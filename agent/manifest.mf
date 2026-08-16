@@ -1,0 +1,7 @@
+Manifest-Version: 1.0
+Premain-Class: tools.mineburp.agent.MineBurpAgent
+Can-Redefine-Classes: false
+Can-Retransform-Classes: false
+Implementation-Title: MineBurp Client Assistance
+Implementation-Version: 0.1.0
+

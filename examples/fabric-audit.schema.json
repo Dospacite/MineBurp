@@ -1,0 +1,27 @@
+{
+  "manifest": {
+    "id": "example.fabric.audit",
+    "name": "Example Fabric audit messages",
+    "version": "1.0.0",
+    "minecraft_versions": ["1.21.1", "1.21.11", "26.2"],
+    "loaders": ["fabric"]
+  },
+  "schemas": [
+    {
+      "name": "audit_request",
+      "match": {
+        "state": "login",
+        "direction": "server_to_client",
+        "packet_id": 4,
+        "channel": "example:audit",
+        "protocol_min": 393,
+        "protocol_max": null
+      },
+      "fields": [
+        { "name": "request_id", "type": "var_int" },
+        { "name": "operation", "type": "string", "max_length": 128 },
+        { "name": "body", "type": "bytes", "rest": true }
+      ]
+    }
+  ]
+}

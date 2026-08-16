@@ -1,0 +1,46 @@
+[package]
+name = "mineburp-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "mineburp_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["desktop-runtime"]
+desktop-runtime = [
+  "tauri/wry",
+  "tauri/compression",
+  "tauri/dynamic-acl",
+  "tauri/x11",
+  "tauri/dbus",
+]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+mineburp-auth = { path = "../crates/mineburp-auth" }
+mineburp-capture = { path = "../crates/mineburp-capture" }
+mineburp-core = { path = "../crates/mineburp-core" }
+mineburp-launcher = { path = "../crates/mineburp-launcher" }
+mineburp-project = { path = "../crates/mineburp-project" }
+mineburp-protocol = { path = "../crates/mineburp-protocol" }
+mineburp-proxy = { path = "../crates/mineburp-proxy" }
+mineburp-session = { path = "../crates/mineburp-session" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", default-features = false, features = [] }
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

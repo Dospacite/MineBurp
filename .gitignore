@@ -1,0 +1,13 @@
+/target/
+/agent/build/
+/node_modules/
+/dist/
+/.idea/
+/.vscode/
+*.mineburp-wal
+*.mineburp-shm
+*.mineburp-journal
+*.log
+.env
+.env.*
+!.env.example

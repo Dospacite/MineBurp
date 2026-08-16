@@ -1,0 +1,29 @@
+[package]
+name = "mineburp-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+mineburp-core = { path = "../mineburp-core" }
+mineburp-project = { path = "../mineburp-project" }
+mineburp-protocol = { path = "../mineburp-protocol" }
+mineburp-session = { path = "../mineburp-session" }
+parking_lot.workspace = true
+rsa.workspace = true
+serde.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20.0"
+
+[lints]
+workspace = true
