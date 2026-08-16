@@ -5,9 +5,11 @@ import type {
   ConnectionSnapshot,
   DecryptModeStatus,
   HeldPacket,
+  PacketFilter,
   PacketView,
   ProjectInfo,
 } from "../domain/types";
+import { EMPTY_FILTER } from "../domain/types";
 import { desktop } from "../lib/desktop";
 
 /** Cadence for session/project polling — unrelated to traffic volume. */
@@ -31,6 +33,16 @@ export function useMineBurp() {
    * inheriting whichever response happens to resolve last.
    */
   const [selectedPacketId, setSelectedPacketId] = useState<number | null>(null);
+  /**
+   * The history filter.
+   *
+   * Held here rather than in the history itself because that component unmounts
+   * whenever another view is on screen, which threw away a filter the operator
+   * had just built the moment they looked at the repeater.
+   */
+  const [packetFilter, setPacketFilter] = useState<PacketFilter>({ ...EMPTY_FILTER });
+  /** Which connection the traffic view is narrowed to, for the same reason. */
+  const [connectionId, setConnectionId] = useState<string | null>(null);
   const [heldPackets, setHeldPackets] = useState<HeldPacket[]>([]);
   const [decryptMode, setDecryptModeState] = useState<DecryptModeStatus | null>(null);
   const [captureStatus, setCaptureStatus] = useState<"starting" | "running" | "unavailable" | "failed">("starting");
@@ -141,6 +153,10 @@ export function useMineBurp() {
     selectedPacket,
     selectedPacketId,
     selectPacket,
+    packetFilter,
+    setPacketFilter,
+    connectionId,
+    setConnectionId,
     heldPackets,
     decryptMode,
     setDecryptMode,

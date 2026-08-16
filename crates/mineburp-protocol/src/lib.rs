@@ -6,8 +6,11 @@ mod crypto;
 mod encryption;
 mod handshake;
 mod inspect;
+mod layout;
 mod nbt;
+mod reader;
 mod registry;
+mod rewrite;
 mod schema;
 mod varint;
 
@@ -17,10 +20,13 @@ pub use crypto::MinecraftCipher;
 pub use encryption::{EncryptionPacketError, EncryptionRequest, EncryptionResponse};
 pub use handshake::{Handshake, HandshakeError, decode_handshake, encode_handshake};
 pub use inspect::{
-    Identification, LARGE_BODY_BYTES, PacketInsight, StreamPacket, inspect_logical, inspect_packet,
+    Identification, PacketInsight, StreamPacket, identify_packet, inspect_logical, inspect_packet,
 };
+pub use layout::{FieldKind, FieldSpan, PacketLayout, encode_field, layout_logical};
 pub use nbt::{NbtError, component_to_text, read_nbt};
+pub use reader::Reader;
 pub use registry::{PacketRegistry, ProtocolVersion};
+pub use rewrite::{RewriteError, apply_edits};
 pub use schema::{
     DecodeContext, FieldDefinition, MatchDefinition, SchemaDefinition, SchemaError, SchemaPack,
     SchemaPackManifest, TypeDefinition, decode_schema,

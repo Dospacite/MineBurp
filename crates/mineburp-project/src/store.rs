@@ -7,8 +7,8 @@ use std::{
 use bytes::Bytes;
 use mineburp_core::{
     Comparison, ConnectionSnapshot, Direction, Disposition, FilterExpression, FilterField,
-    FilterValue, InterceptRule, PacketDetail, PacketSummary, ProtocolState, RepeaterTab, Target,
-    TrafficSource,
+    FilterValue, InterceptRule, PacketDetail, PacketSummary, ProtocolState, RepeaterTab,
+    ReplacementRule, Target, TrafficSource,
 };
 use mineburp_protocol::SchemaPack;
 use parking_lot::Mutex;
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const PROJECT_SCHEMA_VERSION: i32 = 2;
+const PROJECT_SCHEMA_VERSION: i32 = 3;
 
 const INSERT_PACKET_SQL: &str = "INSERT INTO packets(
         sequence, connection_id, timestamp_micros, source, direction, state,
@@ -106,6 +106,25 @@ pub enum ContentMode {
     Regex,
 }
 
+/// How much of the payload the term has to account for.
+///
+/// [`Contains`](ContentScope::Contains) answers "is this in there"; the other
+/// three answer "is this what the packet *is*", which is what makes it possible
+/// to select — or, negated, exclude — every packet whose payload is exactly one
+/// known sequence rather than every packet that merely carries it somewhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContentScope {
+    /// Anywhere in the payload.
+    #[default]
+    Contains,
+    /// The payload is the term and nothing else.
+    Equals,
+    /// The payload begins with the term.
+    Prefix,
+    /// The payload ends with the term.
+    Suffix,
+}
+
 /// A search through the stored payload bytes rather than the row's metadata.
 ///
 /// Unlike every other filter this one cannot be answered from an indexed
@@ -114,8 +133,16 @@ pub enum ContentMode {
 /// metadata search so the cost is something the operator opts into.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContentQuery {
+    /// One term per line; a payload matching any of them matches the search.
+    ///
+    /// A single-line term is the whole language for text and regular
+    /// expressions. Hex terms additionally accept `start-end`, an inclusive
+    /// range over sequences of the same length compared byte by byte, which is
+    /// what makes "every frame that is one byte between `0c` and `0f`"
+    /// expressible — and, negated, hideable.
     pub text: String,
     pub mode: ContentMode,
+    pub scope: ContentScope,
     pub case_sensitive: bool,
     pub negate: bool,
 }
@@ -490,13 +517,15 @@ impl ProjectStore {
         let matcher = query
             .content
             .as_ref()
-            .filter(|content| !content.text.is_empty())
+            // Whitespace-only text yields no terms, and a matcher with no terms
+            // matches nothing — which would silently empty the history.
+            .filter(|content| !content.text.trim().is_empty())
             .map(|content| {
                 ContentMatcher::compile(content).map(|matcher| (Arc::new(matcher), content.negate))
             })
             .transpose()?;
         if let Some((_, negate)) = &matcher {
-            let call = "payload_search(logical_bytes_zstd)";
+            let call = "payload_search(logical_bytes_zstd, size)";
             builder.push_owned(
                 if *negate {
                     format!("NOT {call}")
@@ -706,6 +735,40 @@ impl ProjectStore {
         .collect()
     }
 
+    pub fn save_replacement_rules(&self, rules: &[ReplacementRule]) -> Result<(), ProjectError> {
+        self.ensure_writable()?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM replacement_rules", [])?;
+        for (position, rule) in rules.iter().enumerate() {
+            let payload = serde_json::to_string(rule)
+                .map_err(|error| ProjectError::Corrupt(error.to_string()))?;
+            transaction.execute(
+                "INSERT INTO replacement_rules(id, name, payload_json, position)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    rule.id.to_string(),
+                    rule.name,
+                    payload,
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_replacement_rules(&self) -> Result<Vec<ReplacementRule>, ProjectError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare("SELECT payload_json FROM replacement_rules ORDER BY position ASC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            serde_json::from_str(&row?).map_err(|error| ProjectError::Corrupt(error.to_string()))
+        })
+        .collect()
+    }
+
     fn ensure_writable(&self) -> Result<(), ProjectError> {
         if self.read_only {
             Err(ProjectError::ReadOnly)
@@ -756,7 +819,7 @@ fn register_payload_search(
 
     connection.create_scalar_function(
         "payload_search",
-        1,
+        2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         move |context| {
             let blob = context.get_raw(0).as_blob()?;
@@ -766,7 +829,15 @@ fn register_payload_search(
             let Ok(payload) = decode_bounded(blob) else {
                 return Ok(false);
             };
-            Ok(matcher.matches(&payload))
+            // The recorded size tells the matcher how much of the payload it is
+            // holding — the decode stops at CONTENT_SCAN_LIMIT.
+            let total = context
+                .get::<i64>(1)
+                .ok()
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(payload.len())
+                .max(payload.len());
+            Ok(matcher.matches(&payload, total))
         },
     )?;
     Ok(())
@@ -889,6 +960,25 @@ fn migrate(connection: &Connection) -> Result<(), ProjectError> {
              COMMIT;",
         )?;
     }
+    if current < 3 {
+        add_replacement_rules(connection)?;
+    }
+    Ok(())
+}
+
+/// Schema 3: the rules that rewrite packets automatically.
+fn add_replacement_rules(connection: &Connection) -> Result<(), ProjectError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS replacement_rules(
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           payload_json TEXT NOT NULL,
+           position INTEGER NOT NULL
+         );
+         PRAGMA user_version=3;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
@@ -1027,62 +1117,167 @@ fn push_search(builder: &mut ClauseBuilder, search: &SearchTerm) -> Result<(), P
 /// pathological row would decide how long the whole query takes.
 const CONTENT_SCAN_LIMIT: usize = 1 << 20;
 
+/// One alternative of a payload search.
+#[derive(Debug)]
+enum ContentTerm {
+    /// A literal byte needle.
+    Bytes(Vec<u8>),
+    /// An inclusive range over sequences of the same length, compared byte by
+    /// byte. `0c-0f` selects the four one-byte payloads between them; `0100-01ff`
+    /// selects every two-byte payload that starts with `01`.
+    Range { start: Vec<u8>, end: Vec<u8> },
+}
+
+impl ContentTerm {
+    fn matches(&self, haystack: &[u8], total: usize, scope: ContentScope, truncated: bool) -> bool {
+        match self {
+            Self::Bytes(needle) => {
+                if needle.is_empty() {
+                    return true;
+                }
+                match scope {
+                    ContentScope::Contains => contains(haystack, needle),
+                    // Comparing the recorded size first settles almost every row
+                    // without touching the bytes, and makes truncation moot: a
+                    // payload that equals the needle is needle-sized.
+                    ContentScope::Equals => total == needle.len() && haystack == needle.as_slice(),
+                    ContentScope::Prefix => haystack.starts_with(needle),
+                    ContentScope::Suffix => !truncated && haystack.ends_with(needle),
+                }
+            }
+            Self::Range { start, end } => {
+                let width = start.len();
+                if width == 0 {
+                    return false;
+                }
+                let within = |slice: &[u8]| slice >= start.as_slice() && slice <= end.as_slice();
+                match scope {
+                    ContentScope::Contains => haystack.windows(width).any(within),
+                    ContentScope::Equals => total == width && within(haystack),
+                    ContentScope::Prefix => haystack.len() >= width && within(&haystack[..width]),
+                    ContentScope::Suffix => {
+                        !truncated
+                            && haystack.len() >= width
+                            && within(&haystack[haystack.len() - width..])
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A payload search compiled once, then reused for every row.
+///
+/// Every variant holds a list, because a search is a set of alternatives: a row
+/// matches when any one of them does. That is what makes "hide these four
+/// frames" one query instead of four.
 #[derive(Debug)]
 enum ContentMatcher {
-    /// A literal byte needle. `fold_case` lowercases ASCII on both sides, which
-    /// is what makes a text search behave the way the metadata search does.
-    Bytes {
-        needle: Vec<u8>,
+    /// Literal terms. `fold_case` lowercases ASCII on both sides, which is what
+    /// makes a text search behave the way the metadata search does.
+    Terms {
+        terms: Vec<ContentTerm>,
         fold_case: bool,
+        scope: ContentScope,
     },
-    Regex(Regex),
+    /// The scope is compiled into each pattern as anchors. `needs_tail` records
+    /// whether it anchored the end, which decides whether a payload the scan
+    /// truncated can be judged at all.
+    Regex {
+        patterns: Vec<Regex>,
+        needs_tail: bool,
+    },
 }
 
 impl ContentMatcher {
     fn compile(query: &ContentQuery) -> Result<Self, ProjectError> {
+        let lines = query
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
         match query.mode {
-            ContentMode::Text => Ok(Self::Bytes {
-                needle: if query.case_sensitive {
-                    query.text.as_bytes().to_vec()
-                } else {
-                    query.text.to_lowercase().into_bytes()
-                },
-                fold_case: !query.case_sensitive,
-            }),
-            ContentMode::Hex => Ok(Self::Bytes {
-                needle: parse_hex(&query.text)?,
-                fold_case: false,
-            }),
             ContentMode::Regex => {
-                let pattern = if query.case_sensitive {
-                    query.text.clone()
-                } else {
-                    format!("(?i){}", query.text)
-                };
-                Regex::new(&pattern)
-                    .map(Self::Regex)
-                    .map_err(|error| ProjectError::InvalidSearch(error.to_string()))
+                // The operator's pattern goes inside a non-capturing group so an
+                // alternation at the top level cannot escape the anchors.
+                let patterns = lines
+                    .map(|line| {
+                        let anchored = match query.scope {
+                            ContentScope::Contains => line.to_owned(),
+                            ContentScope::Equals => format!("^(?:{line})$"),
+                            ContentScope::Prefix => format!("^(?:{line})"),
+                            ContentScope::Suffix => format!("(?:{line})$"),
+                        };
+                        let pattern = if query.case_sensitive {
+                            anchored
+                        } else {
+                            format!("(?i){anchored}")
+                        };
+                        Regex::new(&pattern)
+                            .map_err(|error| ProjectError::InvalidSearch(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::Regex {
+                    patterns,
+                    needs_tail: matches!(query.scope, ContentScope::Equals | ContentScope::Suffix),
+                })
             }
+            ContentMode::Text => Ok(Self::Terms {
+                terms: lines
+                    .map(|line| {
+                        ContentTerm::Bytes(if query.case_sensitive {
+                            line.as_bytes().to_vec()
+                        } else {
+                            line.to_lowercase().into_bytes()
+                        })
+                    })
+                    .collect(),
+                fold_case: !query.case_sensitive,
+                scope: query.scope,
+            }),
+            ContentMode::Hex => Ok(Self::Terms {
+                terms: lines.map(parse_hex_term).collect::<Result<Vec<_>, _>>()?,
+                fold_case: false,
+                scope: query.scope,
+            }),
         }
     }
 
-    fn matches(&self, payload: &[u8]) -> bool {
+    /// Matches one payload. `total` is the packet's recorded size, which is
+    /// larger than `payload` when the scan hit [`CONTENT_SCAN_LIMIT`]; a scope
+    /// that depends on the end of the payload cannot be decided in that case and
+    /// reports no match rather than judging a prefix as if it were the whole.
+    fn matches(&self, payload: &[u8], total: usize) -> bool {
+        let truncated = payload.len() < total;
         match self {
-            Self::Bytes { needle, fold_case } => {
-                if needle.is_empty() {
-                    return true;
-                }
-                if *fold_case {
-                    let folded = payload.to_ascii_lowercase();
-                    contains(&folded, needle)
+            Self::Terms {
+                terms,
+                fold_case,
+                scope,
+            } => {
+                let folded;
+                let haystack: &[u8] = if *fold_case {
+                    folded = payload.to_ascii_lowercase();
+                    &folded
                 } else {
-                    contains(payload, needle)
-                }
+                    payload
+                };
+                terms
+                    .iter()
+                    .any(|term| term.matches(haystack, total, *scope, truncated))
             }
             // A payload is rarely valid UTF-8 end to end; a lossy view lets a
             // pattern match the printable runs without discarding the packet.
-            Self::Regex(regex) => regex.is_match(&String::from_utf8_lossy(payload)),
+            Self::Regex {
+                patterns,
+                needs_tail,
+            } => {
+                if *needs_tail && truncated {
+                    return false;
+                }
+                let text = String::from_utf8_lossy(payload);
+                patterns.iter().any(|pattern| pattern.is_match(&text))
+            }
         }
     }
 }
@@ -1091,6 +1286,35 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Reads one hex term: a byte sequence, or `start-end` for an inclusive range.
+///
+/// A dash is unambiguous here — [`parse_hex`] treats every other separator as
+/// noise and a dash has never been one of them — so the range syntax cannot
+/// change what an existing search means.
+fn parse_hex_term(line: &str) -> Result<ContentTerm, ProjectError> {
+    let Some((start, end)) = line.split_once('-') else {
+        return Ok(ContentTerm::Bytes(parse_hex(line)?));
+    };
+    if end.contains('-') {
+        return Err(ProjectError::InvalidSearch(
+            "a hex range is written as start-end".into(),
+        ));
+    }
+    let start = parse_hex(start)?;
+    let end = parse_hex(end)?;
+    if start.len() != end.len() || start.is_empty() {
+        return Err(ProjectError::InvalidSearch(
+            "both ends of a hex range must be the same number of bytes".into(),
+        ));
+    }
+    if start > end {
+        return Err(ProjectError::InvalidSearch(format!(
+            "the start of a hex range must not be greater than its end (`{line}`)"
+        )));
+    }
+    Ok(ContentTerm::Range { start, end })
 }
 
 /// Reads a byte sequence written as hex, ignoring whatever separates the pairs.
@@ -1768,6 +1992,202 @@ mod tests {
             vec![3],
             "a regex reads the printable runs of a mostly binary payload"
         );
+        // A scope anchors the pattern, so a regex can describe the whole payload
+        // rather than any run inside it.
+        assert_eq!(
+            content(ContentQuery {
+                text: "hello.*server".into(),
+                mode: ContentMode::Regex,
+                scope: ContentScope::Equals,
+                ..ContentQuery::default()
+            }),
+            vec![5]
+        );
+        assert_eq!(
+            content(ContentQuery {
+                text: "WORLD".into(),
+                mode: ContentMode::Regex,
+                scope: ContentScope::Equals,
+                ..ContentQuery::default()
+            }),
+            Vec::<u64>::new(),
+            "a fragment of the payload is not the payload"
+        );
+    }
+
+    /// The scope is what makes "every packet that *is* this" expressible: with
+    /// `Contains` alone, excluding one-byte keep-alive-shaped frames also
+    /// excluded every larger packet that happens to carry the same byte.
+    #[test]
+    fn payload_scope_separates_being_a_sequence_from_containing_it() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("scopes.mineburp"),
+            "Scopes",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let base = corpus()[0].clone();
+        store
+            .save_connection(&snapshot(base.connection_id))
+            .unwrap();
+        let payloads: Vec<Vec<u8>> = vec![
+            vec![0x0c],
+            vec![0x0c, 0x00, 0xff],
+            vec![0xff, 0x00, 0x0c],
+            vec![0x0c],
+        ];
+        let details = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| PacketDetail {
+                summary: PacketSummary {
+                    sequence: u64::try_from(index).unwrap() + 1,
+                    size: payload.len(),
+                    ..base.clone()
+                },
+                logical_bytes: Bytes::from(payload.clone()),
+                decoded: None,
+                decode_error: None,
+                wire: WireMetadata::default(),
+            })
+            .collect::<Vec<_>>();
+        store.insert_packets(&details).unwrap();
+
+        let scoped = |scope: ContentScope, negate: bool| {
+            run(
+                &store,
+                PacketQuery {
+                    content: Some(ContentQuery {
+                        text: "0c".into(),
+                        mode: ContentMode::Hex,
+                        scope,
+                        negate,
+                        ..ContentQuery::default()
+                    }),
+                    ..PacketQuery::default()
+                },
+            )
+        };
+
+        assert_eq!(scoped(ContentScope::Contains, false), vec![1, 2, 3, 4]);
+        assert_eq!(scoped(ContentScope::Equals, false), vec![1, 4]);
+        assert_eq!(
+            scoped(ContentScope::Equals, true),
+            vec![2, 3],
+            "excluding the packets that are exactly 0x0c must keep the ones that merely carry it"
+        );
+        assert_eq!(scoped(ContentScope::Prefix, false), vec![1, 2, 4]);
+        assert_eq!(scoped(ContentScope::Suffix, false), vec![1, 3, 4]);
+    }
+
+    /// A term list and a range are what turn "hide this frame" into "hide these
+    /// frames": one query per rule the operator has in mind, not one per byte.
+    #[test]
+    fn payload_terms_list_alternatives_and_hex_ranges() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("terms.mineburp"),
+            "Terms",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let base = corpus()[0].clone();
+        store
+            .save_connection(&snapshot(base.connection_id))
+            .unwrap();
+        // Sequences 1..=5 are the one-byte frames 0x0b..=0x0f; 6 is longer.
+        let payloads: Vec<Vec<u8>> = vec![
+            vec![0x0b],
+            vec![0x0c],
+            vec![0x0d],
+            vec![0x0e],
+            vec![0x0f],
+            vec![0x0c, 0x2a, 0x0f],
+        ];
+        let details = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| PacketDetail {
+                summary: PacketSummary {
+                    sequence: u64::try_from(index).unwrap() + 1,
+                    size: payload.len(),
+                    ..base.clone()
+                },
+                logical_bytes: Bytes::from(payload.clone()),
+                decoded: None,
+                decode_error: None,
+                wire: WireMetadata::default(),
+            })
+            .collect::<Vec<_>>();
+        store.insert_packets(&details).unwrap();
+
+        let hex = |text: &str, scope: ContentScope, negate: bool| {
+            run(
+                &store,
+                PacketQuery {
+                    content: Some(ContentQuery {
+                        text: text.into(),
+                        mode: ContentMode::Hex,
+                        scope,
+                        negate,
+                        ..ContentQuery::default()
+                    }),
+                    ..PacketQuery::default()
+                },
+            )
+        };
+
+        assert_eq!(
+            hex("0c\n0f", ContentScope::Equals, false),
+            vec![2, 5],
+            "a term per line is a set of alternatives"
+        );
+        assert_eq!(
+            hex("0c\n0f", ContentScope::Equals, true),
+            vec![1, 3, 4, 6],
+            "negating the set hides exactly those frames and nothing else"
+        );
+        assert_eq!(
+            hex("0c-0f", ContentScope::Equals, false),
+            vec![2, 3, 4, 5],
+            "a range covers both ends inclusively"
+        );
+        assert_eq!(
+            hex("0c-0f", ContentScope::Equals, true),
+            vec![1, 6],
+            "the longer frame is not in the range even though its bytes are"
+        );
+        assert_eq!(
+            hex("0c-0f", ContentScope::Contains, false),
+            vec![2, 3, 4, 5, 6],
+            "under contains, a range looks for any byte window inside it"
+        );
+        assert_eq!(
+            hex("0b\n0d-0e", ContentScope::Equals, false),
+            vec![1, 3, 4],
+            "sequences and ranges mix in one search"
+        );
+        // A multi-byte range compares the sequences byte by byte.
+        assert_eq!(hex("0c000f-0cff0f", ContentScope::Equals, false), vec![6]);
+
+        let attempt = |text: &str| {
+            store.query_packets_filtered(&PacketQuery {
+                limit: 10,
+                content: Some(ContentQuery {
+                    text: text.into(),
+                    mode: ContentMode::Hex,
+                    ..ContentQuery::default()
+                }),
+                ..PacketQuery::default()
+            })
+        };
+        for malformed in ["0f-0c", "0c-0f0f", "0c-0d-0e"] {
+            assert!(
+                matches!(attempt(malformed), Err(ProjectError::InvalidSearch(_))),
+                "`{malformed}` must be reported rather than quietly matching nothing"
+            );
+        }
     }
 
     #[test]
@@ -1916,6 +2336,36 @@ mod tests {
         assert_eq!(listed[0].state, ProtocolState::Opaque);
         assert_eq!(listed[0].target.port, 25_565);
         assert_eq!(store.list_connections(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replacement_rules_round_trip() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("rules.mineburp"),
+            "Rules",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let rule = ReplacementRule {
+            id: Uuid::new_v4(),
+            name: "Blank the brand".into(),
+            enabled: true,
+            expression: "name == custom_payload".into(),
+            edits: vec![mineburp_core::PacketEdit::Field {
+                name: "channel".into(),
+                value: "minecraft:brand".into(),
+            }],
+        };
+        store
+            .save_replacement_rules(std::slice::from_ref(&rule))
+            .unwrap();
+        assert_eq!(store.load_replacement_rules().unwrap(), vec![rule]);
+        store.save_replacement_rules(&[]).unwrap();
+        assert!(
+            store.load_replacement_rules().unwrap().is_empty(),
+            "saving an empty set clears the rules rather than merging"
+        );
     }
 
     #[test]

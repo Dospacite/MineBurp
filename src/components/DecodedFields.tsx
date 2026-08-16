@@ -1,4 +1,3 @@
-import { Info, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 
 import type { PacketInsight } from "../domain/types";
@@ -8,30 +7,28 @@ const VALUE_LIMIT = 400;
 /** Stream entries listed before the rest are summarised. */
 const STREAM_LIMIT = 40;
 
-/**
- * Renders a decode as readable fields rather than a JSON blob.
- *
- * The old inspector printed `JSON.stringify(decoded, null, 2)`, which for a
- * large decode is both slow to build and hard to read.
- */
-export function DecodedFields({ insight }: { insight: PacketInsight }) {
-  const entries = insight.fields ? Object.entries(insight.fields) : [];
+/** Renders a decode as readable fields rather than a JSON blob. */
+export function DecodedFields({
+  insight,
+  /** Fields a user-supplied schema pack decoded, shown alongside the built-in ones. */
+  schema,
+}: {
+  insight: PacketInsight;
+  schema?: unknown;
+}) {
+  const entries = [
+    ...(insight.fields ? Object.entries(insight.fields) : []),
+    ...(schema && typeof schema === "object" && !Array.isArray(schema)
+      ? Object.entries(schema as Record<string, unknown>)
+      : []),
+  ];
+
+  if (entries.length === 0 && insight.stream.length === 0) {
+    return <p className="decoded-empty">No decoded fields</p>;
+  }
 
   return (
     <div className="decoded">
-      {insight.summary && (
-        <p className="decoded-summary">
-          {insight.summary}
-          <span className={`decode-badge ${insight.identification}`}>
-            {insight.identification === "registry"
-              ? "identified by packet id"
-              : insight.identification === "structure"
-                ? "identified by body shape"
-                : "not identified"}
-          </span>
-        </p>
-      )}
-
       {entries.length > 0 && (
         <dl className="decoded-grid">
           {entries.map(([key, value]) => (
@@ -46,39 +43,19 @@ export function DecodedFields({ insight }: { insight: PacketInsight }) {
       )}
 
       {insight.stream.length > 0 && (
-        <section className="decoded-stream">
-          <h4>Frames in this payload</h4>
-          <ol>
-            {insight.stream.slice(0, STREAM_LIMIT).map((packet) => (
-              <li key={packet.offset}>
-                <span className="stream-offset">+{packet.offset}</span>
-                <span className="stream-name">
-                  {packet.name ??
-                    (packet.packet_id === null ? "unknown" : `0x${packet.packet_id.toString(16)}`)}
-                </span>
-                <span className="stream-summary">{packet.summary ?? `${packet.length} bytes`}</span>
-              </li>
-            ))}
-          </ol>
-          {insight.stream.length > STREAM_LIMIT && (
-            <p className="muted">
-              …and {insight.stream.length - STREAM_LIMIT} more frames in this payload.
-            </p>
-          )}
-        </section>
+        <ol className="decoded-stream">
+          {insight.stream.slice(0, STREAM_LIMIT).map((packet) => (
+            <li key={packet.offset}>
+              <span className="stream-offset">+{packet.offset}</span>
+              <span className="stream-name">
+                {packet.name ??
+                  (packet.packet_id === null ? "unknown" : `0x${packet.packet_id.toString(16)}`)}
+              </span>
+              <span className="stream-summary">{packet.summary ?? `${packet.length} B`}</span>
+            </li>
+          ))}
+        </ol>
       )}
-
-      {insight.error && (
-        <p className="decode-error">
-          <ShieldAlert size={13} aria-hidden="true" /> {insight.error}
-        </p>
-      )}
-
-      {insight.notes.map((note) => (
-        <p className="decode-note" key={note}>
-          <Info size={13} aria-hidden="true" /> {note}
-        </p>
-      ))}
     </div>
   );
 }
@@ -99,7 +76,7 @@ function FieldValue({ value }: { value: unknown }) {
     <span className="field-value">
       {expanded ? text : `${text.slice(0, VALUE_LIMIT)}…`}{" "}
       <button className="link-button" onClick={() => setExpanded(!expanded)}>
-        {expanded ? "show less" : `show all ${text.length.toLocaleString()} characters`}
+        {expanded ? "less" : "more"}
       </button>
     </span>
   );

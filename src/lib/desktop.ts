@@ -9,17 +9,21 @@ import type {
   ConnectionSnapshot,
   DecryptModeStatus,
   Direction,
+  FieldSpan,
   FilterVocabulary,
   HeldPacket,
   InstanceDescriptor,
+  PacketEdit,
   PacketHistoryQuery,
   PacketInsight,
+  PacketLayout,
   PacketSummary,
   PacketView,
   ProjectInfo,
   ProtocolState,
   ProxyEvent,
   RepeaterTab,
+  ReplacementRule,
 } from "../domain/types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -74,6 +78,7 @@ export const desktop = {
         expression: query.expression || null,
         content: query.content || null,
         contentMode: query.contentMode ?? "text",
+        contentScope: query.contentScope ?? "contains",
         contentCaseSensitive: query.contentCaseSensitive ?? false,
         contentNegate: query.contentNegate ?? false,
         beforeId: query.beforeId ?? null,
@@ -102,6 +107,33 @@ export const desktop = {
       direction,
       protocolVersion,
     }),
+  /** Walks a frame into editable field spans for the Repeater's decoded view. */
+  packetLayout: (
+    bytes: Uint8Array,
+    protocolState: ProtocolState,
+    direction: Direction,
+    protocolVersion: number | null = null,
+  ) =>
+    call<PacketLayout>("packet_layout", {
+      logicalBase64: bytesToBase64(bytes),
+      protocolState,
+      direction,
+      protocolVersion,
+    }),
+  /**
+   * Re-encodes one decoded field and splices it back into the frame.
+   *
+   * The splice is done in the backend so that a field whose length changes —
+   * a string, a VarInt — rewrites its own prefix by the same code that read it.
+   */
+  fieldEdit: (bytes: Uint8Array, field: FieldSpan, value: string | number | boolean) =>
+    call<string>("field_edit", {
+      logicalBase64: bytesToBase64(bytes),
+      offset: field.offset,
+      length: field.length,
+      kind: field.kind,
+      value,
+    }).then(base64ToBytes),
   proxySessions: () => call<ConnectionSnapshot[]>("proxy_sessions"),
   setIntercept: (enabled: boolean) =>
     call<void>("intercept_rules_set", {
@@ -129,6 +161,25 @@ export const desktop = {
           ? { type: "replace_base64", payload: bytesToBase64(resolution) }
           : { type: resolution },
     }),
+  /** The automatic replacement rules, in the order they are applied. */
+  replacementRules: () => call<ReplacementRule[]>("replacement_rules_get"),
+  saveReplacementRules: (rules: ReplacementRule[]) =>
+    call<void>("replacement_rules_set", { rules }),
+  /** Runs a rule's edits against one frame without sending anything. */
+  replacementPreview: (
+    bytes: Uint8Array,
+    protocolState: ProtocolState,
+    direction: Direction,
+    edits: PacketEdit[],
+    protocolVersion: number | null = null,
+  ) =>
+    call<string>("replacement_preview", {
+      logicalBase64: bytesToBase64(bytes),
+      protocolState,
+      direction,
+      protocolVersion,
+      edits,
+    }).then(base64ToBytes),
   repeaterSend: (connectionId: string, direction: Direction, bytes: Uint8Array) =>
     call<void>("repeater_send", {
       connectionId,
@@ -215,6 +266,11 @@ export function formatHex(bytes: number[] | Uint8Array, columns = 16, startOffse
     rows.push(`${address}  ${hex}  ${ascii}`);
   }
   return rows.join("\n");
+}
+
+/** The bytes and nothing else: no addresses, no ASCII column, no line breaks. */
+export function formatRawHex(bytes: number[] | Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(" ");
 }
 
 export function formatHexInput(bytes: number[] | Uint8Array, columns = 16): string {

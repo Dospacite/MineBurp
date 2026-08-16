@@ -19,6 +19,7 @@ export function HexView({
   total,
   initial,
   loadWindow,
+  onBytesChange,
   emptyLabel = "Empty frame",
 }: {
   /**
@@ -32,6 +33,12 @@ export function HexView({
   initial: { offset: number; bytes: Uint8Array } | null;
   /** Fetches another window; null means the payload is no longer available. */
   loadWindow: (offset: number, limit: number) => Promise<ByteWindow | null>;
+  /**
+   * Reports the window currently on screen, so a caller's header can act on
+   * exactly the bytes the operator is looking at rather than on the page that
+   * happened to arrive with the packet.
+   */
+  onBytesChange?: (bytes: Uint8Array | null) => void;
   emptyLabel?: string;
 }) {
   const [offset, setOffset] = useState(initial?.offset ?? 0);
@@ -50,6 +57,10 @@ export function HexView({
     setError(null);
   }, [sourceKey]);
 
+  useEffect(() => {
+    onBytesChange?.(bytes);
+  }, [bytes, onBytesChange]);
+
   const pages = Math.max(1, Math.ceil(total / HEX_PAGE_BYTES));
   const page = Math.floor(offset / HEX_PAGE_BYTES);
 
@@ -62,7 +73,7 @@ export function HexView({
       const window = await loadWindow(nextOffset, HEX_PAGE_BYTES);
       if (!window) {
         setBytes(null);
-        setError("These bytes are no longer retained.");
+        setError("Bytes no longer retained");
         return;
       }
       setOffset(window.offset);
@@ -95,7 +106,7 @@ export function HexView({
           </button>
           <span>
             {loading ? <Loader2 className="spin" size={12} /> : null}
-            bytes {offset.toLocaleString()}–
+            {offset.toLocaleString()}–
             {Math.min(total, offset + (bytes?.length ?? 0)).toLocaleString()} of{" "}
             {total.toLocaleString()}
           </span>

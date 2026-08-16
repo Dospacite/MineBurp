@@ -30,13 +30,17 @@ export function SchemasView({ onError }: { onError: (error: string) => void }) {
   }
 
   return (
-    <div className="schema-layout">
-      <section>
-        <div className="page-heading"><span className="eyebrow">Declarative decoding</span><h1>Schema workbench</h1><p>Describe custom payloads without running plugin or mod code inside MineBurp.</p></div>
-        <div className="schema-toolbar"><span><FileJson size={15} /> JSON schema pack</span><button className="button primary" onClick={validate}>{valid ? <Check size={14} /> : null} Validate &amp; load</button></div>
-        <textarea className="schema-editor" spellCheck={false} value={schema} onChange={(event) => { setSchema(event.target.value); setValid(false); }} />
-      </section>
-      <aside className="schema-reference"><span className="eyebrow">Field types</span><h2>Portable and bounded</h2><p>Schemas support numeric primitives, VarInt, VarLong, UUID, strings, byte blocks, arrays, and nested structs.</p><p className="muted">Depth and collection limits are enforced before decode. Schema packs never load native libraries or scripts.</p></aside>
-    </div>
+    <section className="schema-layout">
+      <div className="schema-toolbar">
+        <span><FileJson size={15} /> Schema pack</span>
+        <button className="button primary" onClick={validate}>{valid ? <Check size={14} /> : null} Validate &amp; load</button>
+      </div>
+      <textarea
+        className="schema-editor"
+        spellCheck={false}
+        value={schema}
+        onChange={(event) => { setSchema(event.target.value); setValid(false); }}
+      />
+    </section>
   );
 }

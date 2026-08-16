@@ -11,15 +11,16 @@ use mineburp_auth::{AuthClient, AuthConfig, MinecraftProfile, MinecraftSession};
 use mineburp_capture::{CaptureCapabilities, CaptureStats};
 use mineburp_core::{
     ConnectionSnapshot, Direction, Disposition, FilterExpression, FilterField, InterceptRule,
-    PacketSummary, ProtocolState, RepeaterTab, TrafficSource,
+    PacketEdit, PacketSummary, ProtocolState, RepeaterTab, ReplacementRule, TrafficSource,
 };
 use mineburp_launcher::{AgentSetupOutcome, InstanceDescriptor, LaunchOutcome, LaunchRequest};
 use mineburp_project::{
-    ContentMode, ContentQuery, PacketQuery, ProjectInfo, ProjectOptions, ProjectStore, SearchTerm,
+    ContentMode, ContentQuery, ContentScope, PacketQuery, ProjectInfo, ProjectOptions,
+    ProjectStore, SearchTerm,
 };
 use mineburp_protocol::{
-    DecodeContext, PacketInsight, PacketRegistry, ProtocolVersion, SchemaPack, decode_schema,
-    inspect_logical,
+    DecodeContext, FieldKind, PacketInsight, PacketLayout, PacketRegistry, ProtocolVersion,
+    SchemaPack, apply_edits, decode_schema, encode_field, inspect_logical, layout_logical,
 };
 use mineburp_proxy::HeldPacketDecision;
 use serde::{Deserialize, Serialize};
@@ -142,10 +143,11 @@ pub async fn project_create(
     .map_err(|error| error.to_string())?;
     let info = store.info().clone();
     let asset_store = store.clone();
-    let (packs, rules) = tauri::async_runtime::spawn_blocking(move || {
+    let (packs, rules, replacements) = tauri::async_runtime::spawn_blocking(move || {
         Ok::<_, mineburp_project::ProjectError>((
             asset_store.load_schema_packs()?,
             asset_store.load_intercept_rules()?,
+            asset_store.load_replacement_rules()?,
         ))
     })
     .await
@@ -158,6 +160,10 @@ pub async fn project_create(
     state
         .proxy
         .set_intercept_rules(rules)
+        .map_err(|error| error.to_string())?;
+    state
+        .proxy
+        .set_replacement_rules(replacements)
         .map_err(|error| error.to_string())?;
     state.adopt_project(store);
     Ok(ProjectView::new(info, false))
@@ -185,10 +191,11 @@ pub async fn project_open(
     .map_err(|error| error.to_string())?;
     let info = store.info().clone();
     let asset_store = store.clone();
-    let (packs, rules) = tauri::async_runtime::spawn_blocking(move || {
+    let (packs, rules, replacements) = tauri::async_runtime::spawn_blocking(move || {
         Ok::<_, mineburp_project::ProjectError>((
             asset_store.load_schema_packs()?,
             asset_store.load_intercept_rules()?,
+            asset_store.load_replacement_rules()?,
         ))
     })
     .await
@@ -201,6 +208,10 @@ pub async fn project_open(
     state
         .proxy
         .set_intercept_rules(rules)
+        .map_err(|error| error.to_string())?;
+    state
+        .proxy
+        .set_replacement_rules(replacements)
         .map_err(|error| error.to_string())?;
     state.adopt_project(store);
     Ok(ProjectView::new(info, false))
@@ -270,6 +281,7 @@ pub struct PacketFilterInput {
     /// A search through the payload bytes rather than the row's metadata.
     content: Option<String>,
     content_mode: ContentSearchMode,
+    content_scope: ContentSearchScope,
     content_case_sensitive: bool,
     content_negate: bool,
     before_id: Option<i64>,
@@ -292,6 +304,28 @@ impl From<ContentSearchMode> for ContentMode {
             ContentSearchMode::Text => Self::Text,
             ContentSearchMode::Hex => Self::Hex,
             ContentSearchMode::Regex => Self::Regex,
+        }
+    }
+}
+
+/// How much of the payload the term has to account for.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentSearchScope {
+    #[default]
+    Contains,
+    Equals,
+    Prefix,
+    Suffix,
+}
+
+impl From<ContentSearchScope> for ContentScope {
+    fn from(scope: ContentSearchScope) -> Self {
+        match scope {
+            ContentSearchScope::Contains => Self::Contains,
+            ContentSearchScope::Equals => Self::Equals,
+            ContentSearchScope::Prefix => Self::Prefix,
+            ContentSearchScope::Suffix => Self::Suffix,
         }
     }
 }
@@ -323,6 +357,7 @@ impl PacketFilterInput {
             .map(|text| ContentQuery {
                 text,
                 mode: self.content_mode.into(),
+                scope: self.content_scope.into(),
                 case_sensitive: self.content_case_sensitive,
                 negate: self.content_negate,
             });
@@ -460,21 +495,13 @@ pub async fn packet_detail(
     tauri::async_runtime::spawn_blocking(move || {
         let window = store.packet_window(id, 0, DETAIL_WINDOW_BYTES)?;
         Ok::<_, mineburp_project::ProjectError>(window.map(|window| {
-            let mut insight = inspect_logical(
+            let insight = inspect_logical(
                 window.summary.state,
                 window.summary.direction,
                 &window.bytes,
                 window.summary.protocol_version,
             );
-            let schema_decode = decode_with_schema_packs(&packs, &window);
-            if window.total_bytes > window.bytes.len() {
-                insight.notes.push(format!(
-                    "Decoded from the first {} of {} bytes; the rest is paged in on demand.",
-                    window.bytes.len(),
-                    window.total_bytes
-                ));
-            }
-            let (schema_decoded, schema_error) = schema_decode;
+            let (schema_decoded, schema_error) = decode_with_schema_packs(&packs, &window);
             PacketView {
                 summary: window.summary,
                 wire: window.wire,
@@ -552,6 +579,53 @@ pub async fn packet_bytes(
     .map_err(|error| error.to_string())
 }
 
+/// Walks a frame into editable field spans — the Repeater's decoded view.
+#[tauri::command]
+pub fn packet_layout(
+    logical_base64: String,
+    protocol_state: ProtocolState,
+    direction: Direction,
+    protocol_version: Option<i32>,
+) -> CommandResult<PacketLayout> {
+    let bytes = STANDARD
+        .decode(logical_base64)
+        .map_err(|error| error.to_string())?;
+    Ok(layout_logical(
+        protocol_state,
+        direction,
+        &bytes,
+        protocol_version,
+    ))
+}
+
+/// Re-encodes one decoded field and splices it back into the frame.
+///
+/// The splice happens here rather than in the webview so that the wire encoding
+/// of every field kind — and the length prefix a resized field has to rewrite —
+/// lives in one place next to the decoder that produced the span.
+#[tauri::command]
+pub fn field_edit(
+    logical_base64: String,
+    offset: usize,
+    length: usize,
+    kind: FieldKind,
+    value: serde_json::Value,
+) -> CommandResult<String> {
+    let bytes = STANDARD
+        .decode(logical_base64)
+        .map_err(|error| error.to_string())?;
+    let end = offset
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or("field span is outside the frame")?;
+    let encoded = encode_field(kind, &value)?;
+    let mut edited = Vec::with_capacity(bytes.len() - length + encoded.len());
+    edited.extend_from_slice(&bytes[..offset]);
+    edited.extend_from_slice(&encoded);
+    edited.extend_from_slice(&bytes[end..]);
+    Ok(STANDARD.encode(&edited))
+}
+
 /// Decodes an arbitrary logical frame on demand — used by the Repeater, which
 /// composes frames that were never captured.
 #[tauri::command]
@@ -602,6 +676,54 @@ pub async fn intercept_rules_get(
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
+}
+
+/// The rules that rewrite packets automatically, as the operator ordered them.
+#[tauri::command]
+pub async fn replacement_rules_set(
+    state: State<'_, DesktopState>,
+    rules: Vec<ReplacementRule>,
+) -> CommandResult<()> {
+    state
+        .proxy
+        .set_replacement_rules(rules.clone())
+        .map_err(|error| error.to_string())?;
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || store.save_replacement_rules(&rules))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn replacement_rules_get(
+    state: State<'_, DesktopState>,
+) -> CommandResult<Vec<ReplacementRule>> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || store.load_replacement_rules())
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Runs a rule's edits against one frame without sending anything.
+///
+/// The rules tab uses this to show the operator what a rule does to a real
+/// packet before it is ever applied to live traffic.
+#[tauri::command]
+pub fn replacement_preview(
+    logical_base64: String,
+    protocol_state: ProtocolState,
+    direction: Direction,
+    protocol_version: Option<i32>,
+    edits: Vec<PacketEdit>,
+) -> CommandResult<String> {
+    let bytes = STANDARD
+        .decode(logical_base64)
+        .map_err(|error| error.to_string())?;
+    let rewritten = apply_edits(protocol_state, direction, protocol_version, &bytes, &edits)
+        .map_err(|error| error.to_string())?;
+    Ok(STANDARD.encode(rewritten))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1015,6 +1137,19 @@ mod tests {
         assert_eq!(content.text, "de ad be ef");
         assert!(content.negate);
         assert!(matches!(content.mode, mineburp_project::ContentMode::Hex));
+        assert!(
+            matches!(content.scope, mineburp_project::ContentScope::Contains),
+            "an unstated scope stays the substring search it has always been"
+        );
+
+        let scoped =
+            filter_from(r#"{"content": "0c", "contentMode": "hex", "contentScope": "equals"}"#)
+                .into_query()
+                .expect("filter");
+        assert!(matches!(
+            scoped.content.expect("a content search").scope,
+            mineburp_project::ContentScope::Equals
+        ));
     }
 
     #[test]

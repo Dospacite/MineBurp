@@ -7,7 +7,6 @@ import type {
   PacketSummary,
   ProjectInfo,
 } from "../domain/types";
-import { EMPTY_FILTER } from "../domain/types";
 import { desktop } from "../lib/desktop";
 import { EmptyState } from "./EmptyState";
 import { PacketFilterBar } from "./PacketFilterBar";
@@ -23,6 +22,8 @@ const TAIL_INTERVAL_MS = 700;
 export function PacketHistory({
   project,
   connectionId,
+  filter,
+  onFilterChange,
   selectedId,
   appendSignal,
   onSelect,
@@ -31,13 +32,18 @@ export function PacketHistory({
   project: ProjectInfo | null;
   /** Connection selected in the capture sidebar, or null for all traffic. */
   connectionId: string | null;
+  /**
+   * The filter, owned by the workbench. This view unmounts whenever another
+   * one is on screen, so keeping it here would discard it on every tab switch.
+   */
+  filter: PacketFilter;
+  onFilterChange: (filter: PacketFilter) => void;
   selectedId: number | null;
   /** Increments when the backend reports new packets were written. */
   appendSignal: number;
   onSelect: (id: number) => void;
   onError: (error: string) => void;
 }) {
-  const [filter, setFilter] = useState<PacketFilter>({ ...EMPTY_FILTER });
   const [packets, setPackets] = useState<PacketSummary[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -153,19 +159,19 @@ export function PacketHistory({
   }, [appendSignal, following, project, pullTail]);
 
   if (!project) {
-    return <EmptyState title="Open a project for packet history" detail="MineBurp will keep the table paged and filter in the database, so a long capture stays responsive." />;
+    return <EmptyState title="No project is open" detail="Open or create a project to record packet history." />;
   }
 
   return (
     <section className="packet-history" aria-label="Persisted packet history">
       <PacketFilterBar
         filter={filter}
-        onChange={setFilter}
+        onChange={onFilterChange}
         loaded={packets.length}
         onError={onError}
       />
       <div className="history-result-bar" aria-live="polite">
-        <span>{hasMore ? "more matches available" : "all matches loaded"}</span>
+        <span>{hasMore ? "more available" : "all loaded"}</span>
         <div className="history-follow">
           {!following && pendingNew > 0 && (
             <button
@@ -177,7 +183,7 @@ export function PacketHistory({
                 void pullTail();
               }}
             >
-              new packets — jump to newest
+jump to newest
             </button>
           )}
           <button
@@ -212,7 +218,7 @@ export function PacketHistory({
           }
         />
       ) : (
-        <EmptyState title={loading ? "Loading packet history" : "No packets match these filters"} detail={loading ? "Reading a small page from the project…" : "Adjust the filters or let MineBurp capture more traffic."} />
+        <EmptyState title={loading ? "Loading…" : "No packets match these filters"} detail={loading ? "" : "Adjust the filters or capture more traffic."} />
       )}
     </section>
   );

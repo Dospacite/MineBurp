@@ -1,0 +1,20 @@
+[package]
+name = "mineburp-packet-table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mineburp-packet-table"
+path = "src/main.rs"
+
+[dependencies]
+mineburp-protocol = { path = "../mineburp-protocol" }
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

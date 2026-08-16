@@ -166,6 +166,73 @@ pub enum InterceptDecision {
     DelayMillis(u64),
 }
 
+/// A rule that rewrites packets automatically as they pass through.
+///
+/// Selection reuses the same filter expression language as the history and
+/// intercept rules, so anything an operator can search for is also something
+/// they can rewrite. An empty expression matches every packet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplacementRule {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub expression: String,
+    /// Applied in order; each edit sees the output of the one before it.
+    pub edits: Vec<PacketEdit>,
+}
+
+/// One rewrite applied to a logical frame.
+///
+/// The frame is the packet-id `VarInt` followed by the body, which is what both
+/// the inspector and the Repeater work on, so offsets and field names mean the
+/// same thing everywhere.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PacketEdit {
+    /// Replaces the whole frame with the given hex.
+    Frame { bytes: String },
+    /// Replaces a byte range. A length of zero inserts.
+    Range {
+        offset: usize,
+        length: usize,
+        bytes: String,
+    },
+    /// Finds and replaces a byte sequence, given as hex.
+    Bytes {
+        find: String,
+        replace: String,
+        #[serde(default)]
+        all: bool,
+    },
+    /// Finds and replaces literal text anywhere in the frame's bytes.
+    Text {
+        find: String,
+        replace: String,
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        case_insensitive: bool,
+    },
+    /// Replaces regular-expression matches over the frame's bytes.
+    Regex {
+        pattern: String,
+        replace: String,
+        #[serde(default)]
+        all: bool,
+    },
+    /// Sets a decoded field by name, re-encoding it — including any length
+    /// prefix — so the frame stays well formed.
+    Field { name: String, value: String },
+    /// Rewrites inside a decoded field's value, keeping the frame well formed.
+    FieldReplace {
+        name: String,
+        find: String,
+        replace: String,
+        #[serde(default)]
+        regex: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepeaterTab {
     pub id: Uuid,

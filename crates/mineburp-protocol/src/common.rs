@@ -60,10 +60,16 @@ fn decode_common_packet_inner(
         }
         (ProtocolState::Login, Direction::ClientToServer, 0) => {
             let (username, consumed) = read_string(body, 0)?;
-            Ok(fields(json!({
-                "username": username,
-                "version_specific_bytes": hex(&body[consumed..]),
-            })))
+            // 1.19.1 through 1.20.1 put an optional signature block here; from
+            // 1.20.2 the player UUID always follows the name.
+            let uuid = body
+                .get(consumed..consumed + 16)
+                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+                .map(uuid::Uuid::from_bytes);
+            Ok(fields(match uuid {
+                Some(uuid) => json!({ "username": username, "uuid": uuid.to_string() }),
+                None => json!({ "username": username }),
+            }))
         }
         (ProtocolState::Login, Direction::ServerToClient, 3) => {
             let (threshold, _) = decode_var_i32(body)
@@ -81,7 +87,7 @@ fn decode_common_packet_inner(
             let data = Bytes::copy_from_slice(&body[consumed..]);
             Ok(plugin_decode(
                 channel,
-                json!({ "message_id": message_id, "data": hex(&data) }),
+                json!({ "message_id": message_id, "data_bytes": data.len() }),
                 consumed,
             ))
         }
@@ -95,7 +101,7 @@ fn decode_common_packet_inner(
             Ok(fields(json!({
                 "message_id": message_id,
                 "successful": successful,
-                "data": hex(body.get(prefix + 1..).unwrap_or_default()),
+                "data_bytes": body.get(prefix + 1..).unwrap_or_default().len(),
             })))
         }
         (ProtocolState::Play, _, _)
@@ -104,7 +110,7 @@ fn decode_common_packet_inner(
             let (channel, consumed) = read_string(body, 0)?;
             Ok(plugin_decode(
                 channel,
-                json!({ "data": hex(&body[consumed..]) }),
+                json!({ "data_bytes": body[consumed..].len() }),
                 consumed,
             ))
         }
@@ -173,16 +179,6 @@ fn read_string(input: &[u8], offset: usize) -> Result<(String, usize), String> {
     let value = input.get(start..end).ok_or("truncated string value")?;
     let value = String::from_utf8(value.to_vec()).map_err(|_| "string is not valid UTF-8")?;
     Ok((value, end))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]

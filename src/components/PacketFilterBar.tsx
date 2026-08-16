@@ -1,8 +1,9 @@
-import { ChevronDown, Filter, Search, X } from "lucide-react";
+import { Filter, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   ContentSearchMode,
+  ContentSearchScope,
   Direction,
   Disposition,
   PacketFilter,
@@ -11,6 +12,7 @@ import type {
 } from "../domain/types";
 import { EMPTY_FILTER } from "../domain/types";
 import { desktop } from "../lib/desktop";
+import { Modal } from "./Modal";
 
 const SOURCES: Array<{ value: TrafficSource; label: string }> = [
   { value: "minecraft", label: "Decrypt proxy" },
@@ -32,17 +34,25 @@ const STATES: ProtocolState[] = [
   "closed",
 ];
 
-const CONTENT_MODES: Array<{ value: ContentSearchMode; label: string; hint: string }> = [
-  { value: "text", label: "Text", hint: "Literal string, matched against the payload bytes" },
-  { value: "hex", label: "Hex", hint: "Byte sequence such as 0a 00 09; separators are ignored" },
-  { value: "regex", label: "Regex", hint: "Pattern matched against the payload's printable runs" },
+const CONTENT_MODES: Array<{ value: ContentSearchMode; label: string }> = [
+  { value: "text", label: "Text" },
+  { value: "hex", label: "Hex" },
+  { value: "regex", label: "Regex" },
 ];
 
+/** One term per line; the hex placeholder doubles as the range syntax. */
 const CONTENT_PLACEHOLDER: Record<ContentSearchMode, string> = {
-  text: "minecraft:brand",
-  hex: "0a 00 09",
-  regex: "player_?name",
+  text: "minecraft:brand\nvanilla",
+  hex: "0a 00 09\n0c-0f",
+  regex: "player_?name\nUUID",
 };
+
+const CONTENT_SCOPES: Array<{ value: ContentSearchScope; label: string; title: string }> = [
+  { value: "contains", label: "Contains", title: "The term appears anywhere in the payload" },
+  { value: "equals", label: "Is exactly", title: "The payload is the term and nothing else" },
+  { value: "prefix", label: "Starts with", title: "The payload begins with the term" },
+  { value: "suffix", label: "Ends with", title: "The payload ends with the term" },
+];
 
 const DISPOSITIONS: Disposition[] = [
   "forwarded",
@@ -55,8 +65,8 @@ const DISPOSITIONS: Disposition[] = [
 ];
 
 /**
- * The history filter, modelled on a proxy history filter bar: a one-line
- * summary that expands into grouped controls.
+ * The history filter: a one-line summary in the toolbar that opens the full set
+ * of controls in a modal.
  *
  * Selections are applied as the operator makes them rather than behind an
  * "apply" button — every control maps to a database-side clause, so a change is
@@ -118,21 +128,16 @@ export function PacketFilterBar({
   return (
     <section className={`packet-filter ${active ? "active" : ""}`} aria-label="Packet filter">
       <div className="filter-summary">
-        <button
-          className="filter-toggle"
-          onClick={() => setOpen((value) => !value)}
-          aria-expanded={open}
-        >
+        <button className="filter-toggle" onClick={() => setOpen(true)} aria-haspopup="dialog">
           <Filter size={13} aria-hidden="true" />
-          <span>{summary ?? "Showing all packets"}</span>
-          <ChevronDown size={13} aria-hidden="true" className={open ? "flipped" : ""} />
+          <span>{summary ?? "All packets"}</span>
         </button>
         <label className="history-search filter-quick-search">
           <Search size={14} aria-hidden="true" />
           <input
             value={filter.search}
             onChange={(event) => onChange({ ...filter, search: event.target.value })}
-            placeholder="Search packet, channel, loader, or ID"
+            placeholder="Search"
             aria-label="Search packet history"
           />
         </label>
@@ -145,174 +150,191 @@ export function PacketFilterBar({
       </div>
 
       {open && (
-        <div className="filter-panel">
-          <CheckGroup
-            title="Traffic source"
-            options={SOURCES.map((entry) => ({ ...entry, checked: filter.sources.includes(entry.value) }))}
-            onToggle={(value) => onChange({ ...filter, sources: toggle(filter.sources, value) })}
-            onAll={(all) => onChange({ ...filter, sources: all ? SOURCES.map((entry) => entry.value) : [] })}
-          />
-          <CheckGroup
-            title="Direction"
-            options={DIRECTIONS.map((entry) => ({ ...entry, checked: filter.directions.includes(entry.value) }))}
-            onToggle={(value) => onChange({ ...filter, directions: toggle(filter.directions, value) })}
-            onAll={(all) => onChange({ ...filter, directions: all ? DIRECTIONS.map((entry) => entry.value) : [] })}
-          />
-          <CheckGroup
-            title="Protocol phase"
-            options={STATES.map((value) => ({ value, label: value, checked: filter.states.includes(value) }))}
-            onToggle={(value) => onChange({ ...filter, states: toggle(filter.states, value) })}
-            onAll={(all) => onChange({ ...filter, states: all ? [...STATES] : [] })}
-          />
-          <CheckGroup
-            title="Result"
-            options={DISPOSITIONS.map((value) => ({ value, label: value, checked: filter.dispositions.includes(value) }))}
-            onToggle={(value) => onChange({ ...filter, dispositions: toggle(filter.dispositions, value) })}
-            onAll={(all) => onChange({ ...filter, dispositions: all ? [...DISPOSITIONS] : [] })}
-          />
-
-          <fieldset className="filter-group">
-            <legend>Search term</legend>
-            <input
-              value={filter.search}
-              onChange={(event) => onChange({ ...filter, search: event.target.value })}
-              placeholder="name, channel, loader, or packet ID"
-              aria-label="Filter by search term"
+        <Modal
+          title="Filter"
+          onClose={() => setOpen(false)}
+          actions={
+            <>
+              <button className="button" onClick={clearAll} disabled={!active}>
+                Clear all
+              </button>
+              <button className="button primary" onClick={() => setOpen(false)}>
+                Done
+              </button>
+            </>
+          }
+        >
+          <div className="filter-panel">
+            <CheckGroup
+              title="Traffic source"
+              options={SOURCES.map((entry) => ({ ...entry, checked: filter.sources.includes(entry.value) }))}
+              onToggle={(value) => onChange({ ...filter, sources: toggle(filter.sources, value) })}
+              onAll={(all) => onChange({ ...filter, sources: all ? SOURCES.map((entry) => entry.value) : [] })}
             />
-            <div className="filter-switches">
-              <Switch
-                label="Regex"
-                checked={filter.searchRegex}
-                onChange={(checked) => onChange({ ...filter, searchRegex: checked })}
-              />
-              <Switch
-                label="Case sensitive"
-                checked={filter.searchCaseSensitive}
-                onChange={(checked) => onChange({ ...filter, searchCaseSensitive: checked })}
-              />
-              <Switch
-                label="Negative"
-                checked={filter.searchNegate}
-                onChange={(checked) => onChange({ ...filter, searchNegate: checked })}
-              />
-            </div>
-          </fieldset>
-
-          <fieldset className="filter-group filter-content">
-            <legend>Packet content</legend>
-            <div className="segmented content-modes" aria-label="Payload search mode">
-              {CONTENT_MODES.map((mode) => (
-                <button
-                  key={mode.value}
-                  className={filter.contentMode === mode.value ? "active" : ""}
-                  onClick={() => onChange({ ...filter, contentMode: mode.value })}
-                  title={mode.hint}
-                >
-                  {mode.label}
-                </button>
-              ))}
-            </div>
-            <input
-              value={filter.content}
-              onChange={(event) => onChange({ ...filter, content: event.target.value })}
-              placeholder={CONTENT_PLACEHOLDER[filter.contentMode]}
-              aria-label="Search packet payload bytes"
-              spellCheck={false}
+            <CheckGroup
+              title="Direction"
+              options={DIRECTIONS.map((entry) => ({ ...entry, checked: filter.directions.includes(entry.value) }))}
+              onToggle={(value) => onChange({ ...filter, directions: toggle(filter.directions, value) })}
+              onAll={(all) => onChange({ ...filter, directions: all ? DIRECTIONS.map((entry) => entry.value) : [] })}
             />
-            <div className="filter-switches">
-              <Switch
-                label="Case sensitive"
-                checked={filter.contentCaseSensitive}
-                onChange={(checked) => onChange({ ...filter, contentCaseSensitive: checked })}
-              />
-              <Switch
-                label="Negative"
-                checked={filter.contentNegate}
-                onChange={(checked) => onChange({ ...filter, contentNegate: checked })}
-              />
-            </div>
-            <p className="filter-hint">
-              Searches the stored payload bytes. Every other filter is answered from an index,
-              so narrow with those first — this one decompresses each surviving packet.
-            </p>
-          </fieldset>
+            <CheckGroup
+              title="Protocol phase"
+              options={STATES.map((value) => ({ value, label: value, checked: filter.states.includes(value) }))}
+              onToggle={(value) => onChange({ ...filter, states: toggle(filter.states, value) })}
+              onAll={(all) => onChange({ ...filter, states: all ? [...STATES] : [] })}
+            />
+            <CheckGroup
+              title="Result"
+              options={DISPOSITIONS.map((value) => ({ value, label: value, checked: filter.dispositions.includes(value) }))}
+              onToggle={(value) => onChange({ ...filter, dispositions: toggle(filter.dispositions, value) })}
+              onAll={(all) => onChange({ ...filter, dispositions: all ? [...DISPOSITIONS] : [] })}
+            />
 
-          <fieldset className="filter-group">
-            <legend>Packet name</legend>
-            <label className="filter-field">
-              Show only
+            <fieldset className="filter-group">
+              <legend>Search term</legend>
               <input
-                value={filter.includeNames.join(", ")}
-                onChange={(event) => onChange({ ...filter, includeNames: splitList(event.target.value) })}
-                placeholder="chat, custom_payload"
+                value={filter.search}
+                onChange={(event) => onChange({ ...filter, search: event.target.value })}
+                placeholder="name, channel, loader, or packet ID"
+                aria-label="Filter by search term"
               />
-            </label>
-            <label className="filter-field">
-              Hide
-              <input
-                value={filter.excludeNames.join(", ")}
-                onChange={(event) => onChange({ ...filter, excludeNames: splitList(event.target.value) })}
-                placeholder="keep_alive, chunk"
-              />
-            </label>
-          </fieldset>
+              <div className="filter-switches">
+                <Switch
+                  label="Regex"
+                  checked={filter.searchRegex}
+                  onChange={(checked) => onChange({ ...filter, searchRegex: checked })}
+                />
+                <Switch
+                  label="Case sensitive"
+                  checked={filter.searchCaseSensitive}
+                  onChange={(checked) => onChange({ ...filter, searchCaseSensitive: checked })}
+                />
+                <Switch
+                  label="Negative"
+                  checked={filter.searchNegate}
+                  onChange={(checked) => onChange({ ...filter, searchNegate: checked })}
+                />
+              </div>
+            </fieldset>
 
-          <fieldset className="filter-group">
-            <legend>Payload size</legend>
-            <div className="filter-range">
+            <fieldset className="filter-group filter-content">
+              <legend>Packet content</legend>
+              <div className="segmented content-modes" aria-label="Payload search mode">
+                {CONTENT_MODES.map((mode) => (
+                  <button
+                    key={mode.value}
+                    className={filter.contentMode === mode.value ? "active" : ""}
+                    onClick={() => onChange({ ...filter, contentMode: mode.value })}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+              <div className="segmented content-scopes" aria-label="How much of the payload must match">
+                {CONTENT_SCOPES.map((scope) => (
+                  <button
+                    key={scope.value}
+                    className={filter.contentScope === scope.value ? "active" : ""}
+                    title={scope.title}
+                    onClick={() => onChange({ ...filter, contentScope: scope.value })}
+                  >
+                    {scope.label}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                className="content-terms"
+                rows={3}
+                value={filter.content}
+                onChange={(event) => onChange({ ...filter, content: event.target.value })}
+                placeholder={CONTENT_PLACEHOLDER[filter.contentMode]}
+                aria-label="Search packet payload bytes, one term per line"
+                spellCheck={false}
+              />
+              <div className="filter-switches">
+                <Switch
+                  label="Case sensitive"
+                  checked={filter.contentCaseSensitive}
+                  onChange={(checked) => onChange({ ...filter, contentCaseSensitive: checked })}
+                />
+                <Switch
+                  label="Negative"
+                  checked={filter.contentNegate}
+                  onChange={(checked) => onChange({ ...filter, contentNegate: checked })}
+                />
+              </div>
+            </fieldset>
+
+            <fieldset className="filter-group">
+              <legend>Packet name</legend>
               <label className="filter-field">
-                Min
+                Show only
                 <input
-                  type="number"
-                  min={0}
-                  value={filter.minSize ?? ""}
-                  onChange={(event) => onChange({ ...filter, minSize: parseSize(event.target.value) })}
-                  placeholder="0"
+                  value={filter.includeNames.join(", ")}
+                  onChange={(event) => onChange({ ...filter, includeNames: splitList(event.target.value) })}
+                  placeholder="chat, custom_payload"
                 />
               </label>
               <label className="filter-field">
-                Max
+                Hide
                 <input
-                  type="number"
-                  min={0}
-                  value={filter.maxSize ?? ""}
-                  onChange={(event) => onChange({ ...filter, maxSize: parseSize(event.target.value) })}
-                  placeholder="any"
+                  value={filter.excludeNames.join(", ")}
+                  onChange={(event) => onChange({ ...filter, excludeNames: splitList(event.target.value) })}
+                  placeholder="keep_alive, chunk"
                 />
               </label>
-              <span className="filter-hint">bytes</span>
-            </div>
-          </fieldset>
+            </fieldset>
 
-          <fieldset className="filter-group filter-expression">
-            <legend>Expression</legend>
-            <input
-              value={expressionText}
-              onChange={(event) => setExpressionText(event.target.value)}
-              placeholder="state == play && size > 256 && name ~ chat"
-              aria-label="Filter expression"
-              aria-invalid={expressionError !== null}
-              spellCheck={false}
-            />
-            {expressionError ? (
-              <p className="filter-error" role="alert">{expressionError}</p>
-            ) : (
-              <p className="filter-hint">
-                Fields: source, direction, state, protocol, id, name, channel, loader, size,
-                disposition, connection. Operators: <code>== != &gt; &gt;= &lt; &lt;= ~</code>,
-                combined with <code>&amp;&amp;</code> and <code>||</code>. The same language
-                intercept rules use.
-              </p>
-            )}
-            <ExpressionExamples
-              onPick={(text) => {
-                setExpressionText(text);
-                setExpressionError(null);
-              }}
-              onError={onError}
-            />
-          </fieldset>
-        </div>
+            <fieldset className="filter-group">
+              <legend>Payload size</legend>
+              <div className="filter-range">
+                <label className="filter-field">
+                  Min
+                  <input
+                    type="number"
+                    min={0}
+                    value={filter.minSize ?? ""}
+                    onChange={(event) => onChange({ ...filter, minSize: parseSize(event.target.value) })}
+                    placeholder="0"
+                  />
+                </label>
+                <label className="filter-field">
+                  Max
+                  <input
+                    type="number"
+                    min={0}
+                    value={filter.maxSize ?? ""}
+                    onChange={(event) => onChange({ ...filter, maxSize: parseSize(event.target.value) })}
+                    placeholder="any"
+                  />
+                </label>
+                <span className="filter-hint">bytes</span>
+              </div>
+            </fieldset>
+
+            <fieldset className="filter-group filter-expression">
+              <legend>Expression</legend>
+              <input
+                value={expressionText}
+                onChange={(event) => setExpressionText(event.target.value)}
+                placeholder="state == play && size > 256 && name ~ chat"
+                aria-label="Filter expression"
+                aria-invalid={expressionError !== null}
+                spellCheck={false}
+              />
+              {expressionError && (
+                <p className="filter-error" role="alert">{expressionError}</p>
+              )}
+              <ExpressionExamples
+                onPick={(text) => {
+                  setExpressionText(text);
+                  setExpressionError(null);
+                }}
+                onError={onError}
+              />
+            </fieldset>
+          </div>
+        </Modal>
       )}
     </section>
   );
@@ -346,11 +368,10 @@ function CheckGroup<T extends string>({
         ))}
       </div>
       <div className="filter-group-actions">
-        <button className="link-button" onClick={() => onAll(true)}>Select all</button>
+        <button className="link-button" onClick={() => onAll(true)}>All</button>
         <button className="link-button" onClick={() => onAll(false)} disabled={none}>
           Clear
         </button>
-        {none && <span className="filter-hint">any</span>}
       </div>
     </fieldset>
   );
@@ -423,6 +444,14 @@ function parseSize(value: string): number | null {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+/** How the summary reads a payload search: [plain, negated] per scope. */
+const RELATION: Record<ContentSearchScope, [string, string]> = {
+  contains: ["with", "without"],
+  equals: ["is", "is not"],
+  prefix: ["starts with", "not starting with"],
+  suffix: ["ends with", "not ending with"],
+};
+
 /** A short description of what the filter narrows, or null when it narrows nothing. */
 function describe(filter: PacketFilter): string | null {
   const parts: string[] = [];
@@ -445,9 +474,12 @@ function describe(filter: PacketFilter): string | null {
   if (filter.minSize !== null || filter.maxSize !== null) {
     parts.push(`${filter.minSize ?? 0}–${filter.maxSize ?? "∞"} B`);
   }
-  if (filter.content.trim()) {
+  const terms = filter.content.split("\n").map((term) => term.trim()).filter(Boolean);
+  if (terms.length > 0) {
     const mode = filter.contentMode === "text" ? "" : ` ${filter.contentMode}`;
-    parts.push(`payload${mode} ${filter.contentNegate ? "without " : ""}“${filter.content.trim()}”`);
+    const relation = RELATION[filter.contentScope][filter.contentNegate ? 1 : 0];
+    const subject = terms.length === 1 ? `“${terms[0]}”` : `any of ${terms.length}`;
+    parts.push(`payload${mode} ${relation} ${subject}`);
   }
   if (filter.expression.trim()) parts.push(filter.expression.trim());
   return parts.length > 0 ? parts.join(" · ") : null;

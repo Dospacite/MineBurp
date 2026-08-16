@@ -3,6 +3,6 @@
 mod store;
 
 pub use store::{
-    ContentMode, ContentQuery, PacketQuery, PacketWindow, ProjectError, ProjectInfo,
+    ContentMode, ContentQuery, ContentScope, PacketQuery, PacketWindow, ProjectError, ProjectInfo,
     ProjectOptions, ProjectStore, SearchTerm,
 };

@@ -4,10 +4,12 @@ import { useEffect, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { PacketHistory } from "../components/PacketHistory";
 import { PacketInspector } from "../components/PacketInspector";
+import { Split } from "../components/Split";
 import type {
   AppCapabilities,
   ConnectionSnapshot,
   DecryptModeStatus,
+  PacketFilter,
   PacketView,
   ProjectInfo,
 } from "../domain/types";
@@ -20,6 +22,10 @@ export function TrafficView({
   connections,
   selectedPacket,
   selectedPacketId,
+  filter,
+  onFilterChange,
+  connectionId,
+  onConnectionChange,
   decryptMode,
   captureStatus,
   appendSignal,
@@ -33,6 +39,11 @@ export function TrafficView({
   connections: ConnectionSnapshot[];
   selectedPacket: PacketView | null;
   selectedPacketId: number | null;
+  /** Held by the workbench so it survives a trip to another view. */
+  filter: PacketFilter;
+  onFilterChange: (filter: PacketFilter) => void;
+  connectionId: string | null;
+  onConnectionChange: (connectionId: string | null) => void;
   decryptMode: DecryptModeStatus | null;
   captureStatus: CaptureStatus;
   appendSignal: number;
@@ -41,15 +52,14 @@ export function TrafficView({
   onOpenRepeater: () => void;
   onError: (error: string) => void;
 }) {
-  const [connectionId, setConnectionId] = useState<string | null>(null);
   const [changingDecryptMode, setChangingDecryptMode] = useState(false);
   const capture = capabilities?.side_capture;
 
   useEffect(() => {
     if (connectionId && !connections.some((connection) => connection.id === connectionId)) {
-      setConnectionId(null);
+      onConnectionChange(null);
     }
-  }, [connectionId, connections]);
+  }, [connectionId, connections, onConnectionChange]);
 
   async function toggleDecryptMode() {
     if (changingDecryptMode) return;
@@ -63,84 +73,64 @@ export function TrafficView({
     }
   }
 
-  const statusCopy = captureStatus === "running"
-    ? "Capturing TCP and UDP traffic owned by Minecraft clients"
-    : captureStatus === "starting"
-      ? "Starting system capture…"
-      : capture?.reason ?? "System capture is unavailable";
   const decryptEnabled = decryptMode?.enabled ?? false;
   const totalPackets = connections.reduce((sum, connection) => sum + connection.packet_count, 0);
+  const statusDetail = captureStatus === "running" || captureStatus === "starting" ? null : capture?.reason ?? null;
 
   return (
-    <div className="capture-layout">
+    <Split orientation="columns" storageKey="traffic" initial={[0.19, 0.51, 0.3]} minimum={200} className="capture-layout">
       <aside className="flow-pane" aria-label="Capture and decrypt controls">
-        <div className="pane-header">
-          <div><span className="eyebrow">Connection mode</span><h2>Capture</h2></div>
-        </div>
-        <section className={`decrypt-control ${decryptEnabled ? "enabled" : ""}`} aria-label="Decrypt connection mode">
-          <div className="decrypt-control-heading">
-            <span className="decrypt-icon" aria-hidden="true">{decryptEnabled ? <ShieldCheck size={16} /> : <ShieldOff size={16} />}</span>
-            <span><strong>Decrypt connections</strong><small>{decryptEnabled ? "Active for configured Minecraft clients" : "Passive capture is the safe default"}</small></span>
-          </div>
+        <div className={`decrypt-control ${decryptEnabled ? "enabled" : ""}`}>
+          <span className="decrypt-icon" aria-hidden="true">{decryptEnabled ? <ShieldCheck size={16} /> : <ShieldOff size={16} />}</span>
+          <strong>Decrypt connections</strong>
           <button className={`decrypt-switch ${decryptEnabled ? "on" : ""}`} role="switch" aria-checked={decryptEnabled} disabled={changingDecryptMode} onClick={() => void toggleDecryptMode()}>
-            <span>{decryptEnabled ? "On" : "Off"}</span>
+            {decryptEnabled ? "On" : "Off"}
           </button>
-          <p>MineBurp creates a one-use private route inside the configured Java client. No public listener or target setup is exposed.</p>
-          {decryptEnabled && <p className="decrypt-auth-note">Online mode needs launcher assistance or a valid signed-in Microsoft/Minecraft session to authorize the upstream hash.</p>}
-        </section>
+        </div>
         <div className={`capture-status ${captureStatus}`} role="status" aria-live="polite">
           {captureStatus === "running" ? <Radio size={15} /> : captureStatus === "starting" ? <Loader2 className="spin" size={15} /> : captureStatus === "unavailable" ? <WifiOff size={15} /> : <ShieldAlert size={15} />}
-          <span><strong>{captureStatus}</strong><small>{statusCopy}</small></span>
+          <span><strong>{captureStatus}</strong>{statusDetail && <small>{statusDetail}</small>}</span>
         </div>
         <div className="flow-list" aria-label="Observed connections">
-          <button className={`flow-card ${connectionId === null ? "selected" : ""}`} onClick={() => setConnectionId(null)} aria-pressed={connectionId === null}>
-            <span><strong>All Minecraft traffic</strong><small>{totalPackets.toLocaleString()} packets recorded</small></span>
+          <button className={`flow-card ${connectionId === null ? "selected" : ""}`} onClick={() => onConnectionChange(null)} aria-pressed={connectionId === null}>
+            <span><strong>All traffic</strong><small>{totalPackets.toLocaleString()} packets</small></span>
           </button>
           {connections.map((connection) => (
             <button
               className={`flow-card ${connectionId === connection.id ? "selected" : ""}`}
               key={connection.id}
-              onClick={() => setConnectionId(connection.id)}
+              onClick={() => onConnectionChange(connection.id)}
               aria-pressed={connectionId === connection.id}
             >
               <span className="transport-badge">{connection.state}</span>
               <span>
                 <strong>{connection.target.host}:{connection.target.port}</strong>
-                <small>{connection.packet_count.toLocaleString()} packets · {formatBytes(connection.byte_count)}</small>
+                <small>{connection.packet_count.toLocaleString()} · {formatBytes(connection.byte_count)}</small>
               </span>
             </button>
           ))}
         </div>
       </aside>
       <main className="traffic-pane">
-        <div className="pane-header traffic-header">
-          <div>
-            <span className="eyebrow">{project?.temporary ? "Temporary project" : "Project-backed"}</span>
-            <h2>Packet history</h2>
-          </div>
-        </div>
-        <div className="traffic-content">
-          {project ? (
-            <PacketHistory
-              project={project}
-              connectionId={connectionId}
-              selectedId={selectedPacketId}
-              appendSignal={appendSignal}
-              onSelect={onSelectPacket}
-              onError={onError}
-            />
-          ) : (
-            <EmptyState
-              title="No project is open"
-              detail="MineBurp normally records into a temporary project on startup. Open or create one to resume recording."
-            />
-          )}
-        </div>
+        {project ? (
+          <PacketHistory
+            project={project}
+            connectionId={connectionId}
+            filter={filter}
+            onFilterChange={onFilterChange}
+            selectedId={selectedPacketId}
+            appendSignal={appendSignal}
+            onSelect={onSelectPacket}
+            onError={onError}
+          />
+        ) : (
+          <EmptyState title="No project is open" detail="Open or create one to resume recording." />
+        )}
       </main>
       <aside className="capture-inspector" aria-label="Selected packet details">
         <PacketInspector packet={selectedPacket} onRepeater={onOpenRepeater} onError={onError} />
       </aside>
-    </div>
+    </Split>
   );
 }
 

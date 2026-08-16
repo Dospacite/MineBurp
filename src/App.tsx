@@ -1,4 +1,4 @@
-import { Boxes, Braces, Moon, Radio, Repeat2, Sun, X } from "lucide-react";
+import { Boxes, Braces, Moon, Radio, Repeat2, Replace, Sun, X } from "lucide-react";
 import { useState } from "react";
 
 import type { View } from "./domain/types";
@@ -8,12 +8,14 @@ import { useMineBurp } from "./hooks/useMineBurp";
 import { useTheme } from "./hooks/useTheme";
 import { InstancesView } from "./views/InstancesView";
 import { RepeaterView } from "./views/RepeaterView";
+import { ReplaceView } from "./views/ReplaceView";
 import { SchemasView } from "./views/SchemasView";
 import { TrafficView } from "./views/TrafficView";
 
 const navigation: Array<{ id: View; label: string; icon: typeof Radio }> = [
   { id: "traffic", label: "Traffic", icon: Radio },
   { id: "repeater", label: "Repeater", icon: Repeat2 },
+  { id: "replace", label: "Replace", icon: Replace },
   { id: "schemas", label: "Schemas", icon: Braces },
   { id: "instances", label: "Instances", icon: Boxes },
 ];
@@ -49,10 +51,6 @@ export function App() {
         </div>
       </header>
 
-      <div className="runtime-note" hidden={undefined} data-visible={!window.__TAURI_INTERNALS__}>
-        Browser preview — automatic capture and project actions require the Tauri desktop runtime.
-      </div>
-
       <div className="workspace">
         {view === "repeater" && <RepeaterView sessions={workbench.connections} seed={workbench.selectedPacket} onError={workbench.setError} />}
         {view === "traffic" && (
@@ -62,6 +60,10 @@ export function App() {
             connections={workbench.connections}
             selectedPacket={workbench.selectedPacket}
             selectedPacketId={workbench.selectedPacketId}
+            filter={workbench.packetFilter}
+            onFilterChange={workbench.setPacketFilter}
+            connectionId={workbench.connectionId}
+            onConnectionChange={workbench.setConnectionId}
             decryptMode={workbench.decryptMode}
             captureStatus={workbench.captureStatus}
             appendSignal={workbench.appendSignal}
@@ -71,6 +73,7 @@ export function App() {
             onError={workbench.setError}
           />
         )}
+        {view === "replace" && <ReplaceView seed={workbench.selectedPacket} onError={workbench.setError} />}
         {view === "schemas" && <SchemasView onError={workbench.setError} />}
         {view === "instances" && <InstancesView onError={workbench.setError} />}
       </div>

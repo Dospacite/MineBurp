@@ -12,6 +12,7 @@ cipher.workspace = true
 flate2.workspace = true
 indexmap.workspace = true
 mineburp-core = { path = "../mineburp-core" }
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -1,4 +1,4 @@
-export type View = "traffic" | "repeater" | "schemas" | "instances";
+export type View = "traffic" | "repeater" | "replace" | "schemas" | "instances";
 export type Direction = "client_to_server" | "server_to_client";
 export type TrafficSource = "minecraft" | "side_channel";
 export type Disposition =
@@ -105,8 +105,40 @@ export interface PacketInsight {
   loader: string | null;
   identification: Identification;
   error: string | null;
-  notes: string[];
   stream: StreamPacket[];
+}
+
+/** How a decoded field is written back to the wire. */
+export type FieldKind =
+  | "var_int"
+  | "var_long"
+  | "string"
+  | "bool"
+  | "u8"
+  | "i8"
+  | "i16"
+  | "u16"
+  | "i32"
+  | "i64"
+  | "f32"
+  | "f64"
+  | "bytes"
+  | "prefixed_bytes";
+
+/** One decoded value together with the bytes it occupies in the frame. */
+export interface FieldSpan {
+  name: string;
+  kind: FieldKind;
+  offset: number;
+  length: number;
+  value: string | number | boolean | null;
+}
+
+export interface PacketLayout {
+  name: string | null;
+  fields: FieldSpan[];
+  /** False when the walk stopped early and the tail is raw bytes. */
+  complete: boolean;
 }
 
 /**
@@ -152,6 +184,30 @@ export interface RepeaterTab {
   state: ProtocolState;
   logical_bytes: number[];
   decoded: unknown | null;
+}
+
+/** One rewrite applied to a logical frame by a replacement rule. */
+export type PacketEdit =
+  | { kind: "frame"; bytes: string }
+  | { kind: "range"; offset: number; length: number; bytes: string }
+  | { kind: "bytes"; find: string; replace: string; all: boolean }
+  | { kind: "text"; find: string; replace: string; all: boolean; case_insensitive: boolean }
+  | { kind: "regex"; pattern: string; replace: string; all: boolean }
+  | { kind: "field"; name: string; value: string }
+  | { kind: "field_replace"; name: string; find: string; replace: string; regex: boolean };
+
+export type PacketEditKind = PacketEdit["kind"];
+
+/**
+ * A rule that rewrites matching packets automatically as they pass through.
+ * An empty expression matches every packet.
+ */
+export interface ReplacementRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  expression: string;
+  edits: PacketEdit[];
 }
 
 export interface InstanceDescriptor {
@@ -244,12 +300,22 @@ export interface PacketFilter {
    */
   content: string;
   contentMode: ContentSearchMode;
+  contentScope: ContentSearchScope;
   contentCaseSensitive: boolean;
   contentNegate: boolean;
 }
 
 /** How a payload search reads the term it was given. */
 export type ContentSearchMode = "text" | "hex" | "regex";
+
+/**
+ * How much of the payload the term has to account for.
+ *
+ * `contains` answers "is this in there"; the rest answer "is this what the
+ * packet is", which is what makes it possible to select — or, negated, drop —
+ * every packet whose payload is exactly one sequence.
+ */
+export type ContentSearchScope = "contains" | "equals" | "prefix" | "suffix";
 
 export const EMPTY_FILTER: PacketFilter = {
   search: "",
@@ -267,6 +333,7 @@ export const EMPTY_FILTER: PacketFilter = {
   expression: "",
   content: "",
   contentMode: "text",
+  contentScope: "contains",
   contentCaseSensitive: false,
   contentNegate: false,
 };

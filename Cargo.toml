@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/mineburp-core",
   "crates/mineburp-protocol",
+  "crates/mineburp-packet-table",
   "crates/mineburp-project",
   "crates/mineburp-proxy",
   "crates/mineburp-auth",

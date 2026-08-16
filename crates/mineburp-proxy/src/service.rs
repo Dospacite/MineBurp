@@ -10,7 +10,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use mineburp_core::{
     ConnectionId, ConnectionSnapshot, ConnectionStatus, Direction, Disposition, InterceptDecision,
-    InterceptRule, PacketDetail, PacketSummary, ProtocolState, Target, TrafficSource, WireMetadata,
+    InterceptRule, PacketDetail, PacketSummary, ProtocolState, ReplacementRule, Target,
+    TrafficSource, WireMetadata,
 };
 use mineburp_project::{ProjectError, ProjectStore};
 use mineburp_protocol::{
@@ -124,6 +125,17 @@ struct CompiledRule {
     filter: CompiledFilter,
 }
 
+/// A replacement rule with its selector already parsed.
+///
+/// An empty expression means "every packet", which is why the filter is
+/// optional rather than a parsed `true` — the expression language has no
+/// literal for it.
+#[derive(Debug)]
+struct CompiledReplacement {
+    source: ReplacementRule,
+    filter: Option<CompiledFilter>,
+}
+
 #[derive(Debug)]
 struct PendingHeld {
     decision: oneshot::Sender<HeldPacketDecision>,
@@ -156,6 +168,7 @@ pub struct ProxyService {
     project: Arc<RwLock<Option<ProjectStore>>>,
     sessions: Arc<RwLock<HashMap<ConnectionId, SessionHandle>>>,
     rules: Arc<RwLock<Vec<CompiledRule>>>,
+    replacements: Arc<RwLock<Vec<CompiledReplacement>>>,
     held: Arc<RwLock<HashMap<Uuid, PendingHeld>>>,
     session_join_provider: Arc<RwLock<Option<Arc<dyn SessionJoinProvider>>>>,
     schema_packs: Arc<RwLock<Vec<SchemaPack>>>,
@@ -178,6 +191,7 @@ impl ProxyService {
             project: Arc::new(RwLock::new(None)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             rules: Arc::new(RwLock::new(Vec::new())),
+            replacements: Arc::new(RwLock::new(Vec::new())),
             held: Arc::new(RwLock::new(HashMap::new())),
             session_join_provider: Arc::new(RwLock::new(None)),
             schema_packs: Arc::new(RwLock::new(Vec::new())),
@@ -222,6 +236,23 @@ impl ProxyService {
             })
             .collect::<Result<Vec<_>, FilterParseError>>()?;
         *self.rules.write() = compiled;
+        Ok(())
+    }
+
+    /// Installs the rules that rewrite packets automatically.
+    pub fn set_replacement_rules(&self, rules: Vec<ReplacementRule>) -> Result<(), ProxyError> {
+        let compiled = rules
+            .into_iter()
+            .map(|source| {
+                let filter = if source.expression.trim().is_empty() {
+                    None
+                } else {
+                    Some(CompiledFilter::parse(&source.expression)?)
+                };
+                Ok(CompiledReplacement { source, filter })
+            })
+            .collect::<Result<Vec<_>, FilterParseError>>()?;
+        *self.replacements.write() = compiled;
         Ok(())
     }
 
@@ -641,6 +672,27 @@ impl ProxyService {
             state,
             input_encrypted,
         );
+        // Automatic replacement runs before the intercept decision: a rule
+        // that rewrites a packet has already decided what should go on the
+        // wire, and the recorded row is what was actually sent.
+        if let Some(bytes) = self.rewrite(&detail, state, direction) {
+            match PacketFrame::from_logical_bytes(bytes) {
+                Ok(replaced) => {
+                    outbound = replaced;
+                    detail = self.make_detail(
+                        handle,
+                        direction,
+                        &outbound,
+                        Disposition::Edited,
+                        state,
+                        input_encrypted,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "a replacement rule produced an unusable frame");
+                }
+            }
+        }
         detail.summary.sequence = sequence.fetch_add(1, Ordering::Relaxed);
         let system_edited = outbound != frame;
         let decision = if system_edited {
@@ -773,6 +825,55 @@ impl ProxyService {
         self.publish_snapshot(handle).await?;
         Ok(cipher_started)
     }
+    /// Runs every enabled replacement rule whose selector matches, in order.
+    ///
+    /// A rule that fails — an unknown field, a bad pattern — is reported and
+    /// skipped rather than dropping the connection: an operator's typo in a
+    /// rule must not disconnect the game they are testing.
+    fn rewrite(
+        &self,
+        detail: &PacketDetail,
+        state: ProtocolState,
+        direction: Direction,
+    ) -> Option<Bytes> {
+        let rules = self.replacements.read();
+        let matching: Vec<&ReplacementRule> = rules
+            .iter()
+            .filter(|rule| {
+                rule.source.enabled
+                    && !rule.source.edits.is_empty()
+                    && rule
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| filter.matches(&detail.summary))
+            })
+            .map(|rule| &rule.source)
+            .collect();
+        if matching.is_empty() {
+            return None;
+        }
+        let mut frame = detail.logical_bytes.to_vec();
+        let mut changed = false;
+        for rule in matching {
+            match mineburp_protocol::apply_edits(
+                state,
+                direction,
+                detail.summary.protocol_version,
+                &frame,
+                &rule.edits,
+            ) {
+                Ok(next) => {
+                    changed |= next != frame;
+                    frame = next;
+                }
+                Err(error) => {
+                    tracing::warn!(rule = %rule.name, %error, "replacement rule skipped");
+                }
+            }
+        }
+        changed.then(|| Bytes::from(frame))
+    }
+
     fn intercept_decision(&self, packet: &PacketSummary) -> InterceptDecision {
         self.rules
             .read()
@@ -803,10 +904,16 @@ impl ProxyService {
         );
         let channel = common.channel;
         let loader = common.loader.or_else(|| snapshot.loader.clone());
-        let mut name = self
-            .registry
-            .packet_name(state, direction, frame.id, snapshot.protocol_version)
-            .map(str::to_owned);
+        // Names every row it can, not just the ids that are stable across
+        // versions: play packets are identified from the shape of their body,
+        // which is the only thing that survives Mojang renumbering them.
+        let mut name = mineburp_protocol::identify_packet(
+            state,
+            direction,
+            frame.id,
+            &frame.body,
+            snapshot.protocol_version,
+        );
         // Matching a schema is a cheap predicate and gives the row its name.
         // Running the schema *decode* here is not: it walked every field of
         // every captured packet, including ones nobody opens. The decode now

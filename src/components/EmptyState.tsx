@@ -4,7 +4,7 @@ export function EmptyState({ title, detail, action }: { title: string; detail: s
   return (
     <div className="empty-state">
       <p className="empty-title">{title}</p>
-      <p>{detail}</p>
+      {detail && <p>{detail}</p>}
       {action}
     </div>
   );

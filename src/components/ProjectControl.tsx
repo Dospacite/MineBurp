@@ -39,7 +39,7 @@ export function ProjectControl({
         className={`project-button ${project?.temporary ? "temporary" : ""}`}
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        title={project?.temporary ? "Recording to a temporary project that is deleted when MineBurp exits" : project?.path}
+        title={project?.temporary ? "Temporary project" : project?.path}
       >
         <FolderOpen size={15} aria-hidden="true" />
         <span>{project?.name ?? "Open project"}</span>
@@ -49,10 +49,7 @@ export function ProjectControl({
       {open && (
         <div className="project-popover">
           {project?.temporary && (
-            <p className="project-note">
-              Capture is recording to a temporary project. It is deleted when MineBurp exits — create
-              or open a project to keep this session.
-            </p>
+            <p className="project-note">Temporary project — deleted when MineBurp exits.</p>
           )}
           <div className="segmented" aria-label="Project action">
             <button className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>New</button>
