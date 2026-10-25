@@ -10,12 +10,12 @@ import {
   RefreshCw,
   Settings2,
 } from "lucide-react";
-import { useEffect, useState } from "react";
-
-import type { ClientAssistStatus, InstanceDescriptor } from "../domain/types";
-import { desktop } from "../lib/desktop";
-import { message } from "../hooks/useMineBurp";
+import { useCallback, useEffect, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
+import type { ClientAssistStatus, InstanceDescriptor } from "../domain/types";
+import { message } from "../hooks/useMineBurp";
+import { t } from "../i18n";
+import { desktop } from "../lib/desktop";
 
 const launcherLabels: Record<InstanceDescriptor["launcher"], string> = {
   official: "Minecraft Launcher",
@@ -36,18 +36,35 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
   const [setupNotice, setSetupNotice] = useState<Record<string, string>>({});
   const [copied, setCopied] = useState(false);
 
-  async function refresh() {
-    try { setInstances(await desktop.instances()); } catch (reason) { onError(message(reason)); }
-  }
+  const refresh = useCallback(async () => {
+    try {
+      setInstances(await desktop.instances());
+    } catch (reason) {
+      onError(message(reason));
+    }
+  }, [onError]);
 
   useEffect(() => {
     void refresh();
-    void desktop.authSession().then(setAccount).catch(() => undefined);
+    // A failed session lookup is reported once rather than swallowed: the
+    // backend may be degraded, and silence reads as "signed out".
+    desktop
+      .authSession()
+      .then(setAccount)
+      .catch((reason) => onError(message(reason)));
     let mounted = true;
+    let assistFailures = 0;
     const updateClientAssist = () => {
-      void desktop.clientAssistStatus()
-        .then((status) => { if (mounted) setClientAssist(status); })
-        .catch(() => undefined);
+      void desktop
+        .clientAssistStatus()
+        .then((status) => {
+          if (mounted) setClientAssist(status);
+        })
+        .catch((reason) => {
+          if (!mounted) return;
+          assistFailures += 1;
+          if (assistFailures === 1) onError(message(reason));
+        });
     };
     updateClientAssist();
     const interval = window.setInterval(updateClientAssist, 2_000);
@@ -55,7 +72,7 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
       mounted = false;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [onError, refresh]);
 
   async function copyText(value: string) {
     if (navigator.clipboard?.writeText) {
@@ -107,15 +124,24 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
   }
 
   async function signOut() {
-    await desktop.authSignOut();
-    setAccount(null);
+    try {
+      await desktop.authSignOut();
+      setAccount(null);
+    } catch (reason) {
+      onError(message(reason));
+    }
   }
 
   async function launch(instance: InstanceDescriptor) {
     const instanceKey = `${instance.launcher}-${instance.id}`;
     setLaunchingInstance(instanceKey);
-    try { await desktop.launch(instance); } catch (reason) { onError(message(reason)); }
-    finally { setLaunchingInstance(null); }
+    try {
+      await desktop.launch(instance);
+    } catch (reason) {
+      onError(message(reason));
+    } finally {
+      setLaunchingInstance(null);
+    }
   }
 
   async function configureClientAssist(instance: InstanceDescriptor, enabled: boolean) {
@@ -126,7 +152,7 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
       let notice = outcome.message;
       if (outcome.kind === "manual" && enabled) {
         await copyText(outcome.jvm_argument);
-        notice = `${notice} The argument was copied to the clipboard.`;
+        notice = `${notice} ${t("instances.setup.copied-suffix")}`;
       }
       setSetupNotice((current) => ({ ...current, [instanceKey]: notice }));
       if (outcome.kind === "managed") await refresh();
@@ -139,54 +165,164 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
 
   return (
     <div className="page-view">
-      <div className="page-heading page-heading-row"><h1>Instances</h1><button className="button" onClick={refresh}><RefreshCw size={14} /> Refresh</button></div>
+      <div className="page-heading page-heading-row">
+        <h1>{t("instances.title")}</h1>
+        <button type="button" className="button" onClick={refresh}>
+          <RefreshCw size={14} /> {t("instances.refresh")}
+        </button>
+      </div>
       <section className="client-assist-card" aria-labelledby="client-assist-title">
         <div className="client-assist-heading">
-          <div className="client-assist-title"><span className={`status-dot ${clientAssist?.connected_agents ? "active" : "idle"}`} /><h2 id="client-assist-title">Session assistance</h2></div>
-          <span className="assist-count" aria-live="polite"><Plug size={14} /> {clientAssist?.connected_agents ?? 0} connected · {clientAssist?.ready_sessions ?? 0} ready</span>
+          <div className="client-assist-title">
+            <span className={`status-dot ${clientAssist?.connected_agents ? "active" : "idle"}`} />
+            <h2 id="client-assist-title">{t("instances.assistance.title")}</h2>
+          </div>
+          <span className="assist-count" aria-live="polite">
+            <Plug size={14} />{" "}
+            {t("instances.connected-count", {
+              connected: clientAssist?.connected_agents ?? 0,
+              ready: clientAssist?.ready_sessions ?? 0,
+            })}
+          </span>
         </div>
         <div className="jvm-argument-row">
-          <label>JVM argument<input readOnly value={clientAssist?.jvm_argument ?? "…"} /></label>
-          <button className="button" disabled={!clientAssist} onClick={() => void copyJvmArgument()}><Copy size={14} /> {copied ? "Copied" : "Copy"}</button>
+          <label>
+            {t("instances.jvm-argument")}
+            <input readOnly value={clientAssist?.jvm_argument ?? "…"} />
+          </label>
+          <button
+            type="button"
+            className="button"
+            disabled={!clientAssist}
+            onClick={() => void copyJvmArgument()}
+          >
+            <Copy size={14} /> {copied ? t("instances.copied") : t("instances.copy")}
+          </button>
         </div>
-        {clientAssist?.direct_oauth_available && <details className="direct-auth">
-          <summary><Settings2 size={14} /> Direct Microsoft sign-in</summary>
-          <div className="account-card">
-            {account ? (
-              <><div><CheckCircle2 size={16} /><strong>{account.profile.name}</strong></div><button className="button" onClick={() => void signOut()}><LogOut size={14} /> Sign out</button></>
-            ) : (
-              <div className="auth-form">
-                {!authStart ? (
-                  <button className="button" onClick={() => void beginSignIn()}><LogIn size={14} /> Sign in with Microsoft</button>
-                ) : (
-                  <div className="auth-complete">
-                    <a className="button" href={authStart.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Open sign-in</a>
-                    <label>Callback URL<input value={callbackUrl} onChange={(event) => setCallbackUrl(event.target.value)} placeholder="localhost callback URL" /></label>
-                    <button className="button primary" disabled={!callbackUrl} onClick={() => void completeSignIn()}>Complete sign-in</button>
+        {clientAssist?.direct_oauth_available && (
+          <details className="direct-auth">
+            <summary>
+              <Settings2 size={14} /> {t("instances.direct-signin")}
+            </summary>
+            <div className="account-card">
+              {account ? (
+                <>
+                  <div>
+                    <CheckCircle2 size={16} />
+                    <strong>{account.profile.name}</strong>
                   </div>
-                )}
-              </div>
-            )}
-          </div>
-        </details>}
+                  <button type="button" className="button" onClick={() => void signOut()}>
+                    <LogOut size={14} /> {t("instances.sign-out")}
+                  </button>
+                </>
+              ) : (
+                <div className="auth-form">
+                  {!authStart ? (
+                    <button type="button" className="button" onClick={() => void beginSignIn()}>
+                      <LogIn size={14} /> {t("instances.sign-in-microsoft")}
+                    </button>
+                  ) : (
+                    <div className="auth-complete">
+                      <a className="button" href={authStart.url} target="_blank" rel="noreferrer">
+                        <ExternalLink size={14} /> {t("instances.open-signin")}
+                      </a>
+                      <label>
+                        {t("instances.callback-url")}
+                        <input
+                          value={callbackUrl}
+                          onChange={(event) => setCallbackUrl(event.target.value)}
+                          placeholder={t("instances.callback-placeholder")}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="button primary"
+                        disabled={!callbackUrl}
+                        onClick={() => void completeSignIn()}
+                      >
+                        {t("instances.complete-signin")}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </details>
+        )}
       </section>
-      {instances.length ? <div className="instance-grid">{instances.map((instance) => {
-        const instanceKey = `${instance.launcher}-${instance.id}`;
-        const configuring = busyInstance === instanceKey;
-        const launching = launchingInstance === instanceKey;
-        return <article className="instance-card" key={instanceKey}>
-          <div>
-            <div className="instance-badges"><span className="loader-badge">{instance.loader}</span>{instance.client_assist_configured && <span className="configured-badge"><CheckCircle2 size={12} /> assisted</span>}</div>
-            <h2>{instance.name}</h2>
-            <p>{instance.minecraft_version ?? "Unknown version"} · {launcherLabels[instance.launcher]}</p>
-            {setupNotice[instanceKey] && <p className="instance-setup-note" aria-live="polite">{setupNotice[instanceKey]}</p>}
-          </div>
-          <div className="instance-actions">
-            {instance.supports_agent_configuration ? <button className="button" onClick={() => void configureClientAssist(instance, !instance.client_assist_configured)} disabled={configuring}>{configuring ? <Loader2 className="spin" size={14} /> : instance.client_assist_configured ? null : <Settings2 size={14} />} {instance.client_assist_configured ? "Remove assistance" : "Configure assistance"}</button> : <button className="button" onClick={() => void configureClientAssist(instance, true)} disabled={configuring}>{configuring ? <Loader2 className="spin" size={14} /> : <Copy size={14} />} Copy setup argument</button>}
-            <button className="button primary" onClick={() => void launch(instance)} disabled={launching}>{launching ? <Loader2 className="spin" size={14} /> : <Play size={14} />} {launching ? "Launching…" : "Launch"}</button>
-          </div>
-        </article>;
-      })}</div> : <EmptyState title="No instances found" detail="No supported launcher was found in its default location." />}
+      {instances.length ? (
+        <div className="instance-grid">
+          {instances.map((instance) => {
+            const instanceKey = `${instance.launcher}-${instance.id}`;
+            const configuring = busyInstance === instanceKey;
+            const launching = launchingInstance === instanceKey;
+            return (
+              <article className="instance-card" key={instanceKey}>
+                <div>
+                  <div className="instance-badges">
+                    <span className="loader-badge">{instance.loader}</span>
+                    {instance.client_assist_configured && (
+                      <span className="configured-badge">
+                        <CheckCircle2 size={12} /> {t("instances.assisted")}
+                      </span>
+                    )}
+                  </div>
+                  <h2>{instance.name}</h2>
+                  <p>
+                    {instance.minecraft_version ?? t("instances.unknown-version")} ·{" "}
+                    {launcherLabels[instance.launcher]}
+                  </p>
+                  {setupNotice[instanceKey] && (
+                    <p className="instance-setup-note" aria-live="polite">
+                      {setupNotice[instanceKey]}
+                    </p>
+                  )}
+                </div>
+                <div className="instance-actions">
+                  {instance.supports_agent_configuration ? (
+                    <button
+                      type="button"
+                      className="button"
+                      onClick={() => void configureClientAssist(instance, !instance.client_assist_configured)}
+                      disabled={configuring}
+                    >
+                      {configuring ? (
+                        <Loader2 className="spin" size={14} />
+                      ) : instance.client_assist_configured ? null : (
+                        <Settings2 size={14} />
+                      )}{" "}
+                      {instance.client_assist_configured
+                        ? t("instances.remove-assistance")
+                        : t("instances.configure-assistance")}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="button"
+                      onClick={() => void configureClientAssist(instance, true)}
+                      disabled={configuring}
+                    >
+                      {configuring ? <Loader2 className="spin" size={14} /> : <Copy size={14} />}{" "}
+                      {t("instances.copy-setup-argument")}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="button primary"
+                    onClick={() => void launch(instance)}
+                    disabled={launching}
+                  >
+                    {launching ? <Loader2 className="spin" size={14} /> : <Play size={14} />}{" "}
+                    {launching ? t("instances.launching") : t("instances.launch")}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <EmptyState title={t("instances.none.title")} detail={t("instances.none.detail")} />
+      )}
     </div>
   );
 }

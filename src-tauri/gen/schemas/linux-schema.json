@@ -177,6 +177,714 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the app_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-app-capabilities",
+          "markdownDescription": "Enables the app_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_begin command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-begin",
+          "markdownDescription": "Enables the auth_begin command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_complete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-complete",
+          "markdownDescription": "Enables the auth_complete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-refresh",
+          "markdownDescription": "Enables the auth_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-session",
+          "markdownDescription": "Enables the auth_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the auth_sign_out command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-auth-sign-out",
+          "markdownDescription": "Enables the auth_sign_out command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the capture_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-capture-import",
+          "markdownDescription": "Enables the capture_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the capture_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-capture-start",
+          "markdownDescription": "Enables the capture_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the capture_stats command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-capture-stats",
+          "markdownDescription": "Enables the capture_stats command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the capture_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-capture-stop",
+          "markdownDescription": "Enables the capture_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the client_assist_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-client-assist-status",
+          "markdownDescription": "Enables the client_assist_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the connections_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-connections-query",
+          "markdownDescription": "Enables the connections_query command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the decrypt_mode_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-decrypt-mode-set",
+          "markdownDescription": "Enables the decrypt_mode_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the decrypt_mode_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-decrypt-mode-status",
+          "markdownDescription": "Enables the decrypt_mode_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the field_edit command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-field-edit",
+          "markdownDescription": "Enables the field_edit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the filter_validate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-filter-validate",
+          "markdownDescription": "Enables the filter_validate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the filter_vocabulary command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-filter-vocabulary",
+          "markdownDescription": "Enables the filter_vocabulary command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the inspect_bytes command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-inspect-bytes",
+          "markdownDescription": "Enables the inspect_bytes command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the intercept_forward_all command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-intercept-forward-all",
+          "markdownDescription": "Enables the intercept_forward_all command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the intercept_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-intercept-pending",
+          "markdownDescription": "Enables the intercept_pending command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the intercept_resolve command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-intercept-resolve",
+          "markdownDescription": "Enables the intercept_resolve command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the intercept_settings_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-intercept-settings-get",
+          "markdownDescription": "Enables the intercept_settings_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the intercept_settings_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-intercept-settings-set",
+          "markdownDescription": "Enables the intercept_settings_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the launcher_client_assist_configure command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-launcher-client-assist-configure",
+          "markdownDescription": "Enables the launcher_client_assist_configure command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the launcher_instances command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-launcher-instances",
+          "markdownDescription": "Enables the launcher_instances command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the launcher_launch command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-launcher-launch",
+          "markdownDescription": "Enables the launcher_launch command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the network_conditions_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-network-conditions-get",
+          "markdownDescription": "Enables the network_conditions_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the network_conditions_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-network-conditions-set",
+          "markdownDescription": "Enables the network_conditions_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_annotation_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-annotation-set",
+          "markdownDescription": "Enables the packet_annotation_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_annotations_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-annotations-get",
+          "markdownDescription": "Enables the packet_annotations_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_annotations_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-annotations-list",
+          "markdownDescription": "Enables the packet_annotations_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_bytes command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-bytes",
+          "markdownDescription": "Enables the packet_bytes command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-detail",
+          "markdownDescription": "Enables the packet_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_layout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-layout",
+          "markdownDescription": "Enables the packet_layout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packets_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packets-delete",
+          "markdownDescription": "Enables the packets_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packets_export command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packets-export",
+          "markdownDescription": "Enables the packets_export command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packets_export_pcapng command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packets-export-pcapng",
+          "markdownDescription": "Enables the packets_export_pcapng command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packets_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packets-query",
+          "markdownDescription": "Enables the packets_query command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packets_query_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packets-query-cancel",
+          "markdownDescription": "Enables the packets_query_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_checkpoint command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-checkpoint",
+          "markdownDescription": "Enables the project_checkpoint command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_compact command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-compact",
+          "markdownDescription": "Enables the project_compact command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_create command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-create",
+          "markdownDescription": "Enables the project_create command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_current command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-current",
+          "markdownDescription": "Enables the project_current command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-open",
+          "markdownDescription": "Enables the project_open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_save_as command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-save-as",
+          "markdownDescription": "Enables the project_save_as command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the protocol_versions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-protocol-versions",
+          "markdownDescription": "Enables the protocol_versions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the proxy_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-proxy-sessions",
+          "markdownDescription": "Enables the proxy_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the repeater_send command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-repeater-send",
+          "markdownDescription": "Enables the repeater_send command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the repeater_tab_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-repeater-tab-delete",
+          "markdownDescription": "Enables the repeater_tab_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the repeater_tab_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-repeater-tab-save",
+          "markdownDescription": "Enables the repeater_tab_save command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the repeater_tabs command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-repeater-tabs",
+          "markdownDescription": "Enables the repeater_tabs command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the replacement_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-replacement-preview",
+          "markdownDescription": "Enables the replacement_preview command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the replacement_rules_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-replacement-rules-get",
+          "markdownDescription": "Enables the replacement_rules_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the replacement_rules_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-replacement-rules-set",
+          "markdownDescription": "Enables the replacement_rules_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the saved_filter_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-saved-filter-delete",
+          "markdownDescription": "Enables the saved_filter_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the saved_filter_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-saved-filter-save",
+          "markdownDescription": "Enables the saved_filter_save command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the saved_filters_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-saved-filters-list",
+          "markdownDescription": "Enables the saved_filters_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the schema_validate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-schema-validate",
+          "markdownDescription": "Enables the schema_validate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the traffic_stats command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-traffic-stats",
+          "markdownDescription": "Enables the traffic_stats command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the app_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-app-capabilities",
+          "markdownDescription": "Denies the app_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_begin command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-begin",
+          "markdownDescription": "Denies the auth_begin command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_complete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-complete",
+          "markdownDescription": "Denies the auth_complete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-refresh",
+          "markdownDescription": "Denies the auth_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-session",
+          "markdownDescription": "Denies the auth_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the auth_sign_out command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-auth-sign-out",
+          "markdownDescription": "Denies the auth_sign_out command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the capture_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-capture-import",
+          "markdownDescription": "Denies the capture_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the capture_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-capture-start",
+          "markdownDescription": "Denies the capture_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the capture_stats command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-capture-stats",
+          "markdownDescription": "Denies the capture_stats command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the capture_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-capture-stop",
+          "markdownDescription": "Denies the capture_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the client_assist_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-client-assist-status",
+          "markdownDescription": "Denies the client_assist_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the connections_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-connections-query",
+          "markdownDescription": "Denies the connections_query command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the decrypt_mode_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-decrypt-mode-set",
+          "markdownDescription": "Denies the decrypt_mode_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the decrypt_mode_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-decrypt-mode-status",
+          "markdownDescription": "Denies the decrypt_mode_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the field_edit command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-field-edit",
+          "markdownDescription": "Denies the field_edit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the filter_validate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-filter-validate",
+          "markdownDescription": "Denies the filter_validate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the filter_vocabulary command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-filter-vocabulary",
+          "markdownDescription": "Denies the filter_vocabulary command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the inspect_bytes command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-inspect-bytes",
+          "markdownDescription": "Denies the inspect_bytes command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the intercept_forward_all command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-intercept-forward-all",
+          "markdownDescription": "Denies the intercept_forward_all command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the intercept_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-intercept-pending",
+          "markdownDescription": "Denies the intercept_pending command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the intercept_resolve command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-intercept-resolve",
+          "markdownDescription": "Denies the intercept_resolve command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the intercept_settings_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-intercept-settings-get",
+          "markdownDescription": "Denies the intercept_settings_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the intercept_settings_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-intercept-settings-set",
+          "markdownDescription": "Denies the intercept_settings_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the launcher_client_assist_configure command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-launcher-client-assist-configure",
+          "markdownDescription": "Denies the launcher_client_assist_configure command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the launcher_instances command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-launcher-instances",
+          "markdownDescription": "Denies the launcher_instances command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the launcher_launch command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-launcher-launch",
+          "markdownDescription": "Denies the launcher_launch command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the network_conditions_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-network-conditions-get",
+          "markdownDescription": "Denies the network_conditions_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the network_conditions_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-network-conditions-set",
+          "markdownDescription": "Denies the network_conditions_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_annotation_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-annotation-set",
+          "markdownDescription": "Denies the packet_annotation_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_annotations_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-annotations-get",
+          "markdownDescription": "Denies the packet_annotations_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_annotations_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-annotations-list",
+          "markdownDescription": "Denies the packet_annotations_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_bytes command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-bytes",
+          "markdownDescription": "Denies the packet_bytes command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_detail command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-detail",
+          "markdownDescription": "Denies the packet_detail command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_layout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-layout",
+          "markdownDescription": "Denies the packet_layout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packets_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packets-delete",
+          "markdownDescription": "Denies the packets_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packets_export command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packets-export",
+          "markdownDescription": "Denies the packets_export command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packets_export_pcapng command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packets-export-pcapng",
+          "markdownDescription": "Denies the packets_export_pcapng command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packets_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packets-query",
+          "markdownDescription": "Denies the packets_query command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packets_query_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packets-query-cancel",
+          "markdownDescription": "Denies the packets_query_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_checkpoint command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-checkpoint",
+          "markdownDescription": "Denies the project_checkpoint command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_compact command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-compact",
+          "markdownDescription": "Denies the project_compact command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_create command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-create",
+          "markdownDescription": "Denies the project_create command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_current command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-current",
+          "markdownDescription": "Denies the project_current command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-open",
+          "markdownDescription": "Denies the project_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_save_as command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-save-as",
+          "markdownDescription": "Denies the project_save_as command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the protocol_versions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-protocol-versions",
+          "markdownDescription": "Denies the protocol_versions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the proxy_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-proxy-sessions",
+          "markdownDescription": "Denies the proxy_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the repeater_send command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-repeater-send",
+          "markdownDescription": "Denies the repeater_send command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the repeater_tab_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-repeater-tab-delete",
+          "markdownDescription": "Denies the repeater_tab_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the repeater_tab_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-repeater-tab-save",
+          "markdownDescription": "Denies the repeater_tab_save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the repeater_tabs command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-repeater-tabs",
+          "markdownDescription": "Denies the repeater_tabs command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the replacement_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-replacement-preview",
+          "markdownDescription": "Denies the replacement_preview command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the replacement_rules_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-replacement-rules-get",
+          "markdownDescription": "Denies the replacement_rules_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the replacement_rules_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-replacement-rules-set",
+          "markdownDescription": "Denies the replacement_rules_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the saved_filter_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-saved-filter-delete",
+          "markdownDescription": "Denies the saved_filter_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the saved_filter_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-saved-filter-save",
+          "markdownDescription": "Denies the saved_filter_save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the saved_filters_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-saved-filters-list",
+          "markdownDescription": "Denies the saved_filters_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the schema_validate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-schema-validate",
+          "markdownDescription": "Denies the schema_validate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the traffic_stats command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-traffic-stats",
+          "markdownDescription": "Denies the traffic_stats command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",
@@ -2191,6 +2899,72 @@
           "type": "string",
           "const": "core:window:deny-unminimize",
           "markdownDescription": "Denies the unminimize command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures the types of dialogs\navailable from the dialog plugin.\n\n#### Granted Permissions\n\nAll dialog types are enabled.\n\n\n\n#### This default permission set includes:\n\n- `allow-message`\n- `allow-save`\n- `allow-open`",
+          "type": "string",
+          "const": "dialog:default",
+          "markdownDescription": "This permission set configures the types of dialogs\navailable from the dialog plugin.\n\n#### Granted Permissions\n\nAll dialog types are enabled.\n\n\n\n#### This default permission set includes:\n\n- `allow-message`\n- `allow-save`\n- `allow-open`"
+        },
+        {
+          "description": "Enables the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:allow-ask",
+          "markdownDescription": "Enables the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)"
+        },
+        {
+          "description": "Enables the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:allow-confirm",
+          "markdownDescription": "Enables the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)"
+        },
+        {
+          "description": "Enables the message command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-message",
+          "markdownDescription": "Enables the message command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-open",
+          "markdownDescription": "Enables the open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-save",
+          "markdownDescription": "Enables the save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:deny-ask",
+          "markdownDescription": "Denies the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)"
+        },
+        {
+          "description": "Denies the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:deny-confirm",
+          "markdownDescription": "Denies the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)"
+        },
+        {
+          "description": "Denies the message command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-message",
+          "markdownDescription": "Denies the message command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-open",
+          "markdownDescription": "Denies the open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-save",
+          "markdownDescription": "Denies the save command without any pre-configured scope."
         }
       ]
     },

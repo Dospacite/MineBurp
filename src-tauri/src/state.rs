@@ -89,8 +89,25 @@ impl DesktopState {
     /// away, and passive capture only lived in a bounded in-memory ring — which
     /// is why a running capture appeared to contain nothing but encrypted
     /// traffic. It is deleted when a real project replaces it.
-    pub fn open_temporary_project(&self) -> Result<ProjectStore, ProjectError> {
-        let path = env::temp_dir().join(format!("mineburp-session-{}.mineburp", Uuid::new_v4()));
+    ///
+    /// The file holds decrypted traffic, so it lives in `sessions_dir` — a
+    /// directory only this user can enter — rather than the shared system
+    /// temporary directory, where other local users could read it.
+    pub fn open_temporary_project(
+        &self,
+        sessions_dir: &Path,
+    ) -> Result<ProjectStore, ProjectError> {
+        prepare_private_directory(sessions_dir).map_err(|error| {
+            ProjectError::Storage(format!(
+                "cannot prepare {}: {error}",
+                sessions_dir.display()
+            ))
+        })?;
+        let path = sessions_dir.join(format!(
+            "{SESSION_PREFIX}{}-{}.mineburp",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
         let store = ProjectStore::create(&path, "Temporary session", ProjectOptions::default())?;
         self.proxy.set_project(Some(store.clone()));
         *self.project.write() = Some(store.clone());
@@ -157,11 +174,91 @@ impl DesktopState {
     }
 }
 
+const SESSION_PREFIX: &str = "mineburp-session-";
+
+/// Creates `directory` if needed and makes it private to this user.
+fn prepare_private_directory(directory: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Deletes scratch projects a crashed or killed session left behind.
+///
+/// Each scratch file carries the id of the process that created it, so a file
+/// is removed only when that process is gone: a second `MineBurp` window's
+/// live session is left alone. Scratch files from builds that kept them in the
+/// shared temporary directory carry no process id; those are removed once they
+/// have not been written to for a day.
+pub fn remove_abandoned_sessions(sessions_dir: &Path) -> usize {
+    let mut removed = 0;
+    if let Ok(entries) = fs::read_dir(sessions_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(SESSION_PREFIX) else {
+                continue;
+            };
+            if !name.ends_with(".mineburp") {
+                continue;
+            }
+            let pid = rest
+                .split('-')
+                .next()
+                .and_then(|value| value.parse::<u32>().ok());
+            let abandoned = match pid {
+                Some(pid) => pid != std::process::id() && !process_alive(pid),
+                None => older_than_a_day(&entry.path()),
+            };
+            if abandoned {
+                remove_project_files(&entry.path());
+                removed += 1;
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(env::temp_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(SESSION_PREFIX)
+                && name.ends_with(".mineburp")
+                && older_than_a_day(&entry.path())
+            {
+                remove_project_files(&entry.path());
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+fn older_than_a_day(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > std::time::Duration::from_hours(24))
+}
+
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Without a cheap, safe liveness check, a file is treated as abandoned only
+/// once it has gone a day without writes.
+#[cfg(not(target_os = "linux"))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Best-effort removal of a project and its `SQLite` sidecars.
 ///
 /// A handle may still be alive in the capture writer, so failures are expected
 /// on platforms that refuse to unlink an open file and are not worth surfacing:
-/// the file is in the system temporary directory either way.
+/// the next start removes whatever is left.
 fn remove_project_files(path: &Path) {
     let _ = fs::remove_file(path);
     for suffix in ["-wal", "-shm"] {
@@ -285,4 +382,43 @@ fn preferred_executable(candidates: &[PathBuf], fallback: &str) -> PathBuf {
         .find(|path| path.is_file())
         .cloned()
         .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removes_only_sessions_whose_process_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let mine = directory
+            .path()
+            .join(format!("{SESSION_PREFIX}{}-a.mineburp", std::process::id()));
+        // A pid far beyond any real one.
+        let dead = directory
+            .path()
+            .join(format!("{SESSION_PREFIX}4000000000-b.mineburp"));
+        let unrelated = directory.path().join("notes.mineburp");
+        for path in [&mine, &dead, &unrelated] {
+            fs::write(path, b"x").unwrap();
+        }
+        let mut wal = dead.as_os_str().to_owned();
+        wal.push("-wal");
+        fs::write(&wal, b"w").unwrap();
+        prepare_private_directory(directory.path()).unwrap();
+
+        remove_abandoned_sessions(directory.path());
+        assert!(mine.exists(), "this process's session stays");
+        assert!(unrelated.exists(), "files that are not sessions stay");
+        if cfg!(target_os = "linux") {
+            assert!(!dead.exists());
+            assert!(!PathBuf::from(wal).exists(), "sidecars go with it");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(directory.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+    }
 }

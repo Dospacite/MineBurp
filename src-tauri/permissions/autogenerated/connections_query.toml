@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-connections-query"
+description = "Enables the connections_query command without any pre-configured scope."
+commands.allow = ["connections_query"]
+
+[[permission]]
+identifier = "deny-connections-query"
+description = "Denies the connections_query command without any pre-configured scope."
+commands.deny = ["connections_query"]

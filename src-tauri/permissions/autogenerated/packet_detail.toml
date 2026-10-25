@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-packet-detail"
+description = "Enables the packet_detail command without any pre-configured scope."
+commands.allow = ["packet_detail"]
+
+[[permission]]
+identifier = "deny-packet-detail"
+description = "Denies the packet_detail command without any pre-configured scope."
+commands.deny = ["packet_detail"]

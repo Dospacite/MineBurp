@@ -11,3 +11,9 @@
 .env
 .env.*
 !.env.example
+# Minecraft/Zulu jars and downloaded version assets — not source
+/libraries/
+/versions/
+/logs/
+# Biome cache
+.biome/

@@ -1,6 +1,8 @@
 import { Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
+import { EmptyState } from "../components/EmptyState";
+import { ExpressionInput } from "../components/ExpressionInput";
+import { Split } from "../components/Split";
 import type {
   Direction,
   PacketEdit,
@@ -9,21 +11,27 @@ import type {
   ProtocolState,
   ReplacementRule,
 } from "../domain/types";
-import { EmptyState } from "../components/EmptyState";
-import { Split } from "../components/Split";
-import { base64ToBytes, desktop, formatHexInput, parseHex } from "../lib/desktop";
 import { message } from "../hooks/useMineBurp";
+import { t } from "../i18n";
+import { base64ToBytes, desktop, formatHexInput, parseHex } from "../lib/desktop";
+import { newId } from "../lib/ids";
 
 const STATES: ProtocolState[] = ["handshake", "status", "login", "configuration", "play"];
 
-const EDIT_KINDS: Array<{ value: PacketEditKind; label: string }> = [
-  { value: "field", label: "Set field" },
-  { value: "field_replace", label: "Replace in field" },
-  { value: "text", label: "Find text" },
-  { value: "regex", label: "Regex" },
-  { value: "bytes", label: "Find bytes" },
-  { value: "range", label: "Byte range" },
-  { value: "frame", label: "Whole frame" },
+/** A request from elsewhere in the workbench to start a rule for some packets. */
+export interface RuleRequest {
+  expression: string;
+  nonce: number;
+}
+
+const EDIT_KINDS: Array<{ value: PacketEditKind; labelKey: Parameters<typeof t>[0] }> = [
+  { value: "field", labelKey: "replace.kind.field" },
+  { value: "field_replace", labelKey: "replace.kind.field_replace" },
+  { value: "text", labelKey: "replace.kind.text" },
+  { value: "regex", labelKey: "replace.kind.regex" },
+  { value: "bytes", labelKey: "replace.kind.bytes" },
+  { value: "range", labelKey: "replace.kind.range" },
+  { value: "frame", labelKey: "replace.kind.frame" },
 ];
 
 function blankEdit(kind: PacketEditKind): PacketEdit {
@@ -53,10 +61,14 @@ function blankEdit(kind: PacketEditKind): PacketEdit {
  */
 export function ReplaceView({
   seed,
+  request = null,
+  onRequestHandled,
   onError,
 }: {
   /** The packet selected in Traffic, offered as a preview subject. */
   seed: PacketView | null;
+  request?: RuleRequest | null;
+  onRequestHandled?: (nonce: number) => void;
   onError: (error: string) => void;
 }) {
   const [rules, setRules] = useState<ReplacementRule[]>([]);
@@ -65,16 +77,22 @@ export function ReplaceView({
   const [sample, setSample] = useState("");
   const [state, setState] = useState<ProtocolState>("play");
   const [direction, setDirection] = useState<Direction>("client_to_server");
+  /** The protocol the sample was captured under, so field edits resolve against the right layout. */
+  const [sampleVersion, setSampleVersion] = useState<number | null>(null);
   const [preview, setPreview] = useState<{ hex: string; error: string | null }>({ hex: "", error: null });
+  /** Rules have arrived from the project; until then a save would overwrite them. */
+  const [loaded, setLoaded] = useState(!desktop.isAvailable());
   const saveTimer = useRef(0);
+  const previewRequest = useRef(0);
 
   useEffect(() => {
     if (!desktop.isAvailable()) return;
     void desktop
       .replacementRules()
-      .then((loaded) => {
-        setRules(loaded);
-        setSelectedId((current) => current ?? loaded[0]?.id ?? null);
+      .then((stored) => {
+        setRules(stored);
+        setSelectedId((current) => current ?? stored[0]?.id ?? null);
+        setLoaded(true);
       })
       .catch((reason) => onError(message(reason)));
   }, [onError]);
@@ -107,17 +125,25 @@ export function ReplaceView({
     update(rules.map((rule) => (rule.id === selected.id ? { ...rule, ...change } : rule)));
   }
 
-  function addRule() {
+  function addRule(expression = "") {
     const rule: ReplacementRule = {
-      id: crypto.randomUUID(),
-      name: `Rule ${rules.length + 1}`,
+      id: newId(),
+      name: t("replace.rule.default", { index: rules.length + 1 }),
       enabled: false,
-      expression: "",
+      expression,
       edits: [blankEdit("field")],
     };
     update([...rules, rule]);
     setSelectedId(rule.id);
   }
+
+  // A rule asked for from the history starts disabled with its selector filled in.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: each request is handled once, by nonce.
+  useEffect(() => {
+    if (!request || !loaded) return;
+    addRule(request.expression);
+    onRequestHandled?.(request.nonce);
+  }, [request?.nonce, loaded]);
 
   function removeRule(id: string) {
     const next = rules.filter((rule) => rule.id !== id);
@@ -143,6 +169,7 @@ export function ReplaceView({
   // The preview runs the same edits the proxy would run, against bytes the
   // operator supplies, so a rule can be checked before it is enabled.
   useEffect(() => {
+    const requestId = ++previewRequest.current;
     if (!desktop.isAvailable() || !sample.trim() || edits.length === 0) {
       setPreview({ hex: "", error: null });
       return undefined;
@@ -150,38 +177,64 @@ export function ReplaceView({
     const timer = window.setTimeout(() => {
       void (async () => {
         try {
-          const bytes = await desktop.replacementPreview(parseHex(sample), state, direction, edits);
-          setPreview({ hex: formatHexInput(bytes), error: null });
+          const bytes = await desktop.replacementPreview(
+            parseHex(sample),
+            state,
+            direction,
+            edits,
+            sampleVersion,
+          );
+          // An older preview resolving late must not overwrite a newer one.
+          if (requestId === previewRequest.current) setPreview({ hex: formatHexInput(bytes), error: null });
         } catch (reason) {
-          setPreview({ hex: "", error: message(reason) });
+          if (requestId === previewRequest.current) setPreview({ hex: "", error: message(reason) });
         }
       })();
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [direction, edits, sample, state]);
+  }, [direction, edits, sample, sampleVersion, state]);
 
   return (
-    <Split orientation="columns" storageKey="replace" initial={[0.26, 0.74]} minimum={200} className="replace-layout">
+    <Split
+      orientation="columns"
+      storageKey="replace"
+      initial={[0.26, 0.74]}
+      minimum={200}
+      className="replace-layout"
+    >
       <aside className="rule-list">
         <div className="rule-list-header">
-          <span>Rules</span>
-          <button className="button" onClick={addRule}><Plus size={14} /> New</button>
+          <span>{t("replace.rules")}</span>
+          <button type="button" className="button" onClick={() => addRule()} disabled={!loaded}>
+            <Plus size={14} /> {t("replace.new")}
+          </button>
         </div>
         {rules.map((rule) => (
           <div className={`rule-card ${rule.id === selectedId ? "selected" : ""}`} key={rule.id}>
             <input
               type="checkbox"
               checked={rule.enabled}
-              aria-label={`Enable ${rule.name}`}
+              aria-label={t("replace.enable-rule", { name: rule.name })}
               onChange={(event) =>
-                update(rules.map((item) => (item.id === rule.id ? { ...item, enabled: event.target.checked } : item)))
+                update(
+                  rules.map((item) =>
+                    item.id === rule.id ? { ...item, enabled: event.target.checked } : item,
+                  ),
+                )
               }
             />
-            <button className="rule-open" onClick={() => setSelectedId(rule.id)}>
+            <button type="button" className="rule-open" onClick={() => setSelectedId(rule.id)}>
               <strong>{rule.name}</strong>
-              <small>{rule.expression || "every packet"} · {rule.edits.length}</small>
+              <small>
+                {rule.expression || t("replace.every-packet")} · {rule.edits.length}
+              </small>
             </button>
-            <button className="icon-button" aria-label={`Delete ${rule.name}`} onClick={() => removeRule(rule.id)}>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={t("replace.delete-rule", { name: rule.name })}
+              onClick={() => removeRule(rule.id)}
+            >
               <Trash2 size={14} />
             </button>
           </div>
@@ -191,24 +244,36 @@ export function ReplaceView({
       {selected ? (
         <section className="rule-editor">
           <div className="rule-editor-form">
-            <label>Name<input value={selected.name} onChange={(event) => patch({ name: event.target.value })} /></label>
             <label>
-              Applies to
-              <input
+              {t("replace.name")}
+              <input value={selected.name} onChange={(event) => patch({ name: event.target.value })} />
+            </label>
+            {/* biome-ignore lint/a11y/noLabelWithoutControl: the label wraps ExpressionInput's input. */}
+            <label>
+              {t("replace.applies-to")}
+              <ExpressionInput
                 value={selected.expression}
-                spellCheck={false}
-                placeholder="every packet"
-                aria-invalid={expressionError !== null}
-                onChange={(event) => patch({ expression: event.target.value })}
-                onBlur={(event) => void validateExpression(event.target.value)}
+                placeholder={t("replace.every-packet")}
+                ariaLabel={t("replace.applies-to")}
+                invalid={expressionError !== null}
+                onChange={(expression) => patch({ expression })}
+                onBlur={() => void validateExpression(selected.expression)}
               />
             </label>
             <label className="rule-enabled">
-              <input type="checkbox" checked={selected.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />
-              Enabled
+              <input
+                type="checkbox"
+                checked={selected.enabled}
+                onChange={(event) => patch({ enabled: event.target.checked })}
+              />
+              {t("replace.enabled")}
             </label>
           </div>
-          {expressionError && <p className="filter-error" role="alert">{expressionError}</p>}
+          {expressionError && (
+            <p className="filter-error" role="alert">
+              {expressionError}
+            </p>
+          )}
 
           <div className="rule-edits">
             {edits.map((edit, index) => (
@@ -219,42 +284,82 @@ export function ReplaceView({
                 onRemove={() => patch({ edits: edits.filter((_, at) => at !== index) })}
               />
             ))}
-            <button className="button" onClick={() => patch({ edits: [...edits, blankEdit("field")] })}>
-              <Plus size={14} /> Add edit
+            <button
+              type="button"
+              className="button"
+              onClick={() => patch({ edits: [...edits, blankEdit("field")] })}
+            >
+              <Plus size={14} /> {t("replace.add-edit")}
             </button>
           </div>
 
           <div className="rule-preview">
             <div className="rule-preview-controls">
-              <label>State<select value={state} onChange={(event) => setState(event.target.value as ProtocolState)}>{STATES.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
-              <label>Direction<select value={direction} onChange={(event) => setDirection(event.target.value as Direction)}><option value="client_to_server">Client → server</option><option value="server_to_client">Server → client</option></select></label>
+              <label>
+                {t("replace.state")}
+                <select value={state} onChange={(event) => setState(event.target.value as ProtocolState)}>
+                  {STATES.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                {t("replace.direction")}
+                <select value={direction} onChange={(event) => setDirection(event.target.value as Direction)}>
+                  <option value="client_to_server">{t("replace.direction.c2s")}</option>
+                  <option value="server_to_client">{t("replace.direction.s2c")}</option>
+                </select>
+              </label>
               <button
+                type="button"
                 className="button"
                 disabled={!seed}
                 onClick={() => {
                   if (!seed) return;
                   setSample(formatHexInput(base64ToBytes(seed.bytes_base64)));
-                  setState(seed.summary.state === "opaque" || seed.summary.state === "closed" ? "play" : seed.summary.state);
+                  setSampleVersion(seed.summary.protocol_version);
+                  setState(
+                    seed.summary.state === "opaque" || seed.summary.state === "closed"
+                      ? "play"
+                      : seed.summary.state,
+                  );
                   setDirection(seed.summary.direction);
                 }}
               >
-                From selected packet
+                {t("replace.from-selected")}
               </button>
             </div>
             <div className="rule-preview-panes">
               <label className="rule-preview-pane">
-                Input
-                <textarea className="hex-editor" spellCheck={false} value={sample} onChange={(event) => setSample(event.target.value)} />
+                {t("replace.input")}
+                <textarea
+                  className="hex-editor"
+                  spellCheck={false}
+                  value={sample}
+                  onChange={(event) => setSample(event.target.value)}
+                />
+                {sampleVersion !== null && (
+                  <small className="filter-hint">
+                    {t("replace.sample-version", { version: sampleVersion })}
+                  </small>
+                )}
               </label>
               <label className="rule-preview-pane">
-                Result
-                <textarea className="hex-editor" spellCheck={false} readOnly value={preview.error ?? preview.hex} />
+                {t("replace.result")}
+                <textarea
+                  className="hex-editor"
+                  spellCheck={false}
+                  readOnly
+                  value={preview.error ?? preview.hex}
+                />
               </label>
             </div>
           </div>
         </section>
       ) : (
-        <EmptyState title="No rule selected" detail="Create a rule to rewrite matching packets automatically." />
+        <EmptyState title={t("replace.no-rule.title")} detail={t("replace.no-rule.detail")} />
       )}
     </Split>
   );
@@ -272,69 +377,187 @@ function EditRow({
   return (
     <div className="rule-edit">
       <select
-        aria-label="Edit kind"
+        aria-label={t("replace.edit-kind")}
         value={edit.kind}
         onChange={(event) => onChange(blankEdit(event.target.value as PacketEditKind))}
       >
         {EDIT_KINDS.map((kind) => (
-          <option key={kind.value} value={kind.value}>{kind.label}</option>
+          <option key={kind.value} value={kind.value}>
+            {t(kind.labelKey)}
+          </option>
         ))}
       </select>
 
       {edit.kind === "frame" && (
-        <label>Bytes<input className="hex" spellCheck={false} value={edit.bytes} onChange={(event) => onChange({ ...edit, bytes: event.target.value })} placeholder="00 0f" /></label>
+        <label>
+          {t("form.bytes")}
+          <input
+            className="hex"
+            spellCheck={false}
+            value={edit.bytes}
+            onChange={(event) => onChange({ ...edit, bytes: event.target.value })}
+            placeholder="00 0f"
+          />
+        </label>
       )}
 
       {edit.kind === "range" && (
         <>
-          <label>Offset<input type="number" min={0} value={edit.offset} onChange={(event) => onChange({ ...edit, offset: Number(event.target.value) || 0 })} /></label>
-          <label>Length<input type="number" min={0} value={edit.length} onChange={(event) => onChange({ ...edit, length: Number(event.target.value) || 0 })} /></label>
-          <label>Bytes<input className="hex" spellCheck={false} value={edit.bytes} onChange={(event) => onChange({ ...edit, bytes: event.target.value })} placeholder="ca fe" /></label>
+          <label>
+            {t("form.offset")}
+            <input
+              type="number"
+              min={0}
+              value={edit.offset}
+              onChange={(event) => onChange({ ...edit, offset: Number(event.target.value) || 0 })}
+            />
+          </label>
+          <label>
+            {t("form.length")}
+            <input
+              type="number"
+              min={0}
+              value={edit.length}
+              onChange={(event) => onChange({ ...edit, length: Number(event.target.value) || 0 })}
+            />
+          </label>
+          <label>
+            {t("form.bytes")}
+            <input
+              className="hex"
+              spellCheck={false}
+              value={edit.bytes}
+              onChange={(event) => onChange({ ...edit, bytes: event.target.value })}
+              placeholder="ca fe"
+            />
+          </label>
         </>
       )}
 
       {edit.kind === "bytes" && (
         <>
-          <label>Find<input className="hex" spellCheck={false} value={edit.find} onChange={(event) => onChange({ ...edit, find: event.target.value })} placeholder="de ad" /></label>
-          <label>Replace<input className="hex" spellCheck={false} value={edit.replace} onChange={(event) => onChange({ ...edit, replace: event.target.value })} placeholder="be ef" /></label>
-          <Toggle label="All" checked={edit.all} onChange={(all) => onChange({ ...edit, all })} />
+          <label>
+            {t("form.find")}
+            <input
+              className="hex"
+              spellCheck={false}
+              value={edit.find}
+              onChange={(event) => onChange({ ...edit, find: event.target.value })}
+              placeholder="de ad"
+            />
+          </label>
+          <label>
+            {t("form.replace")}
+            <input
+              className="hex"
+              spellCheck={false}
+              value={edit.replace}
+              onChange={(event) => onChange({ ...edit, replace: event.target.value })}
+              placeholder="be ef"
+            />
+          </label>
+          <Toggle label={t("form.all")} checked={edit.all} onChange={(all) => onChange({ ...edit, all })} />
         </>
       )}
 
       {edit.kind === "text" && (
         <>
-          <label>Find<input value={edit.find} onChange={(event) => onChange({ ...edit, find: event.target.value })} /></label>
-          <label>Replace<input value={edit.replace} onChange={(event) => onChange({ ...edit, replace: event.target.value })} /></label>
-          <Toggle label="All" checked={edit.all} onChange={(all) => onChange({ ...edit, all })} />
-          <Toggle label="Aa" checked={!edit.case_insensitive} onChange={(sensitive) => onChange({ ...edit, case_insensitive: !sensitive })} />
+          <label>
+            {t("form.find")}
+            <input value={edit.find} onChange={(event) => onChange({ ...edit, find: event.target.value })} />
+          </label>
+          <label>
+            {t("form.replace")}
+            <input
+              value={edit.replace}
+              onChange={(event) => onChange({ ...edit, replace: event.target.value })}
+            />
+          </label>
+          <Toggle label={t("form.all")} checked={edit.all} onChange={(all) => onChange({ ...edit, all })} />
+          <Toggle
+            label={t("form.match-case")}
+            checked={!edit.case_insensitive}
+            onChange={(sensitive) => onChange({ ...edit, case_insensitive: !sensitive })}
+          />
         </>
       )}
 
       {edit.kind === "regex" && (
         <>
-          <label>Pattern<input className="hex" spellCheck={false} value={edit.pattern} onChange={(event) => onChange({ ...edit, pattern: event.target.value })} placeholder="player_?name" /></label>
-          <label>Replace<input value={edit.replace} onChange={(event) => onChange({ ...edit, replace: event.target.value })} placeholder="$0" /></label>
-          <Toggle label="All" checked={edit.all} onChange={(all) => onChange({ ...edit, all })} />
+          <label>
+            {t("form.pattern")}
+            <input
+              className="hex"
+              spellCheck={false}
+              value={edit.pattern}
+              onChange={(event) => onChange({ ...edit, pattern: event.target.value })}
+              placeholder="player_?name"
+            />
+          </label>
+          <label>
+            {t("form.replace")}
+            <input
+              value={edit.replace}
+              onChange={(event) => onChange({ ...edit, replace: event.target.value })}
+              placeholder="$0"
+            />
+          </label>
+          <Toggle label={t("form.all")} checked={edit.all} onChange={(all) => onChange({ ...edit, all })} />
         </>
       )}
 
       {edit.kind === "field" && (
         <>
-          <label>Field<input value={edit.name} onChange={(event) => onChange({ ...edit, name: event.target.value })} placeholder="server address" /></label>
-          <label>Value<input value={edit.value} onChange={(event) => onChange({ ...edit, value: event.target.value })} /></label>
+          <label>
+            {t("form.field")}
+            <input
+              value={edit.name}
+              onChange={(event) => onChange({ ...edit, name: event.target.value })}
+              placeholder="server address"
+            />
+          </label>
+          <label>
+            {t("form.value")}
+            <input
+              value={edit.value}
+              onChange={(event) => onChange({ ...edit, value: event.target.value })}
+            />
+          </label>
         </>
       )}
 
       {edit.kind === "field_replace" && (
         <>
-          <label>Field<input value={edit.name} onChange={(event) => onChange({ ...edit, name: event.target.value })} placeholder="message" /></label>
-          <label>Find<input value={edit.find} onChange={(event) => onChange({ ...edit, find: event.target.value })} /></label>
-          <label>Replace<input value={edit.replace} onChange={(event) => onChange({ ...edit, replace: event.target.value })} /></label>
-          <Toggle label="Regex" checked={edit.regex} onChange={(regex) => onChange({ ...edit, regex })} />
+          <label>
+            {t("form.field")}
+            <input
+              value={edit.name}
+              onChange={(event) => onChange({ ...edit, name: event.target.value })}
+              placeholder="message"
+            />
+          </label>
+          <label>
+            {t("form.find")}
+            <input value={edit.find} onChange={(event) => onChange({ ...edit, find: event.target.value })} />
+          </label>
+          <label>
+            {t("form.replace")}
+            <input
+              value={edit.replace}
+              onChange={(event) => onChange({ ...edit, replace: event.target.value })}
+            />
+          </label>
+          <Toggle
+            label={t("filter.regex")}
+            checked={edit.regex}
+            onChange={(regex) => onChange({ ...edit, regex })}
+          />
         </>
       )}
 
-      <button className="icon-button" aria-label="Remove edit" onClick={onRemove}><Trash2 size={14} /></button>
+      <button type="button" className="icon-button" aria-label={t("replace.remove-edit")} onClick={onRemove}>
+        <Trash2 size={14} />
+      </button>
     </div>
   );
 }

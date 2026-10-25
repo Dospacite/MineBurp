@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import type { FieldKind, FieldSpan, PacketLayout } from "../domain/types";
+import { t } from "../i18n";
 
 /**
  * The decoded, editable view of a frame.
@@ -20,7 +21,7 @@ export function FieldEditor({
   busy: boolean;
 }) {
   if (!layout || layout.fields.length === 0) {
-    return <p className="decoded-empty">No decoded fields</p>;
+    return <p className="decoded-empty">{t("fields.none")}</p>;
   }
 
   return (
@@ -36,13 +37,7 @@ export function FieldEditor({
   );
 }
 
-function FieldRow({
-  field,
-  onCommit,
-}: {
-  field: FieldSpan;
-  onCommit: (value: string | boolean) => void;
-}) {
+function FieldRow({ field, onCommit }: { field: FieldSpan; onCommit: (value: string | boolean) => void }) {
   const [draft, setDraft] = useState(() => text(field.value));
 
   // A re-decode after any edit replaces the values under the editor, so the

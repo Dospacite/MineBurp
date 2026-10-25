@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -9,37 +9,68 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use mineburp_core::{
-    ConnectionId, ConnectionSnapshot, ConnectionStatus, Direction, Disposition, InterceptDecision,
-    InterceptRule, PacketDetail, PacketSummary, ProtocolState, ReplacementRule, Target,
-    TrafficSource, WireMetadata,
+    ConnectionId, ConnectionSnapshot, ConnectionStatus, Direction, Disposition, PacketDetail,
+    PacketSummary, ProtocolState, ReplacementRule, Target, TrafficSource, WireMetadata,
 };
 use mineburp_project::{ProjectError, ProjectStore};
 use mineburp_protocol::{
-    FrameCodec, HandshakeError, PacketFrame, PacketRegistry, ProtocolError, SchemaError,
-    SchemaPack, decode_common_packet, decode_handshake, decode_var_i32, encode_handshake,
+    EncryptionRequest, FrameCodec, HandshakeError, PacketFrame, PacketRegistry, ProtocolError,
+    SchemaError, SchemaPack, decode_common_packet, decode_handshake, decode_var_i32,
+    encode_handshake,
 };
 use mineburp_session::{
     SessionJoinProvider, SessionJoinRequest, TransparentRouteProvider, TransparentTarget,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
     task::JoinSet,
+    time::{Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    CompiledFilter, EncryptionBridgeError, FilterParseError,
+    CompiledFilter, EncryptionBridgeError, FilterParseError, InterceptDecision, InterceptError,
+    InterceptSettings, InterceptedPacket, Interceptor, NetworkConditions, NetworkConditionsError,
     encryption::{EncryptionBridge, LinkCipher},
+    network::Shaper,
 };
 
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 512;
+
+/// Bytes one writer may have queued before its reader waits.
+///
+/// A frame-count bound alone allowed 512 maximum-size frames — gigabytes — to
+/// pile up behind a stalled peer.
+const WRITER_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+
+/// How long a closing session gives its writers to deliver what is queued —
+/// the server's disconnect reason, above all — before the sockets are dropped.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Frames read while one is held, waiting their turn, are capped so a held
+/// frame cannot make the proxy buffer an unbounded amount of traffic.
+const HELD_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+
+/// Private routes the agent may have open but not yet connected to.
+const MAX_PENDING_ROUTES: usize = 32;
+/// Private routes the agent may request per second.
+const ROUTES_PER_SECOND: u32 = 20;
+
+/// How many packets may wait for one database transaction.
+///
+/// A busy Minecraft connection emits far more packets per second than `SQLite`
+/// can commit individually; committing a transaction per packet was the
+/// proxy's serialization point. The queue also drains on a short timer, so a
+/// quiet connection's last packets still land within [`FLUSH_INTERVAL`].
+const INSERT_BATCH_LIMIT: usize = 64;
+const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
@@ -50,6 +81,13 @@ pub struct SessionOptions {
     /// It must not leave an unbounded number of unused loopback listeners when
     /// a connection attempt is cancelled by the game.
     pub accept_timeout: Duration,
+    /// Forward the client's handshake address unchanged.
+    ///
+    /// A client routed here by the agent wrote the hostname from its server
+    /// list, which is what virtual-host proxies (Velocity, `BungeeCord` forced
+    /// hosts, `TCPShield`) route on. A client pointed at the loopback listener by
+    /// hand wrote `127.0.0.1`, so that one is rewritten to the target.
+    pub preserve_client_address: bool,
 }
 
 impl SessionOptions {
@@ -60,21 +98,9 @@ impl SessionOptions {
             listen_port: None,
             max_frame_length: 16 * 1024 * 1024,
             accept_timeout: Duration::from_secs(15),
+            preserve_client_address: false,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeldPacket {
-    pub id: Uuid,
-    pub packet: PacketDetail,
-}
-
-#[derive(Debug, Clone)]
-pub enum HeldPacketDecision {
-    Forward,
-    Drop,
-    Replace(Bytes),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,10 +108,13 @@ pub enum HeldPacketDecision {
 pub enum ProxyEvent {
     Connection(ConnectionSnapshot),
     Packet(PacketSummary),
-    Held(HeldPacket),
     Error {
         connection_id: ConnectionId,
         message: String,
+    },
+    /// The Intercept queue changed; `pending` frames are now held.
+    InterceptQueue {
+        pending: usize,
     },
 }
 
@@ -111,18 +140,16 @@ pub enum ProxyError {
     UnknownConnection(ConnectionId),
     #[error("connection {0} is not ready for live injection")]
     ConnectionNotReady(ConnectionId),
-    #[error("held packet {0} does not exist")]
-    UnknownHeldPacket(Uuid),
     #[error("the client did not connect to its private route in time")]
     ClientRouteTimedOut,
     #[error("session task stopped")]
     SessionStopped,
-}
-
-#[derive(Debug)]
-struct CompiledRule {
-    source: InterceptRule,
-    filter: CompiledFilter,
+    #[error(transparent)]
+    Intercept(#[from] InterceptError),
+    #[error(transparent)]
+    NetworkConditions(#[from] NetworkConditionsError),
+    #[error("too many private routes were requested; try again shortly")]
+    RouteLimit,
 }
 
 /// A replacement rule with its selector already parsed.
@@ -136,30 +163,216 @@ struct CompiledReplacement {
     filter: Option<CompiledFilter>,
 }
 
-#[derive(Debug)]
-struct PendingHeld {
-    decision: oneshot::Sender<HeldPacketDecision>,
-}
-
 #[derive(Debug, Clone)]
 struct SessionHandle {
     snapshot: Arc<RwLock<ConnectionSnapshot>>,
-    client_writer: Arc<RwLock<Option<mpsc::Sender<OutboundBytes>>>>,
-    server_writer: Arc<RwLock<Option<mpsc::Sender<OutboundBytes>>>>,
+    client_writer: Arc<RwLock<Option<WriterSender>>>,
+    server_writer: Arc<RwLock<Option<WriterSender>>>,
     compression_threshold: Arc<RwLock<Option<i32>>>,
     client_cipher: Arc<LinkCipher>,
     server_cipher: Arc<LinkCipher>,
     encryption_bridge: Arc<EncryptionBridge>,
-    /// Set when the server has offered to re-enter configuration from play, so
-    /// the client's empty acknowledgement is only believed after the offer.
+    /// Set when the server has sent start-configuration from play, so the
+    /// client's acknowledgement is only believed after the offer.
     reconfiguration_offered: Arc<AtomicBool>,
+    /// Orders every row the session records, Repeater sends included.
+    sequence: Arc<AtomicU64>,
+    /// Set when the snapshot changed since it was last persisted and published.
+    snapshot_dirty: Arc<AtomicBool>,
     cancel: CancellationToken,
+}
+
+impl SessionHandle {
+    fn new(snapshot: ConnectionSnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(snapshot)),
+            client_writer: Arc::new(RwLock::new(None)),
+            server_writer: Arc::new(RwLock::new(None)),
+            compression_threshold: Arc::new(RwLock::new(None)),
+            client_cipher: Arc::new(LinkCipher::new()),
+            server_cipher: Arc::new(LinkCipher::new()),
+            encryption_bridge: Arc::new(EncryptionBridge::new()),
+            reconfiguration_offered: Arc::new(AtomicBool::new(false)),
+            sequence: Arc::new(AtomicU64::new(1)),
+            snapshot_dirty: Arc::new(AtomicBool::new(false)),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug)]
 struct OutboundBytes {
     bytes: Bytes,
     encrypt: bool,
+    /// When the proxy received the frame, which network delay is measured from.
+    queued_at: Instant,
+    /// Returns this frame's share of the writer's byte budget once written.
+    _budget: Option<OwnedSemaphorePermit>,
+}
+
+/// The sending half of a writer queue, bounded by bytes as well as frames.
+#[derive(Debug, Clone)]
+struct WriterSender {
+    frames: mpsc::Sender<OutboundBytes>,
+    budget: Arc<Semaphore>,
+}
+
+impl WriterSender {
+    fn channel() -> (Self, mpsc::Receiver<OutboundBytes>) {
+        let (frames, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        (
+            Self {
+                frames,
+                budget: Arc::new(Semaphore::new(WRITER_QUEUE_BYTES)),
+            },
+            receiver,
+        )
+    }
+
+    /// Queues bytes, waiting while the writer already holds its byte budget.
+    /// A frame larger than the whole budget waits for an empty queue.
+    async fn send(&self, bytes: Bytes, encrypt: bool) -> Result<(), ProxyError> {
+        let cost = u32::try_from(bytes.len().clamp(1, WRITER_QUEUE_BYTES)).unwrap_or(u32::MAX);
+        let permit = Arc::clone(&self.budget)
+            .acquire_many_owned(cost)
+            .await
+            .map_err(|_| ProxyError::SessionStopped)?;
+        self.frames
+            .send(OutboundBytes {
+                bytes,
+                encrypt,
+                queued_at: Instant::now(),
+                _budget: Some(permit),
+            })
+            .await
+            .map_err(|_| ProxyError::SessionStopped)
+    }
+}
+
+/// The reader's socket and buffers, lent to a held frame so the reader can
+/// keep draining while it waits.
+struct HoldIo<'a> {
+    reader: &'a mut ReadHalf<TcpStream>,
+    buffer: &'a mut BytesMut,
+    codec: &'a FrameCodec,
+    read_cipher: &'a LinkCipher,
+    writer: &'a WriterSender,
+    /// Frames read behind a held frame, processed in order once it is decided.
+    pending: &'a mut VecDeque<PacketFrame>,
+    pending_bytes: usize,
+    closed: bool,
+}
+
+impl HoldIo<'_> {
+    fn can_read(&self) -> bool {
+        !self.closed && self.pending_bytes + self.buffer.len() < HELD_BACKLOG_BYTES
+    }
+
+    async fn read_more(&mut self) -> Result<(), ProxyError> {
+        let mut chunk = vec![0_u8; SOCKET_BUFFER_CAPACITY];
+        let read = self.reader.read(&mut chunk).await?;
+        if read == 0 {
+            // The peer stopped sending; the held frame still gets its verdict.
+            self.closed = true;
+            return Ok(());
+        }
+        chunk.truncate(read);
+        self.read_cipher.decrypt(&mut chunk);
+        self.buffer.extend_from_slice(&chunk);
+        Ok(())
+    }
+}
+
+/// Everything one direction's reader owns.
+struct ReaderContext {
+    reader: ReadHalf<TcpStream>,
+    writer: WriterSender,
+    handle: SessionHandle,
+    direction: Direction,
+    opaque: Arc<RwLock<bool>>,
+    max_frame_length: usize,
+    preserve_address: bool,
+}
+
+enum HoldEvent {
+    Stopped,
+    Decided(InterceptDecision),
+    Read(Result<(), ProxyError>),
+}
+
+/// Removes a held entry when its wait ends without the operator's verdict.
+struct HeldGuard<'a> {
+    service: &'a ProxyService,
+    id: u64,
+}
+
+impl Drop for HeldGuard<'_> {
+    fn drop(&mut self) {
+        if self.service.interceptor.discard(self.id) {
+            self.service.announce_intercept_queue();
+        }
+    }
+}
+
+/// The cipher that decrypts what arrives travelling in `direction`.
+fn inbound_cipher(handle: &SessionHandle, direction: Direction) -> &LinkCipher {
+    match direction {
+        Direction::ClientToServer => &handle.client_cipher,
+        Direction::ServerToClient => &handle.server_cipher,
+    }
+}
+
+/// The cipher that encrypts what leaves travelling in `direction`.
+fn outbound_cipher(handle: &SessionHandle, direction: Direction) -> &LinkCipher {
+    match direction {
+        Direction::ClientToServer => &handle.server_cipher,
+        Direction::ServerToClient => &handle.client_cipher,
+    }
+}
+
+/// Packets that move a 1.20.2+ connection between configuration and play,
+/// named by the per-version table.
+fn transition_name(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: Option<i32>,
+    protocol: Option<i32>,
+) -> Option<&'static str> {
+    let name = PacketRegistry::table_packet_name(state, direction, packet_id?, protocol)?;
+    matches!(
+        (state, direction, name),
+        (
+            ProtocolState::Configuration,
+            Direction::ServerToClient,
+            "finish_configuration"
+        ) | (
+            ProtocolState::Configuration,
+            Direction::ClientToServer,
+            "finish_configuration_ack"
+        ) | (
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            "start_configuration"
+        ) | (
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            "configuration_acknowledged"
+        )
+    )
+    .then_some(name)
+}
+
+fn is_state_transition(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: Option<i32>,
+    protocol: Option<i32>,
+) -> bool {
+    transition_name(state, direction, packet_id, protocol).is_some()
 }
 
 #[derive(Debug, Clone)]
@@ -167,13 +380,16 @@ pub struct ProxyService {
     registry: Arc<PacketRegistry>,
     project: Arc<RwLock<Option<ProjectStore>>>,
     sessions: Arc<RwLock<HashMap<ConnectionId, SessionHandle>>>,
-    rules: Arc<RwLock<Vec<CompiledRule>>>,
     replacements: Arc<RwLock<Vec<CompiledReplacement>>>,
-    held: Arc<RwLock<HashMap<Uuid, PendingHeld>>>,
     session_join_provider: Arc<RwLock<Option<Arc<dyn SessionJoinProvider>>>>,
     schema_packs: Arc<RwLock<Vec<SchemaPack>>>,
     events: broadcast::Sender<ProxyEvent>,
+    queue: Arc<PersistenceQueue>,
     next_packet_id: Arc<AtomicI64>,
+    interceptor: Arc<Interceptor>,
+    network: Arc<RwLock<NetworkConditions>>,
+    /// Start of the current one-second route window and routes opened in it.
+    route_window: Arc<Mutex<(Instant, u32)>>,
 }
 
 impl Default for ProxyService {
@@ -186,18 +402,60 @@ impl ProxyService {
     #[must_use]
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(2_048);
+        let project = Arc::new(RwLock::new(None));
+        let queue = Arc::new(PersistenceQueue {
+            project: Arc::clone(&project),
+            events: events.clone(),
+            pending: Mutex::new(Vec::new()),
+            dirty: Mutex::new(HashMap::new()),
+        });
+        // Drains the persistence queue while traffic is quiet. The weak
+        // reference lets the ticker end once the last service handle drops
+        // instead of pinning the service alive forever. Without a runtime —
+        // a synchronous embedder — there is no ticker, and the queue then
+        // only drains when a batch fills.
+        let ticker_queue = Arc::downgrade(&queue);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let Some(queue) = ticker_queue.upgrade() else {
+                        break;
+                    };
+                    queue.flush().await;
+                }
+            });
+        }
         Self {
             registry: Arc::new(PacketRegistry::bundled()),
-            project: Arc::new(RwLock::new(None)),
+            project,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            rules: Arc::new(RwLock::new(Vec::new())),
             replacements: Arc::new(RwLock::new(Vec::new())),
-            held: Arc::new(RwLock::new(HashMap::new())),
             session_join_provider: Arc::new(RwLock::new(None)),
             schema_packs: Arc::new(RwLock::new(Vec::new())),
             events,
+            queue,
             next_packet_id: Arc::new(AtomicI64::new(1)),
+            interceptor: Arc::new(Interceptor::default()),
+            network: Arc::new(RwLock::new(NetworkConditions::default())),
+            route_window: Arc::new(Mutex::new((Instant::now(), 0))),
         }
+    }
+
+    /// The delay, jitter and bandwidth applied to every proxied connection.
+    #[must_use]
+    pub fn network_conditions(&self) -> NetworkConditions {
+        *self.network.read()
+    }
+
+    /// Changes network shaping. It applies to frames written from now on,
+    /// including on connections that are already open.
+    pub fn set_network_conditions(&self, conditions: NetworkConditions) -> Result<(), ProxyError> {
+        conditions.validate()?;
+        *self.network.write() = conditions;
+        Ok(())
     }
 
     pub fn set_project(&self, project: Option<ProjectStore>) {
@@ -227,18 +485,6 @@ impl ProxyService {
         self.events.subscribe()
     }
 
-    pub fn set_intercept_rules(&self, rules: Vec<InterceptRule>) -> Result<(), ProxyError> {
-        let compiled = rules
-            .into_iter()
-            .map(|source| {
-                let filter = CompiledFilter::parse(&source.expression)?;
-                Ok(CompiledRule { source, filter })
-            })
-            .collect::<Result<Vec<_>, FilterParseError>>()?;
-        *self.rules.write() = compiled;
-        Ok(())
-    }
-
     /// Installs the rules that rewrite packets automatically.
     pub fn set_replacement_rules(&self, rules: Vec<ReplacementRule>) -> Result<(), ProxyError> {
         let compiled = rules
@@ -254,6 +500,189 @@ impl ProxyService {
             .collect::<Result<Vec<_>, FilterParseError>>()?;
         *self.replacements.write() = compiled;
         Ok(())
+    }
+
+    #[must_use]
+    pub fn intercept_settings(&self) -> InterceptSettings {
+        self.interceptor.settings()
+    }
+
+    /// Changes what Intercept holds. Turning it off forwards everything held.
+    pub fn set_intercept_settings(&self, settings: InterceptSettings) -> Result<(), ProxyError> {
+        self.interceptor.set_settings(settings)?;
+        self.announce_intercept_queue();
+        Ok(())
+    }
+
+    /// Frames Intercept is holding, oldest first.
+    #[must_use]
+    pub fn intercepted(&self) -> Vec<InterceptedPacket> {
+        self.interceptor.pending()
+    }
+
+    /// Releases one held frame. A replacement must still frame as a packet;
+    /// if it does not, the frame stays held so the operator can fix it.
+    pub fn resolve_intercept(
+        &self,
+        id: u64,
+        decision: InterceptDecision,
+    ) -> Result<(), ProxyError> {
+        if let InterceptDecision::Replace(bytes) = &decision {
+            PacketFrame::from_logical_bytes(bytes.clone())?;
+        }
+        self.interceptor.resolve(id, decision)?;
+        self.announce_intercept_queue();
+        Ok(())
+    }
+
+    /// Forwards every held frame unchanged and reports how many there were.
+    pub fn forward_all_intercepted(&self) -> usize {
+        let released = self.interceptor.release_all();
+        self.announce_intercept_queue();
+        released
+    }
+
+    fn announce_intercept_queue(&self) {
+        let _ = self.events.send(ProxyEvent::InterceptQueue {
+            pending: self.interceptor.pending_count(),
+        });
+    }
+
+    /// Holds a frame until the operator decides, its deadline passes, or its
+    /// session ends.
+    ///
+    /// While it waits, the reader keeps draining its socket: keep-alives and
+    /// pings are forwarded at once, so holding a frame cannot make the server
+    /// time the player out, and everything else queues behind the held frame
+    /// in order.
+    async fn await_intercept(
+        &self,
+        handle: &SessionHandle,
+        direction: Direction,
+        detail: &PacketDetail,
+        io: &mut HoldIo<'_>,
+    ) -> Result<InterceptDecision, ProxyError> {
+        let target = handle.snapshot.read().target.authority();
+        let wait = self.interceptor.auto_forward_after();
+        let held_at = now_micros();
+        let deadline_micros = wait.map(|wait| {
+            held_at.saturating_add(i64::try_from(wait.as_micros()).unwrap_or(i64::MAX))
+        });
+        let (id, decision) = self.interceptor.hold(
+            detail.summary.clone(),
+            target,
+            detail.logical_bytes.clone(),
+            held_at,
+            deadline_micros,
+        );
+        // Releases the entry however this wait ends — including the task
+        // being aborted — so the queue never shows a frame nobody is waiting on.
+        let _guard = HeldGuard { service: self, id };
+        self.announce_intercept_queue();
+
+        // A frame that changes the protocol state must not be overtaken: what
+        // follows it is read in the state it moves to.
+        let allow_bypass = !is_state_transition(
+            detail.summary.state,
+            direction,
+            detail.summary.packet_id,
+            detail.summary.protocol_version,
+        );
+        if allow_bypass {
+            self.drain_held_backlog(handle, direction, io).await?;
+        }
+        let deadline = async move {
+            match wait {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        tokio::pin!(decision);
+        loop {
+            let event = tokio::select! {
+                biased;
+                () = handle.cancel.cancelled() => HoldEvent::Stopped,
+                // A dropped sender means the queue was cleared without a verdict.
+                decision = &mut decision => HoldEvent::Decided(
+                    decision.unwrap_or(InterceptDecision::Forward),
+                ),
+                () = &mut deadline => HoldEvent::Decided(InterceptDecision::Forward),
+                read = io.read_more(), if allow_bypass && io.can_read() => HoldEvent::Read(read),
+            };
+            match event {
+                HoldEvent::Stopped => return Err(ProxyError::SessionStopped),
+                HoldEvent::Decided(decision) => return Ok(decision),
+                HoldEvent::Read(read) => {
+                    read?;
+                    self.drain_held_backlog(handle, direction, io).await?;
+                }
+            }
+        }
+    }
+
+    /// Frames every complete frame buffered behind a held one: keep-alives
+    /// and pings go straight out, the rest wait for the held frame's verdict.
+    async fn drain_held_backlog(
+        &self,
+        handle: &SessionHandle,
+        direction: Direction,
+        io: &mut HoldIo<'_>,
+    ) -> Result<(), ProxyError> {
+        while let Some(frame) = io.codec.try_decode(io.buffer)? {
+            let (state, protocol) = {
+                let snapshot = handle.snapshot.read();
+                (snapshot.state, snapshot.protocol_version)
+            };
+            let name = mineburp_protocol::identify_packet(
+                state,
+                direction,
+                frame.id,
+                &frame.body,
+                protocol,
+            );
+            if self
+                .interceptor
+                .bypasses_hold(state, direction, frame.id, protocol, name.as_deref())
+            {
+                self.forward_unchanged(handle, direction, &frame, io.writer)
+                    .await?;
+            } else {
+                io.pending_bytes += frame.body.len() + 1;
+                io.pending.push_back(frame);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records and sends a frame exactly as it was read.
+    async fn forward_unchanged(
+        &self,
+        handle: &SessionHandle,
+        direction: Direction,
+        frame: &PacketFrame,
+        writer: &WriterSender,
+    ) -> Result<(), ProxyError> {
+        let state = handle.snapshot.read().state;
+        let encrypted = inbound_cipher(handle, direction).is_active();
+        let mut detail = self.make_detail(
+            handle,
+            direction,
+            frame,
+            Disposition::Forwarded,
+            state,
+            encrypted,
+        );
+        detail.summary.sequence = handle.next_sequence();
+        self.record_packet(detail).await;
+        let mut codec = FrameCodec::default();
+        codec.set_compression_threshold(*handle.compression_threshold.read());
+        writer
+            .send(
+                codec.encode(frame)?,
+                outbound_cipher(handle, direction).is_active(),
+            )
+            .await
     }
 
     pub async fn start_session(
@@ -279,27 +708,43 @@ impl ProxyService {
             byte_count: 0,
             last_error: None,
         };
-        let handle = SessionHandle {
-            snapshot: Arc::new(RwLock::new(snapshot.clone())),
-            client_writer: Arc::new(RwLock::new(None)),
-            server_writer: Arc::new(RwLock::new(None)),
-            compression_threshold: Arc::new(RwLock::new(None)),
-            client_cipher: Arc::new(LinkCipher::new()),
-            server_cipher: Arc::new(LinkCipher::new()),
-            encryption_bridge: Arc::new(EncryptionBridge::new()),
-            reconfiguration_offered: Arc::new(AtomicBool::new(false)),
-            cancel: CancellationToken::new(),
-        };
+        let handle = SessionHandle::new(snapshot.clone());
         self.sessions.write().insert(id, handle.clone());
-        self.persist_connection(&snapshot).await?;
-        let _ = self.events.send(ProxyEvent::Connection(snapshot.clone()));
+        self.publish_snapshot(&handle).await;
         let service = self.clone();
         tokio::spawn(async move {
             if let Err(error) = service.run_session(listener, handle, options).await {
                 service.fail_session(id, error.to_string()).await;
             }
+            // The final snapshot is in the project; the live table only
+            // tracks sessions that can still carry traffic.
+            service.sessions.write().remove(&id);
         });
         Ok(snapshot)
+    }
+
+    /// Admits one private route request, or refuses it when too many are
+    /// waiting for a client or too many arrived in the last second.
+    fn admit_route(&self) -> Result<(), ProxyError> {
+        let waiting = self
+            .sessions
+            .read()
+            .values()
+            .filter(|handle| handle.snapshot.read().status == ConnectionStatus::Listening)
+            .count();
+        if waiting >= MAX_PENDING_ROUTES {
+            return Err(ProxyError::RouteLimit);
+        }
+        let mut window = self.route_window.lock();
+        let now = Instant::now();
+        if now.duration_since(window.0) >= Duration::from_secs(1) {
+            *window = (now, 0);
+        }
+        if window.1 >= ROUTES_PER_SECOND {
+            return Err(ProxyError::RouteLimit);
+        }
+        window.1 += 1;
+        Ok(())
     }
 
     /// Loopback ports this service is currently accepting private routes on.
@@ -347,18 +792,6 @@ impl ProxyService {
         Ok(())
     }
 
-    pub fn resolve_held(&self, id: Uuid, decision: HeldPacketDecision) -> Result<(), ProxyError> {
-        let pending = self
-            .held
-            .write()
-            .remove(&id)
-            .ok_or(ProxyError::UnknownHeldPacket(id))?;
-        pending
-            .decision
-            .send(decision)
-            .map_err(|_| ProxyError::SessionStopped)
-    }
-
     pub async fn repeater_send(
         &self,
         connection_id: ConnectionId,
@@ -371,7 +804,12 @@ impl ProxyService {
             .get(&connection_id)
             .cloned()
             .ok_or(ProxyError::UnknownConnection(connection_id))?;
-        if handle.snapshot.read().state == ProtocolState::Opaque {
+        // Compression and encryption are both settled during login, and only
+        // from configuration onwards does neither change under an injected
+        // frame — before that, the framing chosen here could be stale by the
+        // time the writer sends it.
+        let state = handle.snapshot.read().state;
+        if !matches!(state, ProtocolState::Configuration | ProtocolState::Play) {
             return Err(ProxyError::ConnectionNotReady(connection_id));
         }
         let frame = PacketFrame::from_logical_bytes(logical_bytes.clone())?;
@@ -383,27 +821,20 @@ impl ProxyService {
             Direction::ServerToClient => handle.client_writer.read().clone(),
         }
         .ok_or(ProxyError::ConnectionNotReady(connection_id))?;
-        let encrypt = match direction {
-            Direction::ClientToServer => handle.server_cipher.is_active(),
-            Direction::ServerToClient => handle.client_cipher.is_active(),
-        };
         sender
-            .send(OutboundBytes {
-                bytes: encoded,
-                encrypt,
-            })
-            .await
-            .map_err(|_| ProxyError::SessionStopped)?;
+            .send(encoded, outbound_cipher(&handle, direction).is_active())
+            .await?;
 
-        let detail = self.make_detail(
+        let mut detail = self.make_detail(
             &handle,
             direction,
             &frame,
             Disposition::Replayed,
-            handle.snapshot.read().state,
+            state,
             false,
         );
-        self.record_packet(detail).await?;
+        detail.summary.sequence = handle.next_sequence();
+        self.record_packet(detail).await;
         Ok(())
     }
 
@@ -425,102 +856,104 @@ impl ProxyService {
         update_snapshot(&handle, |snapshot| {
             snapshot.status = ConnectionStatus::Active;
         });
-        self.publish_snapshot(&handle).await?;
+        self.publish_snapshot(&handle).await;
 
         let (client_reader, client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
-        let (to_client, client_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
-        let (to_server, server_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let (to_client, client_rx) = WriterSender::channel();
+        let (to_server, server_rx) = WriterSender::channel();
         *handle.client_writer.write() = Some(to_client.clone());
         *handle.server_writer.write() = Some(to_server.clone());
 
         let opaque = Arc::new(RwLock::new(false));
-        let sequence = Arc::new(AtomicU64::new(1));
         let max_frame_length = options.max_frame_length;
-        let mut tasks = JoinSet::new();
-        tasks.spawn(writer_loop(
+        let preserve_address = options.preserve_client_address;
+        let mut writers = JoinSet::new();
+        writers.spawn(writer_loop(
             client_writer,
             client_rx,
             handle.client_cipher.clone(),
             handle.cancel.clone(),
+            Arc::clone(&self.network),
+            Direction::ServerToClient,
         ));
-        tasks.spawn(writer_loop(
+        writers.spawn(writer_loop(
             server_writer,
             server_rx,
             handle.server_cipher.clone(),
             handle.cancel.clone(),
+            Arc::clone(&self.network),
+            Direction::ClientToServer,
         ));
 
-        let client_service = self.clone();
-        let client_handle = handle.clone();
-        let client_read_cipher = client_handle.client_cipher.clone();
-        let client_opaque = opaque.clone();
-        let client_sequence = sequence.clone();
-        tasks.spawn(async move {
-            client_service
-                .reader_loop(
-                    client_reader,
-                    to_server,
-                    client_handle,
-                    Direction::ClientToServer,
-                    client_opaque,
-                    client_sequence,
-                    max_frame_length,
-                    client_read_cipher,
-                )
-                .await
-        });
+        let mut readers = JoinSet::new();
+        for (reader, writer, direction) in [
+            (client_reader, to_server, Direction::ClientToServer),
+            (server_reader, to_client, Direction::ServerToClient),
+        ] {
+            let service = self.clone();
+            let handle = handle.clone();
+            let opaque = opaque.clone();
+            readers.spawn(async move {
+                service
+                    .reader_loop(ReaderContext {
+                        reader,
+                        writer,
+                        handle,
+                        direction,
+                        opaque,
+                        max_frame_length,
+                        preserve_address,
+                    })
+                    .await
+            });
+        }
 
-        let server_service = self.clone();
-        let server_handle = handle.clone();
-        let server_read_cipher = server_handle.server_cipher.clone();
-        let server_opaque = opaque;
-        tasks.spawn(async move {
-            server_service
-                .reader_loop(
-                    server_reader,
-                    to_client,
-                    server_handle,
-                    Direction::ServerToClient,
-                    server_opaque,
-                    sequence,
-                    max_frame_length,
-                    server_read_cipher,
-                )
-                .await
-        });
-
-        tokio::select! {
-            () = handle.cancel.cancelled() => {},
-            result = tasks.join_next() => {
-                if let Some(Ok(Err(error))) = result {
-                    return Err(error);
-                }
-            }
+        let outcome = tokio::select! {
+            () = handle.cancel.cancelled() => Ok(()),
+            result = readers.join_next() => match result {
+                Some(Ok(result)) => result,
+                _ => Ok(()),
+            },
+        };
+        // One side finished. Stop the other reader so nothing new is queued,
+        // then let both writers deliver what already is — a server's
+        // disconnect reason is usually the last frame before it closes.
+        readers.shutdown().await;
+        *handle.client_writer.write() = None;
+        *handle.server_writer.write() = None;
+        let drained = tokio::time::timeout(DRAIN_DEADLINE, async {
+            while writers.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::debug!("writers did not drain before the deadline");
         }
         handle.cancel.cancel();
-        tasks.shutdown().await;
+        writers.shutdown().await;
+        outcome?;
         update_snapshot(&handle, |snapshot| {
             snapshot.status = ConnectionStatus::Closed;
             snapshot.state = ProtocolState::Closed;
         });
-        self.publish_snapshot(&handle).await?;
+        self.publish_snapshot(&handle).await;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn reader_loop(
-        &self,
-        mut reader: ReadHalf<TcpStream>,
-        writer: mpsc::Sender<OutboundBytes>,
-        handle: SessionHandle,
-        direction: Direction,
-        opaque: Arc<RwLock<bool>>,
-        sequence: Arc<AtomicU64>,
-        max_frame_length: usize,
-        read_cipher: Arc<LinkCipher>,
-    ) -> Result<(), ProxyError> {
+    async fn reader_loop(&self, context: ReaderContext) -> Result<(), ProxyError> {
+        let ReaderContext {
+            mut reader,
+            writer,
+            handle,
+            direction,
+            opaque,
+            max_frame_length,
+            preserve_address,
+        } = context;
         let mut buffer = BytesMut::with_capacity(SOCKET_BUFFER_CAPACITY);
+        // Frames read while an earlier one was held, still to be processed.
+        let mut backlog: VecDeque<PacketFrame> = VecDeque::new();
+        let mut closed = false;
         loop {
             if handle.cancel.is_cancelled() {
                 return Ok(());
@@ -528,15 +961,11 @@ impl ProxyService {
             if *opaque.read() {
                 if !buffer.is_empty() {
                     let bytes = buffer.split().freeze();
-                    writer
-                        .send(OutboundBytes {
-                            bytes: bytes.clone(),
-                            encrypt: false,
-                        })
-                        .await
-                        .map_err(|_| ProxyError::SessionStopped)?;
-                    self.record_opaque(&handle, direction, bytes, &sequence)
-                        .await?;
+                    writer.send(bytes.clone(), false).await?;
+                    self.record_opaque(&handle, direction, bytes).await;
+                }
+                if closed {
+                    return Ok(());
                 }
                 let mut chunk = vec![0_u8; SOCKET_BUFFER_CAPACITY];
                 let read = reader.read(&mut chunk).await?;
@@ -545,24 +974,44 @@ impl ProxyService {
                 }
                 chunk.truncate(read);
                 let bytes = Bytes::from(chunk);
-                writer
-                    .send(OutboundBytes {
-                        bytes: bytes.clone(),
-                        encrypt: false,
-                    })
-                    .await
-                    .map_err(|_| ProxyError::SessionStopped)?;
-                self.record_opaque(&handle, direction, bytes, &sequence)
-                    .await?;
+                writer.send(bytes.clone(), false).await?;
+                self.record_opaque(&handle, direction, bytes).await;
                 continue;
             }
 
             let mut codec = FrameCodec::new(max_frame_length);
             codec.set_compression_threshold(*handle.compression_threshold.read());
-            while let Some(frame) = codec.try_decode(&mut buffer)? {
+            loop {
+                let frame = match backlog.pop_front() {
+                    Some(frame) => frame,
+                    None => match codec.try_decode(&mut buffer)? {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                };
+                let read_cipher = inbound_cipher(&handle, direction);
+                let pending_bytes = backlog.iter().map(|frame| frame.body.len() + 1).sum();
+                let mut io = HoldIo {
+                    reader: &mut reader,
+                    buffer: &mut buffer,
+                    codec: &codec,
+                    read_cipher,
+                    writer: &writer,
+                    pending: &mut backlog,
+                    pending_bytes,
+                    closed,
+                };
                 let cipher_started = self
-                    .process_frame(&handle, direction, frame, &writer, &opaque, &sequence)
+                    .process_frame(
+                        &handle,
+                        direction,
+                        frame,
+                        &mut io,
+                        &opaque,
+                        preserve_address,
+                    )
                     .await?;
+                closed = io.closed;
                 if cipher_started && !buffer.is_empty() {
                     // Whatever followed the encryption response in the same read
                     // was copied into the buffer before this link had a cipher,
@@ -574,7 +1023,18 @@ impl ProxyService {
                     read_cipher.decrypt(&mut pending);
                     buffer.extend_from_slice(&pending);
                 }
+                if *opaque.read() {
+                    // The rest of the buffer is ciphertext the proxy cannot
+                    // read; the opaque path above relays it as-is.
+                    break;
+                }
                 codec.set_compression_threshold(*handle.compression_threshold.read());
+            }
+            if *opaque.read() {
+                continue;
+            }
+            if closed && backlog.is_empty() {
+                return Ok(());
             }
             let mut chunk = vec![0_u8; SOCKET_BUFFER_CAPACITY];
             let read = reader.read(&mut chunk).await?;
@@ -582,7 +1042,7 @@ impl ProxyService {
                 return Ok(());
             }
             chunk.truncate(read);
-            read_cipher.decrypt(&mut chunk);
+            inbound_cipher(&handle, direction).decrypt(&mut chunk);
             buffer.extend_from_slice(&chunk);
         }
     }
@@ -596,9 +1056,9 @@ impl ProxyService {
         handle: &SessionHandle,
         direction: Direction,
         frame: PacketFrame,
-        writer: &mpsc::Sender<OutboundBytes>,
-        opaque: &Arc<RwLock<bool>>,
-        sequence: &AtomicU64,
+        io: &mut HoldIo<'_>,
+        opaque: &RwLock<bool>,
+        preserve_address: bool,
     ) -> Result<bool, ProxyError> {
         let state = handle.snapshot.read().state;
         let mut outbound = frame.clone();
@@ -608,15 +1068,17 @@ impl ProxyService {
             && frame.id == 0
             && let Ok(mut handshake) = decode_handshake(&frame.body)
         {
-            let marker_suffix = handshake
-                .server_address
-                .find('\0')
-                .map(|index| handshake.server_address[index..].to_owned())
-                .unwrap_or_default();
-            handshake.server_address =
-                format!("{}{}", handle.snapshot.read().target.host, marker_suffix);
-            handshake.server_port = handle.snapshot.read().target.port;
-            outbound.body = encode_handshake(&handshake)?;
+            if !preserve_address {
+                let marker_suffix = handshake
+                    .server_address
+                    .find('\0')
+                    .map(|index| handshake.server_address[index..].to_owned())
+                    .unwrap_or_default();
+                handshake.server_address =
+                    format!("{}{}", handle.snapshot.read().target.host, marker_suffix);
+                handshake.server_port = handle.snapshot.read().target.port;
+                outbound.body = encode_handshake(&handshake)?;
+            }
             update_snapshot(handle, |snapshot| {
                 snapshot.protocol_version = Some(handshake.protocol_version);
                 snapshot.minecraft_version = self
@@ -637,33 +1099,52 @@ impl ProxyService {
             && frame.id == 1
             && self.session_join_provider.read().is_some()
         {
-            outbound.body = handle.encryption_bridge.intercept_request(&frame.body)?;
+            let protocol_version = handle.snapshot.read().protocol_version.unwrap_or_default();
+            let request = EncryptionRequest::decode_for(&frame.body, protocol_version)
+                .map_err(EncryptionBridgeError::from)?;
+            // RSA key generation is tens of milliseconds of CPU; it must not
+            // stall a runtime worker every other session shares.
+            let key = tokio::task::spawn_blocking(EncryptionBridge::generate_key)
+                .await
+                .map_err(|_| ProxyError::SessionStopped)??;
+            outbound.body =
+                handle
+                    .encryption_bridge
+                    .intercept_request(request, key, protocol_version)?;
         }
-        if state == ProtocolState::Login && direction == Direction::ClientToServer && frame.id == 1
+        if state == ProtocolState::Login
+            && direction == Direction::ClientToServer
+            && frame.id == 1
+            && handle.encryption_bridge.is_negotiating()
         {
             let provider = { self.session_join_provider.read().clone() };
             if let Some(provider) = provider {
                 let protocol_version = handle.snapshot.read().protocol_version.unwrap_or_default();
-                let negotiation = handle
+                let mut negotiation = handle
                     .encryption_bridge
                     .intercept_response(&frame.body, protocol_version)?;
-                provider
-                    .join_server(&SessionJoinRequest {
-                        client_server_hash: negotiation.client_server_hash,
-                        upstream_server_hash: negotiation.upstream_server_hash,
-                    })
-                    .await
-                    .map_err(ProxyError::Authentication)?;
-                outbound.body = negotiation.server_response;
+                // A server that encrypts without authenticating (1.20.5+) told
+                // the client not to join, so no join is coming to correlate.
+                if negotiation.should_authenticate {
+                    provider
+                        .join_server(&SessionJoinRequest {
+                            client_server_hash: std::mem::take(&mut negotiation.client_server_hash),
+                            upstream_server_hash: std::mem::take(
+                                &mut negotiation.upstream_server_hash,
+                            ),
+                        })
+                        .await
+                        .map_err(ProxyError::Authentication)?;
+                }
+                outbound.body = std::mem::take(&mut negotiation.server_response);
                 activate_encryption = Some(negotiation.shared_secret);
             }
         }
 
         let current_state = handle.snapshot.read().state;
-        let input_encrypted = match direction {
-            Direction::ClientToServer => handle.client_cipher.is_active(),
-            Direction::ServerToClient => handle.server_cipher.is_active(),
-        };
+        let input_encrypted = inbound_cipher(handle, direction).is_active();
+        // The row shows the frame as it arrived; the proxy's own handshake and
+        // key-exchange rewrites are bookkeeping, not traffic under test.
         let mut detail = self.make_detail(
             handle,
             direction,
@@ -672,8 +1153,7 @@ impl ProxyService {
             state,
             input_encrypted,
         );
-        // Automatic replacement runs before the intercept decision: a rule
-        // that rewrites a packet has already decided what should go on the
+        // A rule that rewrites a packet has already decided what goes on the
         // wire, and the recorded row is what was actually sent.
         if let Some(bytes) = self.rewrite(&detail, state, direction) {
             match PacketFrame::from_logical_bytes(bytes) {
@@ -693,79 +1173,46 @@ impl ProxyService {
                 }
             }
         }
-        detail.summary.sequence = sequence.fetch_add(1, Ordering::Relaxed);
-        let system_edited = outbound != frame;
-        let decision = if system_edited {
-            InterceptDecision::Forward
-        } else {
-            self.intercept_decision(&detail.summary)
-        };
-        let (disposition, replacement) = match decision {
-            InterceptDecision::Forward => (
-                if system_edited {
-                    Disposition::Edited
-                } else {
-                    Disposition::Forwarded
-                },
-                None,
-            ),
-            InterceptDecision::Drop => (Disposition::Dropped, None),
-            InterceptDecision::DelayMillis(milliseconds) => {
-                tokio::time::sleep(Duration::from_millis(milliseconds)).await;
-                (Disposition::Delayed, None)
-            }
-            InterceptDecision::Hold => {
-                let held_id = Uuid::new_v4();
-                let (decision_tx, decision_rx) = oneshot::channel();
-                self.held.write().insert(
-                    held_id,
-                    PendingHeld {
-                        decision: decision_tx,
-                    },
-                );
-                let _ = self.events.send(ProxyEvent::Held(HeldPacket {
-                    id: held_id,
-                    packet: detail.clone(),
-                }));
-                match decision_rx.await.map_err(|_| ProxyError::SessionStopped)? {
-                    HeldPacketDecision::Forward => (Disposition::Forwarded, None),
-                    HeldPacketDecision::Drop => (Disposition::Dropped, None),
-                    HeldPacketDecision::Replace(bytes) => (Disposition::Edited, Some(bytes)),
+        // Intercept sees the frame as the rules left it, and what it forwards
+        // is what gets recorded.
+        if activate_encryption.is_none() && self.interceptor.should_hold(&detail.summary) {
+            match self.await_intercept(handle, direction, &detail, io).await? {
+                InterceptDecision::Forward => {}
+                InterceptDecision::Replace(bytes) => {
+                    outbound = PacketFrame::from_logical_bytes(bytes)?;
+                    detail = self.make_detail(
+                        handle,
+                        direction,
+                        &outbound,
+                        Disposition::Edited,
+                        state,
+                        input_encrypted,
+                    );
+                }
+                InterceptDecision::Drop => {
+                    // The peer never sees it, so it cannot move the protocol state.
+                    detail.summary.disposition = Disposition::Dropped;
+                    detail.summary.sequence = handle.next_sequence();
+                    self.record_packet(detail).await;
+                    self.queue.mark_dirty(handle);
+                    return Ok(false);
                 }
             }
-        };
-        detail.summary.disposition = disposition;
-        self.record_packet(detail).await?;
-
-        if disposition != Disposition::Dropped {
-            let outbound = if let Some(bytes) = replacement {
-                PacketFrame::from_logical_bytes(bytes)?
-            } else {
-                outbound
-            };
-            let mut codec = FrameCodec::default();
-            codec.set_compression_threshold(*handle.compression_threshold.read());
-            let encrypt = if activate_encryption.is_some() {
-                false
-            } else {
-                match direction {
-                    Direction::ClientToServer => handle.server_cipher.is_active(),
-                    Direction::ServerToClient => handle.client_cipher.is_active(),
-                }
-            };
-            writer
-                .send(OutboundBytes {
-                    bytes: codec.encode(&outbound)?,
-                    encrypt,
-                })
-                .await
-                .map_err(|_| ProxyError::SessionStopped)?;
         }
+        detail.summary.sequence = handle.next_sequence();
+        self.record_packet(detail).await;
 
+        let mut codec = FrameCodec::default();
+        codec.set_compression_threshold(*handle.compression_threshold.read());
+        let encoded = codec.encode(&outbound)?;
+        // The frame that completes the key exchange still travels in the
+        // clear. Every frame after it is encrypted, so both ciphers are live
+        // before this one can reach the server: a fast server's first
+        // encrypted reply must never meet a link without its cipher.
+        let encrypt =
+            activate_encryption.is_none() && outbound_cipher(handle, direction).is_active();
         let mut cipher_started = false;
-        if disposition != Disposition::Dropped
-            && let Some(shared_secret) = activate_encryption
-        {
+        if let Some(shared_secret) = activate_encryption {
             handle.client_cipher.activate(shared_secret);
             handle.server_cipher.activate(shared_secret);
             cipher_started = true;
@@ -774,36 +1221,35 @@ impl ProxyService {
                 snapshot.encrypted_server = true;
             });
         }
+        io.writer.send(encoded, encrypt).await?;
 
+        // From here on the state follows what was actually forwarded: the
+        // peer acts on the frame it received, not the one that arrived.
+        let sent = &outbound;
         if current_state == ProtocolState::Login
             && direction == Direction::ServerToClient
-            && frame.id == 3
-            && let Some((threshold, _)) = decode_var_i32(&frame.body)?
+            && sent.id == 3
+            && let Some((threshold, _)) = decode_var_i32(&sent.body)?
         {
-            *handle.compression_threshold.write() = Some(threshold);
+            // A negative threshold switches compression off.
+            let threshold = (threshold >= 0).then_some(threshold);
+            *handle.compression_threshold.write() = threshold;
             update_snapshot(handle, |snapshot| {
-                snapshot.compression_threshold = Some(threshold);
+                snapshot.compression_threshold = threshold;
             });
         }
+        let protocol_version = handle.snapshot.read().protocol_version;
         if current_state == ProtocolState::Login
             && direction == Direction::ServerToClient
-            && frame.id == 2
-            && handle
-                .snapshot
-                .read()
-                .protocol_version
-                .is_some_and(|version| version < 764)
+            && sent.id == 2
+            && protocol_version.is_some_and(|version| version < 764)
         {
             update_snapshot(handle, |snapshot| snapshot.state = ProtocolState::Play);
         }
         if current_state == ProtocolState::Login
             && direction == Direction::ClientToServer
-            && frame.id == 3
-            && handle
-                .snapshot
-                .read()
-                .protocol_version
-                .is_some_and(|version| version >= 764)
+            && sent.id == 3
+            && protocol_version.is_some_and(|version| version >= 764)
         {
             update_snapshot(handle, |snapshot| {
                 snapshot.state = ProtocolState::Configuration;
@@ -811,7 +1257,7 @@ impl ProxyService {
         }
         if current_state == ProtocolState::Login
             && direction == Direction::ClientToServer
-            && frame.id == 1
+            && sent.id == 1
             && activate_encryption.is_none()
         {
             *opaque.write() = true;
@@ -821,8 +1267,8 @@ impl ProxyService {
                 snapshot.encrypted_server = true;
             });
         }
-        track_configuration_phase(handle, direction, &frame, current_state);
-        self.publish_snapshot(handle).await?;
+        track_configuration_phase(handle, direction, sent, current_state);
+        self.queue.mark_dirty(handle);
         Ok(cipher_started)
     }
     /// Runs every enabled replacement rule whose selector matches, in order.
@@ -836,6 +1282,12 @@ impl ProxyService {
         state: ProtocolState,
         direction: Direction,
     ) -> Option<Bytes> {
+        // Handshake and login belong to the proxy: it rewrites the address and
+        // bridges the key exchange there, and a rule editing those frames
+        // would undo that work or desynchronise the framing.
+        if matches!(state, ProtocolState::Handshake | ProtocolState::Login) {
+            return None;
+        }
         let rules = self.replacements.read();
         let matching: Vec<&ReplacementRule> = rules
             .iter()
@@ -872,16 +1324,6 @@ impl ProxyService {
             }
         }
         changed.then(|| Bytes::from(frame))
-    }
-
-    fn intercept_decision(&self, packet: &PacketSummary) -> InterceptDecision {
-        self.rules
-            .read()
-            .iter()
-            .find(|rule| rule.source.enabled && rule.filter.matches(packet))
-            .map_or(InterceptDecision::Forward, |rule| {
-                rule.source.action.clone()
-            })
     }
 
     fn make_detail(
@@ -970,19 +1412,13 @@ impl ProxyService {
         }
     }
 
-    async fn record_opaque(
-        &self,
-        handle: &SessionHandle,
-        direction: Direction,
-        bytes: Bytes,
-        sequence: &AtomicU64,
-    ) -> Result<(), ProxyError> {
+    async fn record_opaque(&self, handle: &SessionHandle, direction: Direction, bytes: Bytes) {
         let detail = {
             let snapshot = handle.snapshot.read();
             PacketDetail {
                 summary: PacketSummary {
                     id: 0,
-                    sequence: sequence.fetch_add(1, Ordering::Relaxed),
+                    sequence: handle.next_sequence(),
                     connection_id: snapshot.id,
                     timestamp_micros: now_micros(),
                     source: TrafficSource::Minecraft,
@@ -1011,53 +1447,45 @@ impl ProxyService {
                 },
             }
         };
-        self.record_packet(detail).await?;
-        Ok(())
+        self.record_packet(detail).await;
     }
 
-    async fn record_packet(&self, mut detail: PacketDetail) -> Result<(), ProxyError> {
-        let project = self.project.read().clone();
-        if let Some(project) = project {
-            let cloned = detail.clone();
-            let id = tokio::task::spawn_blocking(move || project.insert_packet(&cloned))
-                .await
-                .map_err(|_| ProxyError::SessionStopped)??;
-            detail.summary.id = id;
+    /// Records one packet: counters immediately, persistence coalesced.
+    ///
+    /// With a project open the detail joins a batch that is committed either
+    /// when [`INSERT_BATCH_LIMIT`] packets are waiting or when the periodic
+    /// flusher next runs, whichever comes first; the row's `Packet` event is
+    /// published once its real database id exists. Without a project the id is
+    /// minted locally and the event goes out straight away.
+    async fn record_packet(&self, mut detail: PacketDetail) {
+        {
+            let session = {
+                self.sessions
+                    .read()
+                    .get(&detail.summary.connection_id)
+                    .cloned()
+            };
+            if let Some(handle) = session {
+                update_snapshot(&handle, |snapshot| {
+                    snapshot.packet_count += 1;
+                    snapshot.byte_count += u64::try_from(detail.summary.size).unwrap_or(u64::MAX);
+                });
+            }
+        }
+        if self.project.read().is_some() {
+            self.queue.push(detail).await;
         } else {
             detail.summary.id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+            let _ = self.events.send(ProxyEvent::Packet(detail.summary));
         }
-        let session = {
-            self.sessions
-                .read()
-                .get(&detail.summary.connection_id)
-                .cloned()
-        };
-        if let Some(handle) = session {
-            update_snapshot(&handle, |snapshot| {
-                snapshot.packet_count += 1;
-                snapshot.byte_count += detail.summary.size as u64;
-            });
-        }
-        let _ = self.events.send(ProxyEvent::Packet(detail.summary));
-        Ok(())
     }
 
-    async fn publish_snapshot(&self, handle: &SessionHandle) -> Result<(), ProxyError> {
+    /// Persists and publishes a snapshot now, for lifecycle changes the UI
+    /// should see at once. Per-packet counters go through the flush ticker.
+    async fn publish_snapshot(&self, handle: &SessionHandle) {
+        handle.snapshot_dirty.store(false, Ordering::Release);
         let snapshot = handle.snapshot.read().clone();
-        self.persist_connection(&snapshot).await?;
-        let _ = self.events.send(ProxyEvent::Connection(snapshot));
-        Ok(())
-    }
-
-    async fn persist_connection(&self, snapshot: &ConnectionSnapshot) -> Result<(), ProxyError> {
-        let project = { self.project.read().clone() };
-        if let Some(project) = project {
-            let snapshot = snapshot.clone();
-            tokio::task::spawn_blocking(move || project.save_connection(&snapshot))
-                .await
-                .map_err(|_| ProxyError::SessionStopped)??;
-        }
-        Ok(())
+        self.queue.persist_snapshot(snapshot).await;
     }
 
     async fn fail_session(&self, id: ConnectionId, message: String) {
@@ -1067,7 +1495,7 @@ impl ProxyService {
                 snapshot.status = ConnectionStatus::Failed;
                 snapshot.last_error = Some(message.clone());
             });
-            let _ = self.publish_snapshot(&handle).await;
+            self.publish_snapshot(&handle).await;
         }
         let _ = self.events.send(ProxyEvent::Error {
             connection_id: id,
@@ -1076,14 +1504,147 @@ impl ProxyService {
     }
 }
 
+/// Coalesces packet persistence into batched database transactions.
+///
+/// The queue shares the service's project handle, so installing or replacing a
+/// project is visible to in-flight batches: each flush reads whatever project
+/// is current and commits into it.
+#[derive(Debug)]
+struct PersistenceQueue {
+    project: Arc<RwLock<Option<ProjectStore>>>,
+    events: broadcast::Sender<ProxyEvent>,
+    pending: Mutex<Vec<PacketDetail>>,
+    /// Sessions whose snapshot changed since the last flush.
+    dirty: Mutex<HashMap<ConnectionId, DirtySnapshot>>,
+}
+
+/// A session's live snapshot and the flag saying it needs saving.
+type DirtySnapshot = (Arc<RwLock<ConnectionSnapshot>>, Arc<AtomicBool>);
+
+impl PersistenceQueue {
+    /// Notes that a session's snapshot changed; the next flush saves it once,
+    /// however many packets changed it in between.
+    fn mark_dirty(&self, handle: &SessionHandle) {
+        if !handle.snapshot_dirty.swap(true, Ordering::AcqRel) {
+            let id = handle.snapshot.read().id;
+            self.dirty.lock().insert(
+                id,
+                (
+                    Arc::clone(&handle.snapshot),
+                    Arc::clone(&handle.snapshot_dirty),
+                ),
+            );
+        }
+    }
+
+    async fn flush_snapshots(&self) {
+        let dirty = std::mem::take(&mut *self.dirty.lock());
+        for (_, (snapshot, flag)) in dirty {
+            flag.store(false, Ordering::Release);
+            let snapshot = snapshot.read().clone();
+            self.persist_snapshot(snapshot).await;
+        }
+    }
+
+    /// Saves a snapshot and publishes it. A failed save is reported and the
+    /// session carries on: losing a counter update must not disconnect the
+    /// game being tested.
+    async fn persist_snapshot(&self, snapshot: ConnectionSnapshot) {
+        let project = { self.project.read().clone() };
+        if let Some(project) = project {
+            let row = snapshot.clone();
+            let saved = tokio::task::spawn_blocking(move || project.save_connection(&row)).await;
+            let failure = match saved {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = failure {
+                tracing::warn!(%error, "a connection snapshot could not be persisted");
+                let _ = self.events.send(ProxyEvent::Error {
+                    connection_id: snapshot.id,
+                    message: format!("the connection could not be saved to the project: {error}"),
+                });
+            }
+        }
+        let _ = self.events.send(ProxyEvent::Connection(snapshot));
+    }
+    async fn push(&self, detail: PacketDetail) {
+        let flush_now = {
+            let mut pending = self.pending.lock();
+            pending.push(detail);
+            pending.len() >= INSERT_BATCH_LIMIT
+        };
+        if flush_now {
+            self.flush().await;
+        }
+    }
+
+    /// Commits everything queued so far in one transaction.
+    ///
+    /// A failed batch is reported per connection and dropped rather than
+    /// re-queued: retrying a failing insert on the hot path would stall the
+    /// sessions behind it, and the operator sees the error either way.
+    async fn flush(&self) {
+        self.flush_packets().await;
+        self.flush_snapshots().await;
+    }
+
+    async fn flush_packets(&self) {
+        let batch = std::mem::take(&mut *self.pending.lock());
+        if batch.is_empty() {
+            return;
+        }
+        let Some(project) = self.project.read().clone() else {
+            return;
+        };
+        let mut summaries = Vec::with_capacity(batch.len());
+        for detail in &batch {
+            summaries.push(detail.summary.clone());
+        }
+        let insert = tokio::task::spawn_blocking(move || project.insert_packets(&batch)).await;
+        match insert {
+            Ok(Ok(ids)) => {
+                for (mut summary, id) in summaries.into_iter().zip(ids) {
+                    summary.id = id;
+                    let _ = self.events.send(ProxyEvent::Packet(summary));
+                }
+            }
+            Ok(Err(error)) => self.report_batch_failure(&summaries, error),
+            Err(error) => {
+                self.report_batch_failure(&summaries, ProxyError::SessionStopped);
+                tracing::error!(%error, "the packet persistence worker stopped");
+            }
+        }
+    }
+
+    fn report_batch_failure(&self, summaries: &[PacketSummary], error: impl std::fmt::Display) {
+        tracing::warn!(%error, "a packet batch could not be persisted");
+        let mut reported: Vec<ConnectionId> = Vec::new();
+        for summary in summaries {
+            if reported.contains(&summary.connection_id) {
+                continue;
+            }
+            reported.push(summary.connection_id);
+            let _ = self.events.send(ProxyEvent::Error {
+                connection_id: summary.connection_id,
+                message: format!("packets could not be written to the project: {error}"),
+            });
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl TransparentRouteProvider for ProxyService {
     async fn open_transparent_route(&self, target: TransparentTarget) -> Result<u16, String> {
+        self.admit_route().map_err(|error| error.to_string())?;
+        let mut options = SessionOptions::new(Target {
+            host: target.host,
+            port: target.port,
+        });
+        options.preserve_client_address = true;
         let snapshot = self
-            .start_session(SessionOptions::new(Target {
-                host: target.host,
-                port: target.port,
-            }))
+            .start_session(options)
             .await
             .map_err(|error| error.to_string())?;
         snapshot
@@ -1094,24 +1655,48 @@ impl TransparentRouteProvider for ProxyService {
     }
 }
 
+/// Writes one direction's queue to its socket, in order, applying the
+/// configured network conditions.
+///
+/// Queued frames are preferred over cancellation, and a closed queue ends the
+/// loop with a clean shutdown of the write half, so whatever the session
+/// queued before it closed — a disconnect reason, typically — is delivered.
 async fn writer_loop(
     mut writer: WriteHalf<TcpStream>,
     mut receiver: mpsc::Receiver<OutboundBytes>,
     cipher: Arc<LinkCipher>,
     cancel: CancellationToken,
+    network: Arc<RwLock<NetworkConditions>>,
+    direction: Direction,
 ) -> Result<(), ProxyError> {
+    let mut shaper = Shaper::default();
     loop {
-        tokio::select! {
+        let message = tokio::select! {
+            biased;
+            message = receiver.recv() => message,
             () = cancel.cancelled() => return Ok(()),
-            message = receiver.recv() => {
-                let Some(message) = message else { return Ok(()); };
-                let mut bytes = BytesMut::from(message.bytes.as_ref());
-                if message.encrypt {
-                    cipher.encrypt(&mut bytes);
-                }
-                writer.write_all(&bytes).await?;
-                writer.flush().await?;
+        };
+        let Some(message) = message else {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        };
+        let link = network.read().for_direction(direction);
+        if !link.is_neutral() {
+            let release = shaper.release_at(&link, message.queued_at, Instant::now());
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(release) => {}
+                () = cancel.cancelled() => return Ok(()),
             }
+        }
+        let mut bytes = BytesMut::from(message.bytes.as_ref());
+        if message.encrypt {
+            cipher.encrypt(&mut bytes);
+        }
+        writer.write_all(&bytes).await?;
+        writer.flush().await?;
+        if !link.is_neutral() {
+            shaper.sent(&link, Instant::now(), bytes.len());
         }
     }
 }
@@ -1122,50 +1707,68 @@ fn update_snapshot(handle: &SessionHandle, update: impl FnOnce(&mut ConnectionSn
 
 /// Follows the configuration/play boundary introduced in 1.20.2.
 ///
-/// Configuration and play ids are renumbered nearly every release, so this reads
-/// the exchange by its shape rather than from a per-version id table: each half
-/// of the handshake is the only empty-bodied packet its direction can carry in
-/// that state. Missing this transition left every packet after the configuration
-/// phase labelled `configuration`, and therefore decoded against the wrong state.
+/// The four packets that move a connection between the two states are named by
+/// the version's id table. Recognising them by an empty body was wrong from
+/// 1.21.2 on, where the bundle delimiter and the client's per-tick message are
+/// empty too: every entity bundle flipped the session into configuration.
+/// Only a release with no table falls back to that shape rule.
 fn track_configuration_phase(
     handle: &SessionHandle,
     direction: Direction,
     frame: &PacketFrame,
     state: ProtocolState,
 ) {
-    let modern = handle
-        .snapshot
-        .read()
-        .protocol_version
-        .is_some_and(|version| version >= 764);
-    if !modern || !frame.body.is_empty() {
+    let protocol = handle.snapshot.read().protocol_version;
+    if protocol.is_none_or(|version| version < 764) {
+        return;
+    }
+    if PacketRegistry::is_tabulated(state, protocol) {
+        match transition_name(state, direction, Some(frame.id), protocol) {
+            // Finish configuration is answered by the client's acknowledgement,
+            // and both sides are in play once that is on the wire.
+            Some("finish_configuration_ack") => enter_play(handle),
+            // Start configuration is only an offer; the client's
+            // acknowledgement is what actually moves the stream out of play.
+            Some("start_configuration") => handle
+                .reconfiguration_offered
+                .store(true, Ordering::Release),
+            Some("configuration_acknowledged")
+                if handle.reconfiguration_offered.swap(false, Ordering::AcqRel) =>
+            {
+                enter_configuration(handle);
+            }
+            _ => {}
+        }
+        return;
+    }
+    if !frame.body.is_empty() {
         return;
     }
     match (state, direction) {
-        // Finish configuration, then the client's acknowledgement: both sides
-        // are in play once that acknowledgement is on the wire.
-        (ProtocolState::Configuration, Direction::ClientToServer) => {
-            handle
-                .reconfiguration_offered
-                .store(false, Ordering::Release);
-            update_snapshot(handle, |snapshot| snapshot.state = ProtocolState::Play);
-        }
-        // Start configuration is only an offer; the client's acknowledgement is
-        // what actually moves the stream back out of play.
-        (ProtocolState::Play, Direction::ServerToClient) => {
-            handle
-                .reconfiguration_offered
-                .store(true, Ordering::Release);
-        }
+        (ProtocolState::Configuration, Direction::ClientToServer) => enter_play(handle),
+        (ProtocolState::Play, Direction::ServerToClient) => handle
+            .reconfiguration_offered
+            .store(true, Ordering::Release),
         (ProtocolState::Play, Direction::ClientToServer)
             if handle.reconfiguration_offered.swap(false, Ordering::AcqRel) =>
         {
-            update_snapshot(handle, |snapshot| {
-                snapshot.state = ProtocolState::Configuration;
-            });
+            enter_configuration(handle);
         }
         _ => {}
     }
+}
+
+fn enter_play(handle: &SessionHandle) {
+    handle
+        .reconfiguration_offered
+        .store(false, Ordering::Release);
+    update_snapshot(handle, |snapshot| snapshot.state = ProtocolState::Play);
+}
+
+fn enter_configuration(handle: &SessionHandle) {
+    update_snapshot(handle, |snapshot| {
+        snapshot.state = ProtocolState::Configuration;
+    });
 }
 
 fn loader_from_address(address: &str) -> Option<String> {
@@ -1192,44 +1795,39 @@ mod tests {
     use super::*;
 
     fn handle(protocol_version: i32) -> SessionHandle {
-        SessionHandle {
-            snapshot: Arc::new(RwLock::new(ConnectionSnapshot {
-                id: Uuid::nil(),
-                target: Target {
-                    host: "example.test".into(),
-                    port: 25_565,
-                },
-                listener_address: "127.0.0.1:0".into(),
-                status: ConnectionStatus::Active,
-                state: ProtocolState::Configuration,
-                protocol_version: Some(protocol_version),
-                minecraft_version: None,
-                loader: None,
-                compression_threshold: None,
-                encrypted_client: true,
-                encrypted_server: true,
-                packet_count: 0,
-                byte_count: 0,
-                last_error: None,
-            })),
-            client_writer: Arc::new(RwLock::new(None)),
-            server_writer: Arc::new(RwLock::new(None)),
-            compression_threshold: Arc::new(RwLock::new(None)),
-            client_cipher: Arc::new(LinkCipher::new()),
-            server_cipher: Arc::new(LinkCipher::new()),
-            encryption_bridge: Arc::new(EncryptionBridge::new()),
-            reconfiguration_offered: Arc::new(AtomicBool::new(false)),
-            cancel: CancellationToken::new(),
-        }
+        SessionHandle::new(ConnectionSnapshot {
+            id: Uuid::nil(),
+            target: Target {
+                host: "example.test".into(),
+                port: 25_565,
+            },
+            listener_address: "127.0.0.1:0".into(),
+            status: ConnectionStatus::Active,
+            state: ProtocolState::Configuration,
+            protocol_version: Some(protocol_version),
+            minecraft_version: None,
+            loader: None,
+            compression_threshold: None,
+            encrypted_client: true,
+            encrypted_server: true,
+            packet_count: 0,
+            byte_count: 0,
+            last_error: None,
+        })
     }
 
-    fn frame(body: &'static [u8]) -> PacketFrame {
+    fn frame(id: i32, body: &'static [u8]) -> PacketFrame {
         PacketFrame {
-            id: 3,
+            id,
             body: Bytes::from_static(body),
             compressed: false,
             wire_length: body.len() + 1,
         }
+    }
+
+    fn id(state: ProtocolState, direction: Direction, name: &str, protocol: i32) -> i32 {
+        PacketRegistry::packet_id(state, direction, name, Some(protocol))
+            .unwrap_or_else(|| panic!("{name} is tabulated for {protocol}"))
     }
 
     fn state_of(handle: &SessionHandle) -> ProtocolState {
@@ -1239,25 +1837,61 @@ mod tests {
     #[test]
     fn acknowledging_finish_configuration_enters_play() {
         let session = handle(767);
+        let ack = id(
+            ProtocolState::Configuration,
+            Direction::ClientToServer,
+            "finish_configuration_ack",
+            767,
+        );
         track_configuration_phase(
             &session,
             Direction::ClientToServer,
-            &frame(&[]),
+            &frame(ack, &[]),
             ProtocolState::Configuration,
         );
         assert_eq!(state_of(&session), ProtocolState::Play);
     }
 
     #[test]
-    fn play_only_returns_to_configuration_after_the_server_offers_it() {
+    fn other_empty_configuration_packets_do_not_enter_play() {
         let session = handle(767);
-        session.snapshot.write().state = ProtocolState::Play;
-
-        // An empty client packet on its own must not rewrite the state.
+        let keep_alive = id(
+            ProtocolState::Configuration,
+            Direction::ClientToServer,
+            "client_information",
+            767,
+        );
         track_configuration_phase(
             &session,
             Direction::ClientToServer,
-            &frame(&[]),
+            &frame(keep_alive, &[]),
+            ProtocolState::Configuration,
+        );
+        assert_eq!(state_of(&session), ProtocolState::Configuration);
+    }
+
+    #[test]
+    fn play_only_returns_to_configuration_after_the_server_offers_it() {
+        let session = handle(767);
+        session.snapshot.write().state = ProtocolState::Play;
+        let start = id(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            "start_configuration",
+            767,
+        );
+        let ack = id(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            "configuration_acknowledged",
+            767,
+        );
+
+        // An acknowledgement on its own must not rewrite the state.
+        track_configuration_phase(
+            &session,
+            Direction::ClientToServer,
+            &frame(ack, &[]),
             ProtocolState::Play,
         );
         assert_eq!(state_of(&session), ProtocolState::Play);
@@ -1265,29 +1899,53 @@ mod tests {
         track_configuration_phase(
             &session,
             Direction::ServerToClient,
-            &frame(&[]),
+            &frame(start, &[]),
             ProtocolState::Play,
         );
         assert_eq!(state_of(&session), ProtocolState::Play);
         track_configuration_phase(
             &session,
             Direction::ClientToServer,
-            &frame(&[]),
+            &frame(ack, &[]),
             ProtocolState::Play,
         );
         assert_eq!(state_of(&session), ProtocolState::Configuration);
     }
 
+    /// From 1.21.2 the bundle delimiter and the client's tick end are both
+    /// empty, and both are constant traffic during play.
     #[test]
-    fn packets_with_a_body_never_move_the_state() {
-        let session = handle(767);
-        track_configuration_phase(
-            &session,
-            Direction::ClientToServer,
-            &frame(&[1, 2, 3]),
-            ProtocolState::Configuration,
+    fn bundle_delimiters_and_tick_ends_leave_play_alone() {
+        let protocol = 768;
+        let session = handle(protocol);
+        session.snapshot.write().state = ProtocolState::Play;
+        let bundle = id(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            "bundle_delimiter",
+            protocol,
         );
-        assert_eq!(state_of(&session), ProtocolState::Configuration);
+        let tick_end = id(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            "client_tick_end",
+            protocol,
+        );
+        for _ in 0..3 {
+            track_configuration_phase(
+                &session,
+                Direction::ServerToClient,
+                &frame(bundle, &[]),
+                ProtocolState::Play,
+            );
+            track_configuration_phase(
+                &session,
+                Direction::ClientToServer,
+                &frame(tick_end, &[]),
+                ProtocolState::Play,
+            );
+            assert_eq!(state_of(&session), ProtocolState::Play);
+        }
     }
 
     #[test]
@@ -1297,9 +1955,86 @@ mod tests {
         track_configuration_phase(
             &session,
             Direction::ClientToServer,
-            &frame(&[]),
+            &frame(0, &[]),
             ProtocolState::Play,
         );
         assert_eq!(state_of(&session), ProtocolState::Play);
+    }
+
+    #[test]
+    fn replacement_rules_never_touch_handshake_or_login() {
+        let service = ProxyService::new();
+        service
+            .set_replacement_rules(vec![ReplacementRule {
+                id: Uuid::nil(),
+                name: "everything".into(),
+                enabled: true,
+                expression: String::new(),
+                edits: vec![mineburp_core::PacketEdit::Frame {
+                    bytes: "00 01".into(),
+                }],
+            }])
+            .expect("rules");
+        let session = handle(767);
+        for state in [ProtocolState::Handshake, ProtocolState::Login] {
+            let detail = service.make_detail(
+                &session,
+                Direction::ServerToClient,
+                &frame(1, &[9, 9]),
+                Disposition::Forwarded,
+                state,
+                false,
+            );
+            assert!(
+                service
+                    .rewrite(&detail, state, Direction::ServerToClient)
+                    .is_none()
+            );
+        }
+        let detail = service.make_detail(
+            &session,
+            Direction::ServerToClient,
+            &frame(1, &[9, 9]),
+            Disposition::Forwarded,
+            ProtocolState::Play,
+            false,
+        );
+        assert!(
+            service
+                .rewrite(&detail, ProtocolState::Play, Direction::ServerToClient)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_budget_bounds_queued_bytes() {
+        let (sender, mut receiver) = WriterSender::channel();
+        sender
+            .send(Bytes::from(vec![0_u8; WRITER_QUEUE_BYTES]), false)
+            .await
+            .expect("first frame fits the empty budget");
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(50),
+            sender.send(Bytes::from_static(&[1]), false),
+        )
+        .await;
+        assert!(blocked.is_err(), "a full budget makes the reader wait");
+        drop(receiver.recv().await);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sender.send(Bytes::from_static(&[1]), false),
+        )
+        .await
+        .expect("written bytes return to the budget")
+        .expect("send");
+    }
+
+    #[test]
+    fn route_requests_are_rate_limited() {
+        let service = ProxyService::new();
+        for _ in 0..ROUTES_PER_SECOND {
+            service.admit_route().expect("within the limit");
+        }
+        assert!(matches!(service.admit_route(), Err(ProxyError::RouteLimit)));
     }
 }

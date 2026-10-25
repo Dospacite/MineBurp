@@ -3,6 +3,8 @@ import { useEffect, useLayoutEffect, useState } from "react";
 export type Theme = "light" | "dark";
 
 const STORAGE_KEY = "mineburp.theme";
+/** Window chrome colours matching `--bg` for each theme. */
+const CHROME_COLOR: Record<Theme, string> = { light: "#f2f1ed", dark: "#191917" };
 
 function initialTheme(): Theme {
   const stored = window.localStorage.getItem(STORAGE_KEY);
@@ -16,6 +18,9 @@ export function useTheme() {
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
+    // Keep the window chrome in step; the static meta tag can only name one.
+    const meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    if (meta) meta.content = CHROME_COLOR[theme];
   }, [theme]);
 
   useEffect(() => {
@@ -28,10 +33,11 @@ export function useTheme() {
 
   return {
     theme,
-    toggleTheme: () => setTheme((current) => {
-      const next = current === "dark" ? "light" : "dark";
-      window.localStorage.setItem(STORAGE_KEY, next);
-      return next;
-    }),
+    toggleTheme: () =>
+      setTheme((current) => {
+        const next = current === "dark" ? "light" : "dark";
+        window.localStorage.setItem(STORAGE_KEY, next);
+        return next;
+      }),
   };
 }

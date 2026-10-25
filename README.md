@@ -1,18 +1,20 @@
 # MineBurp
 
-MineBurp is a Burp Suite-style desktop workbench for authorized Minecraft Java security testing. It automatically discovers Minecraft client JVMs, observes only their TCP/UDP sockets, exposes raw payloads and flows, and stores observations in portable `.mineburp` project files. Its protocol and proxy crates provide the active-inspection foundation for decoding, interception, and Repeater workflows.
+MineBurp is a Burp Suite-style desktop workbench for authorized Minecraft Java security testing. It automatically discovers Minecraft client JVMs, observes only their TCP/UDP sockets, exposes raw payloads and flows, and stores observations in portable `.mineburp` project files. Its protocol and proxy crates provide the active-inspection foundation for decoding, rewriting, and Repeater workflows.
 
-The current registry covers stable Java releases from 1.7.2 through 26.2. Unknown/newer protocol numbers remain usable in raw mode: framing, compression, encryption bridging, history, interception, and Repeater do not depend on a named packet map.
+The current registry covers stable Java releases from 1.7.2 through 26.2. Unknown/newer protocol numbers remain usable in raw mode: framing, compression, encryption bridging, history, rewriting, and Repeater do not depend on a named packet map.
 
 ## What is implemented
 
 - Stateful loopback TCP proxy with VarInt framing, compression, connection state tracking, and frame size limits.
 - Opt-in **Decrypt connections** mode. A configured Minecraft client receives a one-use, capability-protected private loopback route for each Minecraft network connect; there is no public proxy listener, target field, or PID workflow.
 - Online-mode encryption termination with independent client/server AES-128/CFB8 streams. MineBurp uses the signed-in Minecraft session to join the upstream server hash, then continues inspection in plaintext internally.
-- Interactive intercept with forward, drop, delay, hold, and edited-forward decisions.
+- **Intercept**: hold status, configuration, and play packets on decrypted connections before they are forwarded, per direction and selected with the filter expression language. Each held packet can be forwarded, edited through its decoded fields or hex and then forwarded, or dropped. A held packet pauses only its own direction of its own connection. Handshake and login packets are never held, keep-alives and pings overtake a held packet instead of queueing behind it, an optional auto-forward deadline releases held packets with a visible countdown, and turning Intercept off forwards everything still held.
+- **Network conditions**: per-direction fixed delay, jitter, and bandwidth limit on decrypted connections, set at runtime from the Intercept view.
 - Live Repeater injection in either direction with project-backed tabs. The Repeater decodes the frame it is editing into typed fields; editing a field re-encodes it — length prefixes included — and the hex follows, and editing the hex re-decodes the fields.
 - Automatic **Replace** rules that rewrite matching packets in either direction as they pass through: whole frame, byte range, byte sequence, literal text, regular expression, a named decoded field, or a find/replace inside one. Rules are selected with the same filter expression language as the history, are stored in the project, and can be previewed against a captured packet before they are enabled.
 - Raw hex inspector plus decoded fields for handshake, status, login, and configuration packets (a version-aware id table confirmed against the body), from a generated per-version id table (see below), and for play packets identified from the shape of their body: chat, commands and tab completion, plugin/custom payloads, client information, movement and vehicle movement, digging, block placement and block use, entity clicks (attack and interact), item use, sneak/sprint and the other player commands, sign edits, hotbar switches, keep alive, health, experience, abilities, time, block updates and block events, mining progress, level events, container screens, entity moves, teleports, velocity and removals, tab-list removals, resource packs, and the play login packet. Fabric, Forge, NeoForge, and legacy plugin channels are recognised by channel.
+- Registry ids in decoded fields are named for every release from 1.7 to 26.2: items (with pre-1.13 damage variants), entity types, block states with their properties, sounds, particles, menus, effects, statistics, attributes, data component types, and the other built-in registries. The name sits beside the number (`item_id_name`), so the wire value stays visible and editable.
 - Declarative, bounded JSON schema packs for plugin/mod payloads; packs are validated, hashed, stored in the project, and never execute code.
 - SQLCipher-backed `.mineburp` projects with optional passphrases, WAL journaling, zstd packet blobs, connections, rules, Repeater tabs, and schema packs.
 - Launcher-session assistance for online-mode servers without a MineBurp-owned Entra registration. A loader-independent Java agent asks the already signed-in Minecraft Authlib service to join MineBurp's upstream server hash; its access token never leaves the game process.
@@ -20,7 +22,12 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 - Official Minecraft Launcher, Prism Launcher, MultiMC, Modrinth, and CurseForge discovery and launch adapters. Official, Prism, and MultiMC JVM configuration is reversible; Modrinth and CurseForge show a copyable manual argument.
 - Automatic Minecraft-client TCP/UDP capture through Wireshark's privilege-separated `dumpcap` helper and Linux `procfs` socket ownership. No MineBurp listener, target, or manual PID selection is required, and frames owned by unrelated processes are discarded before publication or persistence.
 - Project packet history uses database-side filters and fixed-size pages, so a long capture does not force the desktop UI to reset or render every packet at once.
-- Advanced packet filtering: traffic source, direction, protocol phase, and result sets; packet-name show/hide lists; payload size bounds; free-text search with regex, case-sensitive, and negative options; a filter expression language (`state == play && size > 256 && name ~ chat`) shared with intercept rules; and payload content search by literal text, hex byte sequence, or regular expression, scoped to packets that contain the term, are exactly it, start with it, or end with it — each of which can be negated. A content search takes one term per line and matches any of them, and a hex term may be an inclusive range (`0c-0f`, `0100-01ff`), so hiding a handful of frames is one filter rather than one per frame. All of it runs in SQLite against the whole capture, not against the rows on screen.
+- Passive capture keeps a connection's first frames: frames of a flow not yet attributed are held until the next socket scan instead of dropped, and every TCP direction is reassembled — retransmissions removed, out-of-order segments put back in sequence, link padding trimmed — with the capture's own timestamps.
+- **Annotations and saved filters**: bookmark, colour, and annotate any packet, filter the history to bookmarked rows, and save named filters in the project.
+- **Traffic statistics** for any filter: packets and bytes per direction over time, the busiest packet names by count and by bytes, the busiest connections, and a size histogram.
+- **pcapng export and import**. Export writes decrypted packets as one synthetic TCP stream per connection, with each packet named in a comment, and `tools/wireshark/mineburp.lua` dissects it in Wireshark. Import reads pcap or pcapng files into a project through the same reassembly as live capture, then splits each TCP stream into Minecraft packets — one row per packet with its state, id and name — following the handshake, compression, login and configuration the way the proxy does. Encrypted traffic (after an online-mode login) cannot be decrypted from a capture and is kept as labelled raw rows; a capture that starts mid-connection is synchronised by searching for frame boundaries, optionally with a protocol version you give it. Re-importing a MineBurp pcapng export restores the packets, states and names it was written with.
+- History maintenance: delete the packets a filter matches and compact the project file.
+- Advanced packet filtering: traffic source, direction, protocol phase, and result sets; packet-name show/hide lists; payload size bounds; free-text search with regex, case-sensitive, and negative options; a filter expression language (`state == play && size > 256 && name ~ chat`) shared with replace rules; and payload content search by literal text, hex byte sequence, or regular expression, scoped to packets that contain the term, are exactly it, start with it, or end with it — each of which can be negated. A content search takes one term per line and matches any of them, and a hex term may be an inclusive range (`0c-0f`, `0100-01ff`), so hiding a handful of frames is one filter rather than one per frame. All of it runs in SQLite against the whole capture, not against the rows on screen.
 
 ## Repository layout
 
@@ -29,7 +36,7 @@ crates/
   mineburp-core/       transport-neutral domain models and filters
   mineburp-protocol/   wire framing, encryption, common decoders, schemas
   mineburp-project/    encrypted project repository and migrations
-  mineburp-proxy/      sessions, interception, online-mode bridge, Repeater
+  mineburp-proxy/      sessions, online-mode bridge, Repeater
   mineburp-auth/       Microsoft/Minecraft authentication and secret boundary
   mineburp-session/    session-join contract and capability-protected broker
   mineburp-launcher/   launcher discovery and process isolation
@@ -81,20 +88,42 @@ The first three read `reports/packets.json` — the game reporting its own ids �
 which exists from 1.20.5 onwards; `--prismarine` reads a `minecraft-data`
 `protocol.json` for older releases. Names are mapped onto the names the
 inspector already uses, so a packet named from a table and the same packet named
-from its shape are one row, not two. Results land in
-`crates/mineburp-protocol/data/play-packets.json`, one entry per protocol,
-carrying the release and the source it came from. Requires a JDK the target
-version accepts (21+ for modern releases) and network access, unless a report or
-`minecraft-data` file is supplied.
+from its shape are one row, not two. Running with no `--protocol` regenerates
+every release from the cache (`target/minecraft`), downloading missing
+`minecraft-data` descriptions; `--offline` uses only the cache. Results land in
+`crates/mineburp-protocol/data/packet-tables.json` (login, configuration and
+play ids per protocol, with the release and source) and
+`crates/mineburp-protocol/data/protocol-definitions.zst` (field definitions the
+inspector decodes with). Requires a JDK the target version accepts (21+ for
+modern releases) and network access, unless a report or `minecraft-data` file
+is supplied.
 
-A table names a packet; it never outranks its bytes. The protocol version comes
-from a handshake the client wrote, so when a decoder reads the body as a
-different packet, the body wins.
+The same run rebuilds `crates/mineburp-protocol/data/registry-names.zst`, which
+names the numeric registry ids in decoded fields — items, entity types, block
+states, sounds, particles, menus and so on — beside the number
+(`item_id_name: "minecraft:diamond_sword"`). Its sources are cached under
+`target/minecraft/registries/<protocol>/`: the data generator's
+`registries.json`, `blocks.json` and `items.json`, cached whenever `--protocol`
+runs the generator, and `minecraft-data` registry lists for older releases,
+downloaded automatically.
+
+```bash
+# Run the data generator for every 1.13+ release whose registry reports are
+# not cached yet (downloads each server jar), then rebuild everything.
+cargo run -p mineburp-packet-table -- --vanilla-registries
+
+# Write the registry names somewhere else.
+cargo run -p mineburp-packet-table -- --offline --names /tmp/registry-names.zst
+```
+
+Where a table exists, it names the packet and the body is decoded as that
+packet. A body that doesn't fit is reported as a warning on the packet, along
+with what it reads as instead, rather than renamed.
 
 ## First run
 
 1. Start MineBurp. The **Traffic** view starts system capture automatically and records into a temporary project, so nothing is lost before you decide where to keep it.
-2. Create an optional-passphrase `.mineburp` project when you want the session kept — the temporary project is deleted on exit.
+2. Choose **Save as** in the project menu to keep the session: it copies everything captured so far into a `.mineburp` file (with an optional passphrase) and keeps recording there. The temporary project is deleted on exit.
 3. Launch Minecraft from its normal launcher or from **Instances**, then connect to any server normally.
 4. Pick a connection in **Traffic** and select a packet to inspect its endpoints, decoded fields, and payload bytes. No MineBurp listener, target, PID, Java agent, or Microsoft sign-in is required.
 
@@ -121,7 +150,7 @@ MineBurp uses authorization-code flow with PKCE and no client secret. Minecraft 
 
 Use MineBurp only on systems you own or have explicit permission to assess. The capture helper can see system traffic, but MineBurp publishes and persists only frames attributed to detected Minecraft client JVM sockets. MineBurp applies payload, collection, nesting, and database limits, does not load native code from schema packs, and redacts authentication secrets from debug output.
 
-Current intentionally bounded areas are documented in [SECURITY.md](SECURITY.md). In particular, the 1.19–1.19.2 signed-nonce alternative is rejected rather than guessed, and passive capture does not claim to decrypt encrypted application payloads.
+Current intentionally bounded areas are documented in [SECURITY.md](SECURITY.md). In particular, the 1.19–1.19.2 signed-nonce response is accepted but its signature is not verified locally, and passive capture does not claim to decrypt encrypted application payloads.
 
 ## Verification
 

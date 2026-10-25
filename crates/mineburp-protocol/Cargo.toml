@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 aes.workspace = true
+base64.workspace = true
 bytes.workspace = true
 cipher.workspace = true
 flate2.workspace = true
@@ -14,14 +15,17 @@ indexmap.workspace = true
 mineburp-core = { path = "../mineburp-core" }
 regex.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Decoded fields are reported in wire order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+proptest = { version = "1.7", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

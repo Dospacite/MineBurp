@@ -42,6 +42,11 @@ pub enum TrafficSource {
     SideChannel,
 }
 
+/// How a packet left the pipeline.
+///
+/// Intercept produces `Dropped` for a held frame the operator discarded, and
+/// `Edited` for one forwarded with changes. `Delayed` is no longer produced but
+/// stays in the vocabulary so projects recorded by older builds still read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
@@ -148,29 +153,11 @@ pub struct ConnectionSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InterceptRule {
-    pub id: Uuid,
-    pub name: String,
-    pub enabled: bool,
-    pub expression: String,
-    pub action: InterceptDecision,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-pub enum InterceptDecision {
-    Forward,
-    Drop,
-    Hold,
-    DelayMillis(u64),
-}
-
 /// A rule that rewrites packets automatically as they pass through.
 ///
-/// Selection reuses the same filter expression language as the history and
-/// intercept rules, so anything an operator can search for is also something
-/// they can rewrite. An empty expression matches every packet.
+/// Selection reuses the same filter expression language as the history, so
+/// anything an operator can search for is also something they can rewrite. An
+/// empty expression matches every packet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplacementRule {
     pub id: Uuid,

@@ -352,7 +352,12 @@ fn compare_text(actual: &str, comparison: Comparison, expected: &FilterValue) ->
     match comparison {
         Comparison::Equal => actual.eq_ignore_ascii_case(expected),
         Comparison::NotEqual => !actual.eq_ignore_ascii_case(expected),
-        Comparison::Contains => actual.to_lowercase().contains(&expected.to_lowercase()),
+        // ASCII folding only, like `eq_ignore_ascii_case` above and like
+        // SQLite's built-in `LOWER`: the project evaluates the same expression
+        // in SQL, and a Unicode fold here would select different packets there.
+        Comparison::Contains => actual
+            .to_ascii_lowercase()
+            .contains(&expected.to_ascii_lowercase()),
         Comparison::Greater
         | Comparison::GreaterOrEqual
         | Comparison::Less
@@ -467,5 +472,141 @@ mod tests {
             ],
         };
         assert!(expression.matches(&packet()));
+    }
+
+    fn parse(input: &str) -> FilterExpression {
+        FilterExpression::parse(input).expect("valid expression")
+    }
+
+    #[test]
+    fn or_binds_looser_than_and() {
+        let expression = parse("size > 1000 && state == play || name == custom_payload");
+        // (false && true) || true
+        assert!(expression.matches(&packet()));
+        // Parentheses are not part of the grammar: the text is rejected rather
+        // than silently read as a grouping.
+        assert!(matches!(
+            FilterExpression::parse("size > 1000 && (state == play || name == x)"),
+            Err(FilterParseError::UnknownField(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_aliases_quotes_and_match_all() {
+        assert_eq!(parse("*"), FilterExpression::MatchAll);
+        assert!(parse("dir == client_to_server").matches(&packet()));
+        assert!(parse("phase == PLAY").matches(&packet()));
+        assert!(parse("packet.id == 10").matches(&packet()));
+        assert!(parse("version >= 765").matches(&packet()));
+        let quoted = parse("channel == \"fabric:registry/sync\"");
+        assert!(quoted.matches(&packet()));
+        // A separator inside quotes belongs to the value.
+        let expression = parse("name == 'a && b' || size == 128");
+        assert!(expression.matches(&packet()));
+        let FilterExpression::Or { expressions } = expression else {
+            panic!("expected a disjunction");
+        };
+        assert_eq!(
+            expressions[0],
+            FilterExpression::Predicate {
+                field: FilterField::Name,
+                comparison: Comparison::Equal,
+                value: FilterValue::String("a && b".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn reports_malformed_expressions() {
+        assert_eq!(FilterExpression::parse("  "), Err(FilterParseError::Empty));
+        assert!(matches!(
+            FilterExpression::parse("colour == red"),
+            Err(FilterParseError::UnknownField(_))
+        ));
+        assert!(matches!(
+            FilterExpression::parse("size === 3"),
+            Err(FilterParseError::UnknownOperator(_))
+        ));
+        assert!(matches!(
+            FilterExpression::parse("size > big"),
+            Err(FilterParseError::ExpectedInteger(_))
+        ));
+        assert!(matches!(
+            FilterExpression::parse("size >"),
+            Err(FilterParseError::InvalidPredicate(_))
+        ));
+    }
+
+    #[test]
+    fn an_absent_optional_field_never_matches_even_under_not_equal() {
+        let mut bare = packet();
+        bare.name = None;
+        bare.packet_id = None;
+        bare.protocol_version = None;
+        assert!(!parse("name != chat").matches(&bare));
+        assert!(!parse("name ~ ''").matches(&bare));
+        assert!(!parse("id != 3").matches(&bare));
+        assert!(!parse("id ~ 1").matches(&bare));
+        assert!(!parse("protocol < 1000").matches(&bare));
+        // Negation is plain boolean negation of that result.
+        let negated = FilterExpression::Not {
+            expression: Box::new(parse("name != chat")),
+        };
+        assert!(negated.matches(&bare));
+    }
+
+    #[test]
+    fn text_comparisons_fold_ascii_only_and_never_order() {
+        assert!(parse("name == CUSTOM_PAYLOAD").matches(&packet()));
+        assert!(parse("name ~ PAYLOAD").matches(&packet()));
+        assert!(!parse("name > a").matches(&packet()));
+        assert!(!parse("name <= z").matches(&packet()));
+        let mut accented = packet();
+        accented.name = Some("Ärger".into());
+        // `Ä` and `ä` are different code points to an ASCII fold.
+        assert!(!parse("name ~ ärger").matches(&accented));
+        assert!(parse("name ~ Ärger").matches(&accented));
+        // The ASCII letters still fold around it.
+        assert!(parse("name ~ ÄRGER").matches(&accented));
+    }
+
+    #[test]
+    fn numeric_contains_is_a_digit_match() {
+        assert!(parse("size ~ 12").matches(&packet()));
+        assert!(parse("size ~ 28").matches(&packet()));
+        assert!(!parse("size ~ 9").matches(&packet()));
+        assert!(parse("size != 127").matches(&packet()));
+    }
+
+    #[test]
+    fn empty_groups_follow_iterator_semantics() {
+        assert!(
+            FilterExpression::And {
+                expressions: Vec::new()
+            }
+            .matches(&packet())
+        );
+        assert!(
+            !FilterExpression::Or {
+                expressions: Vec::new()
+            }
+            .matches(&packet())
+        );
+    }
+
+    #[test]
+    fn a_mistyped_value_never_matches() {
+        let expression = FilterExpression::Predicate {
+            field: FilterField::Size,
+            comparison: Comparison::Equal,
+            value: FilterValue::String("128".into()),
+        };
+        assert!(!expression.matches(&packet()));
+        let expression = FilterExpression::Predicate {
+            field: FilterField::Name,
+            comparison: Comparison::Equal,
+            value: FilterValue::Integer(1),
+        };
+        assert!(!expression.matches(&packet()));
     }
 }

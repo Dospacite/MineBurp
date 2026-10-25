@@ -14,7 +14,7 @@ use mineburp_protocol::{
     EncryptionRequest, EncryptionResponse, FrameCodec, Handshake, MinecraftCipher, PacketFrame,
     encode_handshake, encode_var_i32,
 };
-use mineburp_proxy::{ProxyService, SessionOptions};
+use mineburp_proxy::{ProxyEvent, ProxyService, SessionOptions};
 use mineburp_session::{SessionJoinProvider, SessionJoinRequest};
 use rsa::{
     Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
@@ -111,7 +111,7 @@ fn string_bytes(value: &str) -> Vec<u8> {
 }
 
 /// The upstream server: issues the key exchange, then compresses and encrypts.
-async fn run_server(listener: TcpListener, private_key: RsaPrivateKey) {
+async fn run_server(listener: TcpListener, private_key: RsaPrivateKey, should_authenticate: bool) {
     let (stream, _) = listener.accept().await.expect("accept");
     let mut link = Link::new(stream);
 
@@ -134,6 +134,7 @@ async fn run_server(listener: TcpListener, private_key: RsaPrivateKey) {
         public_key_der: Bytes::copy_from_slice(public_key_der.as_ref()),
         verify_token: Bytes::copy_from_slice(&SERVER_VERIFY_TOKEN),
         trailing: Bytes::new(),
+        should_authenticate,
     };
     link.send(1, &request.encode().expect("encode request"))
         .await;
@@ -180,15 +181,41 @@ async fn run_server(listener: TcpListener, private_key: RsaPrivateKey) {
     link.send(0x22, b"play-payload").await;
 }
 
+/// Fails the test if the proxy asks for a join the server did not want.
+#[derive(Debug)]
+struct NeverJoins;
+
+#[async_trait::async_trait]
+impl SessionJoinProvider for NeverJoins {
+    async fn join_server(&self, _request: &SessionJoinRequest) -> Result<(), String> {
+        Err("the server said not to authenticate, so no join may be made".into())
+    }
+}
+
 #[tokio::test]
 async fn online_mode_login_completes_through_the_proxy() {
+    login_through_the_proxy(true, Arc::new(AlwaysJoins)).await;
+}
+
+/// A 1.20.5+ server can encrypt without authenticating; the vanilla client
+/// then skips its join, so the proxy must not wait for one.
+#[tokio::test]
+async fn a_server_that_skips_authentication_gets_no_join() {
+    login_through_the_proxy(false, Arc::new(NeverJoins)).await;
+}
+
+async fn login_through_the_proxy(
+    should_authenticate: bool,
+    provider: Arc<dyn SessionJoinProvider>,
+) {
     let private_key = RsaPrivateKey::new(&mut OsRng, 1024).expect("server key");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let target_port = listener.local_addr().expect("addr").port();
-    let server = tokio::spawn(run_server(listener, private_key));
+    let server = tokio::spawn(run_server(listener, private_key, should_authenticate));
 
     let proxy = ProxyService::new();
-    proxy.set_session_join_provider(Some(Arc::new(AlwaysJoins)));
+    let mut events = proxy.subscribe();
+    proxy.set_session_join_provider(Some(provider));
     let snapshot = proxy
         .start_session(SessionOptions::new(Target {
             host: "127.0.0.1".into(),
@@ -221,6 +248,10 @@ async fn online_mode_login_completes_through_the_proxy() {
     let request_frame = client.receive().await;
     assert_eq!(request_frame.id, 1, "encryption request");
     let request = EncryptionRequest::decode(&request_frame.body).expect("request");
+    assert_eq!(
+        request.should_authenticate, should_authenticate,
+        "the client sees the server's authentication choice"
+    );
     let proxy_key = RsaPublicKey::from_public_key_der(&request.public_key_der)
         .expect("the proxy must present its own key");
     let response = EncryptionResponse {
@@ -234,6 +265,7 @@ async fn online_mode_login_completes_through_the_proxy() {
                 .encrypt(&mut OsRng, Pkcs1v15Encrypt, &request.verify_token)
                 .expect("encrypt token"),
         ),
+        signature: None,
     };
     client
         .send(
@@ -266,8 +298,16 @@ async fn online_mode_login_completes_through_the_proxy() {
         .expect("the server side must finish")
         .expect("the server task must not panic");
 
-    let sessions = proxy.sessions();
-    let session = sessions.first().expect("one session");
+    // A finished session leaves the live table; its last published snapshot
+    // is the record of what the proxy negotiated.
+    let mut last = None;
+    while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(500), events.recv()).await
+    {
+        if let ProxyEvent::Connection(connection) = event {
+            last = Some(connection);
+        }
+    }
+    let session = last.expect("the session published its snapshot");
     assert!(
         session.encrypted_client && session.encrypted_server,
         "both links encrypted"

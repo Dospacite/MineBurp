@@ -10,6 +10,10 @@ use crate::{decode_var_i32, decode_var_i64};
 
 const MAX_SCHEMA_DEPTH: usize = 32;
 const MAX_COLLECTION_LENGTH: usize = 1_000_000;
+/// Total values one decode may produce. Array counts are already bounded by
+/// the bytes left, but an item that reads nothing — an empty struct, a zero
+/// length byte field — would otherwise let a count multiply output for free.
+const MAX_DECODED_NODES: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaPackManifest {
@@ -121,6 +125,8 @@ pub enum SchemaError {
     InvalidLength(String),
     #[error("array count field `{0}` is missing or is not an integer")]
     InvalidCountField(String),
+    #[error("decoded output exceeds the decoding budget")]
+    BudgetExceeded,
     #[error(transparent)]
     Protocol(#[from] crate::ProtocolError),
 }
@@ -213,7 +219,15 @@ pub fn decode_schema(
 ) -> Result<Value, SchemaError> {
     let mut cursor = Cursor::new(input);
     let mut values = IndexMap::new();
-    decode_fields(&schema.fields, &mut cursor, &mut values, context, 0)?;
+    let mut budget = MAX_DECODED_NODES;
+    decode_fields(
+        &schema.fields,
+        &mut cursor,
+        &mut values,
+        context,
+        0,
+        &mut budget,
+    )?;
     let mut object = Map::new();
     for (key, value) in values {
         object.insert(key, value);
@@ -232,12 +246,21 @@ fn decode_fields(
     values: &mut IndexMap<String, Value>,
     context: DecodeContext,
     depth: usize,
+    budget: &mut usize,
 ) -> Result<(), SchemaError> {
     if depth > context.max_depth {
         return Err(SchemaError::TooDeep);
     }
     for field in fields {
-        let value = decode_type(&field.name, &field.kind, cursor, values, context, depth + 1)?;
+        let value = decode_type(
+            &field.name,
+            &field.kind,
+            cursor,
+            values,
+            context,
+            depth + 1,
+            budget,
+        )?;
         values.insert(field.name.clone(), value);
     }
     Ok(())
@@ -251,10 +274,12 @@ fn decode_type(
     values: &IndexMap<String, Value>,
     context: DecodeContext,
     depth: usize,
+    budget: &mut usize,
 ) -> Result<Value, SchemaError> {
     if depth > context.max_depth {
         return Err(SchemaError::TooDeep);
     }
+    *budget = budget.checked_sub(1).ok_or(SchemaError::BudgetExceeded)?;
     match kind {
         TypeDefinition::Bool => Ok(Value::Bool(read_exact::<1>(cursor, name)?[0] != 0)),
         TypeDefinition::U8 => Ok(Value::from(read_exact::<1>(cursor, name)?[0])),
@@ -335,7 +360,12 @@ fn decode_type(
             } else {
                 return Err(SchemaError::InvalidLength(name.into()));
             };
-            if count > context.max_collection_length {
+            // Every item reads at least its minimum width, so a count that
+            // cannot fit in what is left is rejected before any work is done.
+            let fits = count
+                .checked_mul(minimum_width(item))
+                .is_some_and(|needed| needed <= remaining(cursor).len());
+            if count > context.max_collection_length || !fits {
                 return Err(SchemaError::CollectionTooLarge(count));
             }
             let mut output = Vec::with_capacity(count.min(4_096));
@@ -347,15 +377,46 @@ fn decode_type(
                     values,
                     context,
                     depth + 1,
+                    budget,
                 )?);
             }
             Ok(Value::Array(output))
         }
         TypeDefinition::Struct { fields } => {
             let mut nested = IndexMap::new();
-            decode_fields(fields, cursor, &mut nested, context, depth + 1)?;
+            decode_fields(fields, cursor, &mut nested, context, depth + 1, budget)?;
             Ok(Value::Object(nested.into_iter().collect()))
         }
+    }
+}
+
+/// The fewest bytes one value of `kind` can occupy.
+fn minimum_width(kind: &TypeDefinition) -> usize {
+    match kind {
+        TypeDefinition::Bool
+        | TypeDefinition::U8
+        | TypeDefinition::I8
+        | TypeDefinition::VarInt
+        | TypeDefinition::VarLong
+        | TypeDefinition::String { .. } => 1,
+        TypeDefinition::U16Be | TypeDefinition::I16Be => 2,
+        TypeDefinition::U32Be | TypeDefinition::I32Be | TypeDefinition::F32Be => 4,
+        TypeDefinition::I64Be | TypeDefinition::F64Be => 8,
+        TypeDefinition::Uuid => 16,
+        TypeDefinition::Bytes { length, rest } => {
+            if rest.unwrap_or(false) {
+                0
+            } else {
+                length.unwrap_or(0)
+            }
+        }
+        TypeDefinition::Array { count, item, .. } => {
+            count.unwrap_or(0).saturating_mul(minimum_width(item))
+        }
+        TypeDefinition::Struct { fields } => fields
+            .iter()
+            .map(|field| minimum_width(&field.kind))
+            .fold(0, usize::saturating_add),
     }
 }
 
@@ -439,5 +500,69 @@ mod tests {
         .unwrap();
         assert_eq!(decoded["enabled"], true);
         assert_eq!(decoded["message"], "hello");
+    }
+
+    fn schema(fields: Vec<FieldDefinition>) -> SchemaDefinition {
+        SchemaDefinition {
+            name: "bounded".into(),
+            matcher: MatchDefinition {
+                state: ProtocolState::Play,
+                direction: Direction::ServerToClient,
+                packet_id: None,
+                channel: None,
+                protocol_min: None,
+                protocol_max: None,
+            },
+            fields,
+        }
+    }
+
+    #[test]
+    fn an_array_count_larger_than_the_input_is_rejected_up_front() {
+        let definition = schema(vec![
+            FieldDefinition {
+                name: "count".into(),
+                kind: TypeDefinition::VarInt,
+            },
+            FieldDefinition {
+                name: "items".into(),
+                kind: TypeDefinition::Array {
+                    count_field: Some("count".into()),
+                    count: None,
+                    item: Box::new(TypeDefinition::I64Be),
+                },
+            },
+        ]);
+        // 100 longs claimed, 16 bytes present.
+        let mut input = vec![100];
+        input.extend_from_slice(&[0; 16]);
+        assert!(matches!(
+            decode_schema(&definition, &input, DecodeContext::default()),
+            Err(SchemaError::CollectionTooLarge(100))
+        ));
+    }
+
+    #[test]
+    fn zero_width_items_cannot_amplify_output() {
+        let empty = TypeDefinition::Struct { fields: vec![] };
+        let inner = TypeDefinition::Array {
+            count_field: None,
+            count: Some(1_000_000),
+            item: Box::new(empty),
+        };
+        let definition = schema(vec![FieldDefinition {
+            name: "outer".into(),
+            kind: TypeDefinition::Array {
+                count_field: None,
+                count: Some(1_000_000),
+                item: Box::new(inner),
+            },
+        }]);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            decode_schema(&definition, &[], DecodeContext::default()),
+            Err(SchemaError::BudgetExceeded)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

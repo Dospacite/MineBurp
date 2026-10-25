@@ -38,9 +38,13 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", default-features = false, features = [] }
+tauri-plugin-dialog = "2"
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

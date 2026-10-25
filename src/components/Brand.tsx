@@ -1,6 +1,6 @@
 export function Brand() {
   return (
-    <div className="brand" aria-label="MineBurp">
+    <div className="brand">
       <span className="brand-mark" aria-hidden="true">
         MB
       </span>

@@ -11,6 +11,9 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Reports a backend failure to the operator: `(source, message)`.
+pub type ErrorReporter = Arc<dyn Fn(&'static str, String) + Send + Sync>;
+
 #[derive(Debug)]
 struct ObservedFlow {
     id: Uuid,
@@ -28,9 +31,14 @@ const BATCH_LIMIT: usize = 256;
 /// segments a second, and committing a transaction per segment made the writer
 /// slower than the capture backend, so the channel filled and frames were
 /// silently dropped.
+///
+/// A failed write is reported through `report` rather than dropped silently:
+/// a project opened read-only, a full disk, or a removed file would otherwise
+/// mean capture appears to run while nothing is kept.
 pub fn spawn_capture_project_writer(
     project: Arc<RwLock<Option<ProjectStore>>>,
     proxy: ProxyService,
+    report: ErrorReporter,
 ) -> mpsc::Sender<SideChannelFrame> {
     let (sender, mut receiver) = mpsc::channel(16_384);
     tauri::async_runtime::spawn_blocking(move || {
@@ -63,15 +71,35 @@ pub fn spawn_capture_project_writer(
                 touched.insert(snapshot.id, snapshot);
                 details.push(detail);
             }
-            // One connection row per flow per batch rather than per frame: the
-            // counters are cumulative, so only the last value matters.
-            for snapshot in touched.values() {
-                let _ = store.save_connection(snapshot);
+            if let Err(error) = persist(&store, touched.values(), &details) {
+                report(
+                    "capture",
+                    format!(
+                        "{} captured frame(s) were not saved: {error}",
+                        details.len()
+                    ),
+                );
             }
-            let _ = store.insert_packets(&details);
         }
     });
     sender
+}
+
+/// Saves one batch: the connection rows first (packets reference them), then
+/// the packets in one transaction.
+///
+/// One connection row per flow per batch rather than per frame: the counters
+/// are cumulative, so only the last value matters.
+pub fn persist<'a>(
+    store: &ProjectStore,
+    connections: impl IntoIterator<Item = &'a ConnectionSnapshot>,
+    details: &[PacketDetail],
+) -> Result<(), mineburp_project::ProjectError> {
+    for snapshot in connections {
+        store.save_connection(snapshot)?;
+    }
+    store.insert_packets(details)?;
+    Ok(())
 }
 
 /// Whether this frame is the client's leg of a stream the proxy is decrypting.

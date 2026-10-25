@@ -2,6 +2,8 @@
 
 mod adapter;
 mod discover;
+mod fsutil;
+mod ini;
 mod process;
 
 pub use adapter::{

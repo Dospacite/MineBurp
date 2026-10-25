@@ -13,7 +13,7 @@ pub use broker::{BrokerError, ClientAssistBroker, ClientAssistServer, ClientAssi
 pub use hash::minecraft_server_hash;
 
 /// A destination supplied by the Java client agent before it is redirected to
-/// MineBurp's private, one-use proxy port.
+/// `MineBurp`'s private, one-use proxy port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentTarget {
     pub host: String,

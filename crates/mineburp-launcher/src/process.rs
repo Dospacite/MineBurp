@@ -38,12 +38,41 @@ pub(crate) fn spawn_launcher(
     if is_elevated() {
         command = de_elevated_command(&command)?;
     }
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
+    let process_id = child.id();
+    // Launchers outlive the call that started them. Waiting on a background
+    // thread reaps the process when it exits, so it does not linger as a
+    // zombie for the rest of the session.
+    let _ = std::thread::Builder::new()
+        .name("mineburp-launcher-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
     Ok(LaunchOutcome {
-        process_id: child.id(),
+        process_id,
         command: executable,
     })
 }
+
+/// Environment variables carried into a de-elevated launch. Everything else
+/// in root's environment — `LD_PRELOAD`, `SUDO_*`, root's `PATH` additions,
+/// credentials in variables — stays behind.
+#[cfg(target_os = "linux")]
+const PRESERVED_ENVIRONMENT: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+];
+
+#[cfg(target_os = "linux")]
+const SAFE_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
 
 #[cfg(target_os = "linux")]
 fn de_elevated_command(command: &Command) -> Result<Command, LaunchError> {
@@ -58,7 +87,18 @@ fn de_elevated_command(command: &Command) -> Result<Command, LaunchError> {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(account.gid);
     let mut lowered = Command::new("setpriv");
+    lowered.env_clear();
+    for key in PRESERVED_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(key) {
+            lowered.env(key, value);
+        }
+    }
     lowered
+        .env("PATH", SAFE_PATH)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path=/run/user/{uid}/bus"),
+        )
         .arg(format!("--reuid={uid}"))
         .arg(format!("--regid={gid}"))
         .arg("--init-groups")

@@ -29,8 +29,11 @@ final class AgentConfiguration {
         try (InputStream input = Files.newInputStream(path)) {
             properties.load(input);
         }
-        if (!"1".equals(properties.getProperty("protocol"))) {
-            throw new IOException("unsupported client-assistance protocol");
+        String protocol = properties.getProperty("protocol");
+        if (!BrokerClient.PROTOCOL_VERSION.equals(protocol)) {
+            throw new IOException("MineBurp wrote client-assistance protocol " + protocol
+                + " but this agent speaks " + BrokerClient.PROTOCOL_VERSION
+                + "; update the agent or MineBurp so they match");
         }
         String host = required(properties, "host");
         int port;

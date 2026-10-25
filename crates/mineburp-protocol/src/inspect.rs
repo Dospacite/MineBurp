@@ -4,16 +4,23 @@
 //! rates that work is wasted on rows nobody opens. The desktop app calls into
 //! this module only when an operator selects a packet.
 //!
-//! Identification happens in three tiers, strongest first:
+//! Identification happens in tiers, strongest first:
 //!
-//! 1. Handshake, status, and login ids have never moved, so the id alone names
-//!    the packet.
-//! 2. Configuration ids have been renumbered twice since 1.20.2, so the version
-//!    table in [`crate::registry`] proposes a name and the body has to agree
-//!    with it before it is used.
-//! 3. Play ids are renumbered nearly every release, so nothing is read from the
-//!    id at all: each decoder carries a strict validator and a packet is only
-//!    named when its body actually parses as that packet and consumes the bytes
+//! 1. Handshake, status, and the first login ids have never moved, so the id
+//!    alone names the packet.
+//! 2. Every other login, configuration, and play id is read through a table
+//!    generated for that exact protocol from the release's own data (see
+//!    [`crate::registry`]). The table names the packet; the body is then
+//!    decoded *as that packet* — from the bundled `minecraft-data` description
+//!    where there is one ([`crate::protodef`]), otherwise by the hand-written
+//!    decoder for that name. A body that does not match is reported as a
+//!    warning on the packet rather than renamed: the table is the stronger
+//!    witness, and a mismatch is exactly what a client lying about its
+//!    version, a modded server, or a malformed packet looks like.
+//! 3. Without a table — an unknown protocol, or passive capture that never saw
+//!    a handshake — play and configuration packets are identified from the
+//!    shape of their body: each decoder carries a strict validator and names a
+//!    packet only when its body parses as that packet and consumes the bytes
 //!    it should.
 //!
 //! A decoder that half-matches reports nothing rather than a plausible lie.
@@ -24,11 +31,14 @@ use serde_json::{Map, Value, json};
 use crate::{
     common::decode_common_packet,
     nbt::{component_to_text, read_nbt},
+    present::{format_millis, interactive_events, plausible_timestamp, present},
+    protodef,
     reader::{
         Reader, plausible_altitude, plausible_coordinate, plausible_pitch, plausible_yaw,
         unpack_position,
     },
     registry::PacketRegistry,
+    registry_names,
     varint::decode_var_i32,
 };
 
@@ -40,10 +50,12 @@ const SIGNATURE_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Identification {
-    /// The state and packet id identify the packet, and the body agrees.
+    /// The state and packet id name the packet: a fixed id, or a table
+    /// generated for this exact protocol. Any disagreement from the body is in
+    /// [`PacketInsight::warnings`].
     Registry,
-    /// The body parsed cleanly as a known packet shape. Play-state ids move
-    /// between versions, so shape is the evidence here, not the id.
+    /// The body parsed cleanly as a known packet shape. Used where no table
+    /// covers the protocol, so shape is the only evidence.
     Structure,
     /// Nothing matched; only the raw frame is available.
     #[default]
@@ -76,6 +88,15 @@ pub struct PacketInsight {
     pub error: Option<String>,
     /// Packets recovered from a raw transport payload.
     pub stream: Vec<StreamPacket>,
+    /// Where the body disagrees with the name its id was given — a version
+    /// mismatch, a modded packet, or a malformed one. The name is kept; these
+    /// say why it should not be taken on trust.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// Where the fields came from: `definition` (the bundled description of
+    /// this protocol), `decoder` (a hand-written decoder), or `shape`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoded_by: Option<String>,
 }
 
 /// Inspects a stored logical frame.
@@ -117,11 +138,41 @@ pub fn inspect_packet(
     body: &[u8],
     protocol_version: Option<i32>,
 ) -> PacketInsight {
-    registry_decode(state, direction, packet_id, body, protocol_version)
-        .or_else(|| configuration_decode(state, direction, packet_id, body, protocol_version))
-        .or_else(|| play_decode(state, direction, packet_id, body, protocol_version))
-        .or_else(|| structure_decode(state, direction, body, protocol_version))
-        .unwrap_or_else(structural_read)
+    let mut insight = decode_packet_body(state, direction, packet_id, body, protocol_version);
+    // Registry names are added here rather than in the decoders so that
+    // `identify_packet`, which runs while capturing, never pays for them.
+    if let (Some(name), Some(fields)) = (insight.name.as_deref(), insight.fields.as_mut()) {
+        registry_names::annotate(name, protocol_version, fields);
+    }
+    insight
+}
+
+fn decode_packet_body(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: i32,
+    body: &[u8],
+    protocol_version: Option<i32>,
+) -> PacketInsight {
+    if let Some(insight) = registry_decode(state, direction, packet_id, body, protocol_version) {
+        return insight;
+    }
+    if let Some(name) = tabulated_name(state, direction, packet_id, protocol_version) {
+        return tabulated_decode(state, direction, packet_id, body, protocol_version, name);
+    }
+    if PacketRegistry::is_tabulated(state, protocol_version) {
+        // The protocol has a table and this id is not in it: a modded or
+        // malformed packet. Guessing a vanilla name from its shape would be
+        // the plausible lie this module refuses to tell.
+        return PacketInsight {
+            warnings: vec![format!(
+                "id {packet_id:#04x} is not a {state:?} packet in protocol {}",
+                protocol_version.unwrap_or_default()
+            )],
+            ..structural_read()
+        };
+    }
+    structure_decode(state, direction, body, protocol_version).unwrap_or_else(structural_read)
 }
 
 /// Bodies past this size are not shape-tested while capturing.
@@ -134,8 +185,9 @@ const MAX_IDENTIFY_BYTES: usize = 4 * 1024;
 /// Names a packet while capturing, without building a decode for it.
 ///
 /// The history table wants a name for every row, but the full decode is
-/// deliberately deferred until a packet is opened. This runs the same
-/// identification and throws the fields away.
+/// deliberately deferred until a packet is opened. Where a table covers the
+/// protocol this is a slice index; shape identification — capped at
+/// [`MAX_IDENTIFY_BYTES`] — runs only where none does.
 #[must_use]
 pub fn identify_packet(
     state: ProtocolState,
@@ -146,25 +198,68 @@ pub fn identify_packet(
 ) -> Option<String> {
     if let Some(name) = PacketRegistry::stable_packet_name(state, direction, packet_id)
         .or_else(|| login_plugin_name(state, direction, packet_id, protocol_version))
+        .or_else(|| tabulated_name(state, direction, packet_id, protocol_version))
     {
         return Some(name.to_owned());
     }
-    // A table lookup is a slice index, so the packets the size cap exists to
-    // protect — chunks, registries, maps — are named for free when the version
-    // has a table, and only the shape work is skipped.
-    let tabulated = (state == ProtocolState::Play)
-        .then(|| PacketRegistry::play_packet_name(direction, packet_id, protocol_version))
-        .flatten();
-    if body.len() > MAX_IDENTIFY_BYTES {
-        return tabulated.map(str::to_owned);
+    if PacketRegistry::is_tabulated(state, protocol_version) || body.len() > MAX_IDENTIFY_BYTES {
+        return None;
     }
-    configuration_decode(state, direction, packet_id, body, protocol_version)
-        .or_else(|| play_decode(state, direction, packet_id, body, protocol_version))
-        .or_else(|| structure_decode(state, direction, body, protocol_version))
-        .and_then(|insight| insight.name)
+    structure_decode(state, direction, body, protocol_version).and_then(|insight| insight.name)
+}
+
+/// The name a generated table (or, for login, a version gate) gives an id.
+fn tabulated_name(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: i32,
+    protocol_version: Option<i32>,
+) -> Option<&'static str> {
+    match state {
+        ProtocolState::Login => {
+            PacketRegistry::login_packet_name(direction, packet_id, protocol_version)
+        }
+        ProtocolState::Configuration | ProtocolState::Play => {
+            PacketRegistry::table_packet_name(state, direction, packet_id, protocol_version)
+        }
+        _ => None,
+    }
+}
+
+/// The name the layout walker and the replacement rules key on: the table's
+/// name where there is one, otherwise whatever the inspector settles on.
+pub(crate) fn resolve_name(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: i32,
+    body: &[u8],
+    protocol_version: Option<i32>,
+) -> Option<String> {
+    if let Some(name) = PacketRegistry::stable_packet_name(state, direction, packet_id)
+        .or_else(|| login_plugin_name(state, direction, packet_id, protocol_version))
+        .or_else(|| tabulated_name(state, direction, packet_id, protocol_version))
+    {
+        return Some(name.to_owned());
+    }
+    inspect_packet(state, direction, packet_id, body, protocol_version).name
 }
 
 // --- identification by state and id (stable across every protocol version) ---
+
+/// Packets whose hand-written decode in [`crate::common`] says more than the
+/// description does — a parsed status JSON, a plugin channel's loader.
+fn prefers_common_decode(name: &str) -> bool {
+    matches!(
+        name,
+        "handshake"
+            | "status_response"
+            | "ping_request"
+            | "pong_response"
+            | "set_compression"
+            | "login_plugin_request"
+            | "login_plugin_response"
+    )
+}
 
 fn registry_decode(
     state: ProtocolState,
@@ -176,17 +271,40 @@ fn registry_decode(
     let name = PacketRegistry::stable_packet_name(state, direction, packet_id)
         .or_else(|| login_plugin_name(state, direction, packet_id, protocol_version))?;
     let common = decode_common_packet(state, direction, packet_id, body, protocol_version);
-    let fields = common.fields.unwrap_or_else(|| json!({}));
+    let definition = protodef::decode_packet(state, direction, packet_id, body, protocol_version)
+        .filter(protodef::DefinitionDecode::is_complete);
+    let common_usable = common.error.is_none() && common.fields.is_some();
+    let (fields, decoded_by, error) = match definition {
+        Some(definition) if !(prefers_common_decode(name) && common_usable) => {
+            (present(name, definition.fields), "definition", None)
+        }
+        _ => (
+            common
+                .fields
+                .map_or_else(|| json!({}), |fields| present(name, fields)),
+            "decoder",
+            common.error,
+        ),
+    };
+    let channel = common.channel.or_else(|| channel_of(&fields));
+    let loader = common.loader.or_else(|| {
+        channel
+            .as_deref()
+            .and_then(loader_for_channel)
+            .map(str::to_owned)
+    });
     Some(PacketInsight {
         summary: Some(summarize(name, &fields)),
         name: Some(name.to_owned()),
         label: Some(title_case(name)),
         fields: Some(fields),
-        channel: common.channel,
-        loader: common.loader,
+        channel,
+        loader,
         identification: Identification::Registry,
-        error: common.error,
+        error,
         stream: Vec::new(),
+        warnings: Vec::new(),
+        decoded_by: Some(decoded_by.into()),
     })
 }
 
@@ -208,26 +326,56 @@ fn login_plugin_name(
     }
 }
 
-// --- configuration: a versioned id table, confirmed against the body ---
+// --- tabulated: the table names the packet, the body is decoded as it ---
 
-fn configuration_decode(
+fn tabulated_decode(
     state: ProtocolState,
     direction: Direction,
     packet_id: i32,
     body: &[u8],
     protocol_version: Option<i32>,
-) -> Option<PacketInsight> {
-    if state != ProtocolState::Configuration {
-        return None;
+    name: &'static str,
+) -> PacketInsight {
+    let definition = protodef::decode_packet(state, direction, packet_id, body, protocol_version);
+    let mut warnings = Vec::new();
+    let mut error = None;
+    let (fields, decoded_by) = match definition {
+        Some(definition) if definition.is_complete() => {
+            (present(name, definition.fields), Some("definition"))
+        }
+        definition => {
+            let hand = hand_decode(state, name, body, protocol_version);
+            match (hand, definition) {
+                (Some(fields), _) => (fields, Some("decoder")),
+                (None, Some(definition)) => {
+                    let reason = definition.error.unwrap_or_default();
+                    warnings.push(format!(
+                        "the body does not match `{name}` as protocol {} describes it: {reason}",
+                        protocol_version.unwrap_or_default()
+                    ));
+                    error = Some(reason);
+                    (present(name, definition.fields), Some("definition"))
+                }
+                (None, None) => {
+                    if has_hand_decoder(state, name) {
+                        warnings.push(format!(
+                            "the body does not have the shape of `{name}` this decoder expects"
+                        ));
+                    }
+                    (json!({}), None)
+                }
+            }
+        }
+    };
+    if !warnings.is_empty()
+        && let Some(shape) = structure_decode(state, direction, body, None)
+        && let Some(other) = shape.name.filter(|other| other != name)
+    {
+        warnings.push(format!("the body also reads as `{other}`"));
     }
-    let name = PacketRegistry::configuration_packet_name(direction, packet_id, protocol_version)?;
-    let fields = configuration_fields(name, body)?;
-    let channel = fields
-        .get("channel")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let channel = channel_of(&fields);
     let loader = channel.as_deref().and_then(loader_for_channel);
-    Some(PacketInsight {
+    PacketInsight {
         summary: Some(summarize(name, &fields)),
         name: Some(name.to_owned()),
         label: Some(title_case(name)),
@@ -235,77 +383,198 @@ fn configuration_decode(
         channel,
         loader: loader.map(str::to_owned),
         identification: Identification::Registry,
-        error: None,
+        error,
         stream: Vec::new(),
-    })
+        warnings,
+        decoded_by: decoded_by.map(str::to_owned),
+    }
 }
 
-/// Confirms an id-proposed configuration name against the bytes.
+fn channel_of(fields: &Value) -> Option<String> {
+    fields
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The hand-written decoders, keyed by the table name they decode.
 ///
-/// Returning `None` means the body does not look like that packet — the id
-/// table is being read with the wrong protocol version — and the packet falls
-/// through to shape identification instead of being mislabelled.
+/// These predate the bundled descriptions and remain the decode for releases
+/// without one (26.2, 1.14.2, 1.7) and the fallback when a description fails.
+fn hand_decoders(state: ProtocolState, name: &str) -> &'static [Decoder] {
+    if state == ProtocolState::Configuration {
+        return &[];
+    }
+    match name {
+        "keep_alive" => &[decode_keep_alive_any],
+        "chat_message" => &[decode_signed_chat_message],
+        "chat_command" => &[decode_signed_chat_command, decode_lone_string],
+        "chat_command_signed" => &[decode_signed_chat_command],
+        "disconnect"
+        | "system_chat"
+        | "set_title_text"
+        | "set_subtitle_text"
+        | "set_action_bar_text"
+        | "login_disconnect"
+        | "tab_list" => &[decode_text_component_packet],
+        "custom_payload" => &[decode_custom_payload],
+        "client_information" => &[decode_client_information],
+        "set_player_position" => &[decode_player_position],
+        "set_player_position_and_rotation" => &[decode_player_position_and_rotation],
+        "set_player_rotation" => &[decode_player_rotation],
+        "player_action" => &[decode_player_action],
+        "use_item_on" => &[decode_use_item_on],
+        "click_container" => &[decode_click_container],
+        "sign_update" => &[decode_sign_update],
+        "interact" => &[decode_interact],
+        "command_suggestion" => &[decode_command_suggestion],
+        "player_command" => &[decode_player_command],
+        "use_item" => &[decode_use_item_any],
+        "set_held_item" => &[decode_set_held_item],
+        "move_vehicle" => &[decode_move_vehicle],
+        "update_time" => &[decode_update_time],
+        "player_abilities" => &[decode_player_abilities],
+        "set_health" => &[decode_set_health],
+        "set_experience" => &[decode_set_experience],
+        "container_set_data" => &[decode_container_set_data],
+        "game_event" => &[decode_game_event],
+        "set_default_spawn_position" => &[decode_default_spawn_position],
+        "block_update" => &[decode_block_update],
+        "block_destruction" => &[decode_block_destruction],
+        "block_event" => &[decode_block_event],
+        "level_event" => &[decode_level_event],
+        "synchronize_player_position" => &[decode_synchronize_player_position],
+        "teleport_entity" => &[decode_teleport_entity],
+        "login" => &[decode_login_play],
+        "open_screen" => &[decode_open_screen],
+        "boss_bar" => &[decode_boss_bar],
+        "sound_effect" => &[decode_sound_effect],
+        "add_entity" => &[decode_spawn_entity],
+        "damage_event" => &[decode_damage_event],
+        "entity_effect" => &[decode_entity_effect],
+        "remove_entity_effect" => &[decode_remove_entity_effect],
+        "scoreboard_objective" => &[decode_scoreboard_objective],
+        "update_score" => &[decode_update_score],
+        "reset_score" => &[decode_reset_score],
+        "combat_death" => &[decode_combat_death],
+        "player_info_remove" => &[decode_player_info_remove],
+        "add_resource_pack" => &[decode_resource_pack_push],
+        "set_entity_motion" => &[decode_set_entity_motion],
+        "move_entity_pos" | "move_entity_pos_rot" | "move_entity_rot" => &[decode_move_entity],
+        "remove_entities" => &[decode_remove_entities],
+        _ => &[],
+    }
+}
+
+fn has_hand_decoder(state: ProtocolState, name: &str) -> bool {
+    !hand_decoders(state, name).is_empty()
+        || (state == ProtocolState::Configuration && configuration_fields(name, &[]).is_some())
+}
+
+fn hand_decode(
+    state: ProtocolState,
+    name: &str,
+    body: &[u8],
+    protocol_version: Option<i32>,
+) -> Option<Value> {
+    if state == ProtocolState::Configuration {
+        return configuration_fields(name, body);
+    }
+    hand_decoders(state, name)
+        .iter()
+        .find_map(|decoder| decoder(body, protocol_version))
+        .map(|(_, fields)| fields)
+}
+
+/// Keep alive where the table already says so: any eight bytes.
+fn decode_keep_alive_any(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    if body.len() != 8 {
+        return None;
+    }
+    Some(("keep_alive", json!({ "id": Reader::new(body).i64()? })))
+}
+
+/// Item use where the table already says so: a small sequence number is no
+/// longer ambiguous with a hotbar switch.
+fn decode_use_item_any(body: &[u8], protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let hand = reader.var_i32().filter(|value| (0..=1).contains(value))?;
+    let sequence = reader.var_i32().filter(|value| *value >= 0)?;
+    if !reader.is_empty() {
+        return decode_use_item(body, protocol);
+    }
+    Some((
+        "use_item",
+        json!({ "hand": if hand == 0 { "main" } else { "off" }, "sequence": sequence }),
+    ))
+}
+
+/// Validates a configuration body against the name its id was given.
+///
+/// Returning `None` means the body does not look like that packet; a name with
+/// no validator here also returns `None`, so the bundled description decides.
 fn configuration_fields(name: &str, body: &[u8]) -> Option<Value> {
     let mut reader = Reader::new(body);
-    match name {
-        "finish_configuration" | "finish_configuration_ack" | "reset_chat" => {
-            body.is_empty().then(|| json!({}))
+    let fields = match name {
+        "finish_configuration" | "finish_configuration_ack" | "reset_chat" | "clear_dialog" => {
+            json!({})
         }
-        "keep_alive" => {
-            if body.len() != 8 {
-                return None;
-            }
-            Some(json!({ "id": reader.i64()? }))
+        "keep_alive" => json!({ "id": reader.i64()? }),
+        "ping" | "pong" => json!({ "id": reader.i32()? }),
+        "plugin_message" => return decode_custom_payload(body, None).map(|(_, fields)| fields),
+        "client_information" => {
+            return decode_client_information(body, None).map(|(_, fields)| fields);
         }
-        "ping" | "pong" => {
-            if body.len() != 4 {
-                return None;
-            }
-            Some(json!({ "id": reader.i32()? }))
+        "disconnect" => {
+            return decode_text_component_packet(body, None).map(|(_, fields)| fields);
         }
-        "plugin_message" => decode_custom_payload(body, None).map(|(_, fields)| fields),
-        "client_information" => decode_client_information(body, None).map(|(_, fields)| fields),
-        "disconnect" => decode_text_component_packet(body, None).map(|(_, fields)| fields),
-        "known_packs" | "select_known_packs" => decode_known_packs(body, None).map(|(_, f)| f),
-        "cookie_request" | "store_cookie" | "cookie_response" | "remove_resource_pack" => {
-            let key = reader.identifier();
-            Some(json!({ "key": key.unwrap_or_default() }))
+        "known_packs" | "select_known_packs" => {
+            return decode_known_packs(body, None).map(|(_, fields)| fields);
         }
-        "add_resource_pack" => decode_resource_pack_push(body, None).map(|(_, fields)| fields),
+        "cookie_request" => json!({ "key": reader.identifier()? }),
+        "store_cookie" | "cookie_response" => {
+            let key = reader.identifier()?;
+            // A stored cookie always carries a payload; a response says
+            // whether it has one.
+            let present = name == "store_cookie" || reader.bool()?;
+            let payload = if present {
+                Some(reader.byte_array()?)
+            } else {
+                None
+            };
+            json!({
+                "key": key,
+                "payload": payload.map(crate::protodef::to_hex),
+                "payload_text": payload.and_then(|bytes| printable_run(bytes, 4)),
+            })
+        }
+        "remove_resource_pack" => {
+            // 1.20.3+: an optional pack UUID; absent means "remove all".
+            let present = reader.bool()?;
+            let id = if present { Some(reader.uuid()?) } else { None };
+            json!({ "pack": id.map_or_else(|| "all".to_owned(), |id| id.to_string()) })
+        }
+        "add_resource_pack" => {
+            return decode_resource_pack_push(body, None).map(|(_, fields)| fields);
+        }
         "resource_pack_response" => {
             // 1.20.3 put a pack UUID in front of the result.
             if body.len() == 17 {
                 reader.take(16)?;
             }
             let result = reader.var_i32().filter(|value| (0..=6).contains(value))?;
-            reader
-                .is_empty()
-                .then(|| json!({ "result": resource_pack_result(result) }))
+            json!({ "result": resource_pack_result(result) })
         }
         "transfer" => {
             let host = reader.string(255)?;
             let port = reader
                 .var_i32()
                 .filter(|value| (0..=65_535).contains(value))?;
-            reader
-                .is_empty()
-                .then(|| json!({ "host": host, "port": port }))
+            json!({ "host": host, "port": port })
         }
-        "registry_data" => {
-            // 1.20.5 split the registries into one packet each; before that the
-            // whole set arrived as a single NBT compound.
-            if let Some(registry) = reader.identifier() {
-                let entries = reader.counted(65_536)?;
-                return Some(json!({ "registry": registry, "entries": entries }));
-            }
-            read_nbt(body).ok().map(|_| json!({}))
-        }
-        "update_tags" | "update_enabled_features" | "server_links" | "custom_report_details" => {
-            let count = reader.counted(8_192)?;
-            Some(json!({ "entries": count }))
-        }
-        _ => Some(json!({})),
-    }
+        _ => return None,
+    };
+    reader.is_empty().then_some(fields)
 }
 
 fn resource_pack_result(value: i32) -> &'static str {
@@ -319,50 +588,6 @@ fn resource_pack_result(value: i32) -> &'static str {
         6 => "failed_reload",
         _ => "discarded",
     }
-}
-
-// --- play: a generated id table, with the body given the final word ---
-
-/// Names a play packet from the table generated for its protocol version.
-///
-/// This is the only tier that reads a play id, and it exists because shape has a
-/// floor: a one-byte body holding `0` or `1` is an arm swing, a client command,
-/// and a movement-input bitmask at once, and no validator can separate them. The
-/// table is trusted because it is *derived* — `mineburp-packet-table` reads the
-/// ids out of the version's own data generator report — never typed out.
-///
-/// It still does not outrank the bytes. The protocol version comes from a
-/// handshake the client wrote, so it is a claim; the body is evidence. When a
-/// decoder reads the body as a different packet, the body wins and the packet is
-/// reported as a structural match, which is also what a version mismatch looks
-/// like from the inside.
-fn play_decode(
-    state: ProtocolState,
-    direction: Direction,
-    packet_id: i32,
-    body: &[u8],
-    protocol_version: Option<i32>,
-) -> Option<PacketInsight> {
-    if state != ProtocolState::Play {
-        return None;
-    }
-    let name = PacketRegistry::play_packet_name(direction, packet_id, protocol_version)?;
-    let Some(shape) = structure_decode(state, direction, body, protocol_version) else {
-        return Some(PacketInsight {
-            summary: Some(name.to_owned()),
-            name: Some(name.to_owned()),
-            label: Some(title_case(name)),
-            identification: Identification::Registry,
-            ..PacketInsight::default()
-        });
-    };
-    if shape.name.as_deref() != Some(name) {
-        return Some(shape);
-    }
-    Some(PacketInsight {
-        identification: Identification::Registry,
-        ..shape
-    })
 }
 
 // --- identification by body shape (play and configuration) ---
@@ -382,6 +607,7 @@ const SERVERBOUND: &[Decoder] = &[
     decode_signed_chat_command,
     decode_player_action,
     decode_use_item_on,
+    decode_click_container,
     decode_sign_update,
     decode_interact,
     decode_command_suggestion,
@@ -400,6 +626,7 @@ const CLIENTBOUND: &[Decoder] = &[
     decode_player_abilities,
     decode_set_health,
     decode_set_experience,
+    decode_container_set_data,
     decode_game_event,
     decode_default_spawn_position,
     decode_block_update,
@@ -410,6 +637,16 @@ const CLIENTBOUND: &[Decoder] = &[
     decode_teleport_entity,
     decode_login_play,
     decode_open_screen,
+    decode_boss_bar,
+    decode_sound_effect,
+    decode_spawn_entity,
+    decode_damage_event,
+    decode_entity_effect,
+    decode_remove_entity_effect,
+    decode_scoreboard_objective,
+    decode_update_score,
+    decode_reset_score,
+    decode_combat_death,
     decode_player_info_remove,
     decode_resource_pack_push,
     decode_custom_payload,
@@ -436,10 +673,7 @@ fn structure_decode(
         let Some((name, fields)) = decoder(body, protocol_version) else {
             continue;
         };
-        let channel = fields
-            .get("channel")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let channel = channel_of(&fields);
         let loader = channel.as_deref().and_then(loader_for_channel);
         return Some(PacketInsight {
             summary: Some(summarize(name, &fields)),
@@ -451,6 +685,8 @@ fn structure_decode(
             identification: Identification::Structure,
             error: None,
             stream: Vec::new(),
+            warnings: Vec::new(),
+            decoded_by: Some("shape".into()),
         });
     }
     None
@@ -564,6 +800,10 @@ fn decode_text_component_packet(
     fields.insert("text".into(), Value::String(text));
     if let Some(overlay) = overlay {
         fields.insert("action_bar".into(), Value::Bool(overlay));
+    }
+    let events = interactive_events(&component);
+    if !events.is_empty() {
+        fields.insert("interactive_events".into(), Value::Array(events));
     }
     Some((name, Value::Object(fields)))
 }
@@ -1459,7 +1699,567 @@ fn decode_resource_pack_push(body: &[u8], _protocol: Option<i32>) -> Option<(&'s
     ))
 }
 
+/// Boss bar creation and the four updates a server can send for one.
+///
+/// The `UUID` plus an action enum of at most five values is already narrow
+/// evidence, and each action's payload has its own bounds, so this shape is
+/// hard to reach by accident.
+fn decode_boss_bar(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let uuid = reader.uuid()?;
+    let action = reader.var_i32().filter(|value| (0..=5).contains(value))?;
+    let mut fields = Map::new();
+    fields.insert("uuid".into(), Value::String(uuid.to_string()));
+    match action {
+        // Add: title, health, colour, overlay, and flags.
+        0 => {
+            let (component, consumed) = read_text_component(reader.rest())?;
+            reader.take(consumed)?;
+            let title = component_to_text(&component);
+            if title.is_empty() {
+                return None;
+            }
+            let health = reader
+                .f32()
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))?;
+            let color = reader.var_i32().filter(|value| (0..=5).contains(value))?;
+            let overlay = reader.var_i32().filter(|value| (0..=3).contains(value))?;
+            let flags = reader.u8().filter(|value| *value <= 0x07)?;
+            fields.insert("action".into(), Value::String("add".into()));
+            fields.insert("title".into(), Value::String(title));
+            fields.insert("health".into(), json!(health));
+            fields.insert("color".into(), json!(color));
+            fields.insert("overlay".into(), json!(overlay));
+            fields.insert("flags".into(), json!(format!("0x{flags:02x}")));
+        }
+        1 => {
+            let health = reader
+                .f32()
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))?;
+            fields.insert("action".into(), Value::String("update_health".into()));
+            fields.insert("health".into(), json!(health));
+        }
+        2 => {
+            let color = reader.var_i32().filter(|value| (0..=5).contains(value))?;
+            fields.insert("action".into(), Value::String("update_color".into()));
+            fields.insert("color".into(), json!(color));
+        }
+        3 => {
+            let overlay = reader.var_i32().filter(|value| (0..=3).contains(value))?;
+            fields.insert("action".into(), Value::String("update_style".into()));
+            fields.insert("overlay".into(), json!(overlay));
+        }
+        4 => {
+            let flags = reader.u8().filter(|value| *value <= 0x07)?;
+            fields.insert("action".into(), Value::String("update_flags".into()));
+            fields.insert("flags".into(), json!(format!("0x{flags:02x}")));
+        }
+        _ => {
+            fields.insert("action".into(), Value::String("remove".into()));
+        }
+    }
+    reader
+        .is_empty()
+        .then_some(("boss_bar", Value::Object(fields)))
+}
+
+/// A sound played at a world position. The packed position, bounded category,
+/// and volume/pitch ranges together make this shape specific.
+///
+/// Its sibling `stop_sound` is deliberately not decoded: an entity id followed
+/// by an identifier is byte-for-byte both a stopped sound and a worn-off
+/// potion effect, so naming either would be a coin flip the module refuses.
+fn decode_sound_effect(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let sound = reader
+        .var_i32()
+        .filter(|value| (0..=2_048).contains(value))?;
+    let category = reader.var_i32().filter(|value| (0..=8).contains(value))?;
+    let position = unpack_position(reader.i64()?)?;
+    let volume = reader
+        .f32()
+        .filter(|value| value.is_finite() && (0.0..=64.0).contains(value))?;
+    let pitch = reader
+        .f32()
+        .filter(|value| value.is_finite() && (0.5..=4.0).contains(value))?;
+    let _seed = reader.i64()?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((
+        "sound_effect",
+        json!({
+            "sound_id": sound,
+            "category": sound_category(category),
+            "position": format_position(position),
+            "volume": volume,
+            "pitch": pitch,
+        }),
+    ))
+}
+
+fn sound_category(value: i32) -> &'static str {
+    match value {
+        0 => "master",
+        1 => "music",
+        2 => "record",
+        3 => "weather",
+        4 => "block",
+        5 => "hostile",
+        6 => "neutral",
+        7 => "player",
+        _ => "ambient",
+    }
+}
+
+/// An entity appearing in view. The fixed run of coordinates, angles, and
+/// velocity around two small ids is strong evidence.
+fn decode_spawn_entity(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let entity_id = reader.var_i32().filter(|value| *value >= 0)?;
+    let uuid = reader.uuid()?;
+    let kind = reader
+        .var_i32()
+        .filter(|value| (0..=1_024).contains(value))?;
+    let (x, y, z) = read_location(&mut reader)?;
+    let pitch = f64::from(reader.u8()?) * 360.0 / 256.0;
+    let yaw = f64::from(reader.u8()?) * 360.0 / 256.0;
+    let data = reader.var_i32()?;
+    let velocity: Vec<f64> = (0..3)
+        .map(|_| reader.i16().map(|value| f64::from(value) / 8_000.0))
+        .collect::<Option<Vec<_>>>()?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((
+        "add_entity",
+        json!({
+            "entity_id": entity_id,
+            "uuid": uuid.to_string(),
+            "type": kind,
+            "x": x, "y": y, "z": z,
+            "yaw": yaw, "pitch": pitch,
+            "data": data,
+            "velocity": format!("{:.3}, {:.3}, {:.3}", velocity[0], velocity[1], velocity[2]),
+        }),
+    ))
+}
+
+/// The hurt animation and its cause, added in 1.19.4.
+fn decode_damage_event(body: &[u8], protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    protocol.filter(|version| *version >= 763)?;
+    let mut reader = Reader::new(body);
+    let kind = reader.var_i32().filter(|value| (0..=64).contains(value))?;
+    let mut fields = Map::new();
+    fields.insert("type".into(), json!(kind));
+    for key in ["source_entity", "direct_entity"] {
+        if reader.bool()? {
+            let id = reader.var_i32().filter(|value| *value >= 0)?;
+            fields.insert(key.into(), json!(id));
+        }
+    }
+    if reader.bool()? {
+        let (x, y, z) = read_location(&mut reader)?;
+        fields.insert(
+            "position".into(),
+            Value::String(format!("{x:.2}, {y:.2}, {z:.2}")),
+        );
+    }
+    if !reader.is_empty() {
+        return None;
+    }
+    Some(("damage_event", Value::Object(fields)))
+}
+
+/// Furnace arrows, brewing stands, and the other progress bars a server
+/// pushes as window properties.
+///
+/// This packet and `game_event` are both five bytes, so this decoder runs
+/// first and carries the stricter evidence: a real property total is a tick
+/// budget above zero and no larger than about a thousand, which no finite
+/// game-event float satisfies — a gamemode float has a zero low half, and a
+/// rain level's high word already exceeds any such total.
+fn decode_container_set_data(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    if body.len() != 5 {
+        return None;
+    }
+    let mut reader = Reader::new(body);
+    let window = reader.u8().filter(|value| *value <= 63)?;
+    let progress = reader.i16().filter(|value| (0..=1_000).contains(value))?;
+    let total = reader.i16().filter(|value| (1..=1_000).contains(value))?;
+    if progress > total {
+        return None;
+    }
+    Some((
+        "container_set_data",
+        json!({ "window_id": window, "progress": progress, "total": total }),
+    ))
+}
+
+/// A status effect applied to an entity, in the 1.20.2 field order.
+fn decode_entity_effect(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let entity_id = reader.var_i32().filter(|value| *value >= 0)?;
+    let effect = reader.var_i32().filter(|value| (1..=40).contains(value))?;
+    let amplifier = reader.var_i32().filter(|value| (0..=256).contains(value))?;
+    let duration = reader.var_i32()?;
+    let flags = reader.u8().filter(|value| *value <= 0x07)?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((
+        "entity_effect",
+        json!({
+            "entity_id": entity_id,
+            "effect": effect,
+            "amplifier": amplifier,
+            "duration": if duration < 0 { "infinite".to_owned() } else { duration.to_string() },
+            "ambient": flags & 0x01 != 0,
+            "particles": flags & 0x02 != 0,
+            "icon": flags & 0x04 != 0,
+        }),
+    ))
+}
+
+/// A potion effect wearing off.
+fn decode_remove_entity_effect(
+    body: &[u8],
+    _protocol: Option<i32>,
+) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let entity_id = reader.var_i32().filter(|value| *value >= 0)?;
+    let effect = reader.identifier()?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((
+        "remove_entity_effect",
+        json!({ "entity_id": entity_id, "effect": effect }),
+    ))
+}
+
+/// Creating or rewriting a scoreboard objective.
+///
+/// The objective-name budget of sixteen characters over a restricted alphabet,
+/// followed by a mode byte and — when present — a title component, is what
+/// separates this from any other string-led packet.
+fn decode_scoreboard_objective(
+    body: &[u8],
+    _protocol: Option<i32>,
+) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let objective = read_objective_name(&mut reader)?;
+    let mode = reader.u8().filter(|value| *value <= 2)?;
+    let mut fields = Map::new();
+    fields.insert("objective".into(), Value::String(objective));
+    if mode == 1 {
+        fields.insert("action".into(), Value::String("remove".into()));
+    } else {
+        let (component, consumed) = read_text_component(reader.rest())?;
+        reader.take(consumed)?;
+        let title = component_to_text(&component);
+        if title.is_empty() {
+            return None;
+        }
+        let criterion = reader.var_i32().filter(|value| (0..=2).contains(value))?;
+        fields.insert(
+            "action".into(),
+            Value::String(if mode == 0 {
+                "create".into()
+            } else {
+                "update".into()
+            }),
+        );
+        fields.insert("title".into(), Value::String(title));
+        fields.insert(
+            "render_type".into(),
+            Value::String(match criterion {
+                0 => "integer".into(),
+                1 => "hearts".into(),
+                _ => "blank".into(),
+            }),
+        );
+        read_optional_number_format(&mut reader, &mut fields)?;
+    }
+    reader
+        .is_empty()
+        .then_some(("scoreboard_objective", Value::Object(fields)))
+}
+
+fn read_objective_name(reader: &mut Reader<'_>) -> Option<String> {
+    let name = reader.string(16)?;
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-+.".contains(&byte)))
+    .then_some(name)
+}
+
+/// The optional display format added to score packets in 1.20.3.
+///
+/// Older releases stop after the render type, so a failed strict read simply
+/// rewinds and leaves nothing behind rather than rejecting the packet.
+fn read_optional_number_format(
+    reader: &mut Reader<'_>,
+    fields: &mut Map<String, Value>,
+) -> Option<()> {
+    let checkpoint = reader.clone();
+    if !matches!(reader.bool(), Some(true)) {
+        *reader = checkpoint;
+        return Some(());
+    }
+    match reader.var_i32() {
+        Some(0) => {
+            fields.insert("number_format".into(), Value::String("blank".into()));
+            Some(())
+        }
+        Some(1) => {
+            let (component, consumed) = read_text_component(reader.rest())?;
+            reader.take(consumed)?;
+            fields.insert(
+                "number_format".into(),
+                Value::String(component_to_text(&component)),
+            );
+            Some(())
+        }
+        Some(2) => {
+            let text = reader.string(256)?;
+            fields.insert("number_format".into(), Value::String(text));
+            Some(())
+        }
+        _ => {
+            // A format kind this decoder does not know rewinds to the mark:
+            // the packet is still named from what came before it.
+            *reader = checkpoint;
+            Some(())
+        }
+    }
+}
+
+/// Setting a player's score on an objective, 1.20.3 shape.
+fn decode_update_score(body: &[u8], protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    protocol.filter(|version| *version >= 764)?;
+    let mut reader = Reader::new(body);
+    let entity = reader.string(40)?;
+    let objective = read_objective_name(&mut reader)?;
+    let score = reader.var_i32().filter(|value| *value >= 0)?;
+    let mut fields = Map::new();
+    fields.insert("entity".into(), Value::String(entity));
+    fields.insert("objective".into(), Value::String(objective));
+    fields.insert("score".into(), json!(score));
+    if matches!(reader.bool(), Some(true)) {
+        let (component, consumed) = read_text_component(reader.rest())?;
+        reader.take(consumed)?;
+        fields.insert(
+            "display_name".into(),
+            Value::String(component_to_text(&component)),
+        );
+    }
+    read_optional_number_format(&mut reader, &mut fields)?;
+    reader
+        .is_empty()
+        .then_some(("update_score", Value::Object(fields)))
+}
+
+/// Clearing a player's score on an objective: exactly two names.
+fn decode_reset_score(body: &[u8], protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    protocol.filter(|version| *version >= 764)?;
+    let mut reader = Reader::new(body);
+    let entity = reader.string(40)?;
+    let objective = read_objective_name(&mut reader)?;
+    if !reader.is_empty() {
+        return None;
+    }
+    Some((
+        "reset_score",
+        json!({ "entity": entity, "objective": objective }),
+    ))
+}
+
+/// A player death announced with its kill message: an entity id followed by
+/// nothing but a text component.
+fn decode_combat_death(body: &[u8], _protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let player_id = reader.var_i32().filter(|value| *value >= 0)?;
+    let rest = reader.rest();
+    let (component, consumed) = read_text_component(rest)?;
+    if consumed != rest.len() {
+        return None;
+    }
+    let message = component_to_text(&component);
+    if message.is_empty() {
+        return None;
+    }
+    Some((
+        "combat_death",
+        json!({ "player_id": player_id, "message": message }),
+    ))
+}
+
+/// Clicking a container slot.
+///
+/// The layout has moved several times: 1.17.1 put a state id after the window
+/// id, 1.20.5 replaced item NBT with typed components, 1.21.2 widened the
+/// window id to a `VarInt`, and 1.21.5 sends *hashed* stacks — item id, count,
+/// and component hashes — which can be walked without a registry. A modern
+/// stack carrying real components cannot be walked without one, so between
+/// 1.20.5 and 1.21.4 only clicks with empty stacks are named; everything else
+/// stays raw rather than half-read.
+fn decode_click_container(body: &[u8], protocol: Option<i32>) -> Option<(&'static str, Value)> {
+    match protocol {
+        Some(version) => click_container_as(body, version),
+        // Without a version, try the layouts newest first; each consumes the
+        // body exactly or not at all.
+        None => [770, 768, 766, 764, 756]
+            .into_iter()
+            .find_map(|version| click_container_as(body, version)),
+    }
+}
+
+fn click_container_as(body: &[u8], version: i32) -> Option<(&'static str, Value)> {
+    let mut reader = Reader::new(body);
+    let window = if version >= 768 {
+        reader.var_i32().filter(|value| (0..=255).contains(value))?
+    } else {
+        i32::from(reader.u8()?)
+    };
+    let state_id = if version >= 756 {
+        Some(reader.var_i32().filter(|value| *value >= 0)?)
+    } else {
+        None
+    };
+    let slot = reader.i16().filter(|value| (-1000..=999).contains(value))?;
+    let button = reader.u8().filter(|value| *value <= 40)?;
+    let mode = reader.var_i32().filter(|value| (0..=6).contains(value))?;
+    let count = reader.counted(128)?;
+    let mut changed = Vec::with_capacity(count);
+    for _ in 0..count {
+        let changed_slot = reader.i16().filter(|value| (-1000..=999).contains(value))?;
+        let item = read_click_item(&mut reader, version)?;
+        changed.push(json!({ "slot": changed_slot, "item": item }));
+    }
+    let carried = read_click_item(&mut reader, version)?;
+    if !reader.is_empty() {
+        return None;
+    }
+    let mut fields = Map::new();
+    fields.insert("window_id".into(), json!(window));
+    if let Some(state_id) = state_id {
+        fields.insert("state_id".into(), json!(state_id));
+    }
+    fields.insert("slot".into(), json!(slot));
+    fields.insert("button".into(), json!(button));
+    fields.insert("mode".into(), json!(mode));
+    fields.insert("changed_slots".into(), Value::Array(changed));
+    fields.insert("carried_item".into(), carried);
+    Some(("click_container", Value::Object(fields)))
+}
+
+fn read_click_item(reader: &mut Reader<'_>, version: i32) -> Option<Value> {
+    if version >= 770 {
+        decode_hashed_item(reader)
+    } else if version >= 766 {
+        decode_cursor_item_modern(reader)
+    } else {
+        decode_cursor_item_legacy(reader)
+    }
+}
+
+/// A 1.21.5+ hashed stack: presence, item id, count, then the added
+/// components as (type, CRC32C) pairs and the removed ones as types.
+fn decode_hashed_item(reader: &mut Reader<'_>) -> Option<Value> {
+    if !reader.bool()? {
+        return Some(Value::Null);
+    }
+    let id = reader.var_i32().filter(|value| *value >= 0)?;
+    let count = reader.var_i32().filter(|value| (1..=99).contains(value))?;
+    let added = reader.counted(256)?;
+    let mut hashes = Vec::with_capacity(added);
+    for _ in 0..added {
+        let kind = reader.var_i32().filter(|value| *value >= 0)?;
+        let hash = reader.i32()?;
+        hashes.push(json!({ "type": kind, "hash": format!("{:08x}", hash.cast_unsigned()) }));
+    }
+    let removed = reader.counted(256)?;
+    let mut removals = Vec::with_capacity(removed);
+    for _ in 0..removed {
+        removals.push(json!(reader.var_i32().filter(|value| *value >= 0)?));
+    }
+    Some(json!({
+        "id": id,
+        "count": count,
+        "component_hashes": hashes,
+        "removed_components": removals,
+    }))
+}
+
+/// A 1.20.5–1.21.4 stack: a count, and nothing else when it is empty. A
+/// non-empty stack needs the component registry to walk; refusing keeps the
+/// decoder honest instead of naming a partial read.
+fn decode_cursor_item_modern(reader: &mut Reader<'_>) -> Option<Value> {
+    let count = reader.var_i32().filter(|value| (0..=99).contains(value))?;
+    if count == 0 { Some(Value::Null) } else { None }
+}
+
+/// A stack before 1.20.5: presence, id, count, and NBT (a lone `TAG_End` when
+/// the stack carries none).
+fn decode_cursor_item_legacy(reader: &mut Reader<'_>) -> Option<Value> {
+    if !reader.bool()? {
+        return Some(Value::Null);
+    }
+    let id = reader
+        .var_i32()
+        .filter(|value| (0..=4_000).contains(value))?;
+    let count = reader.u8().filter(|value| (1..=64).contains(value))?;
+    let rest = reader.rest();
+    let consumed = if rest.first() == Some(&0) {
+        1
+    } else {
+        read_nbt(rest).ok()?.1
+    };
+    reader.take(consumed)?;
+    Some(json!({ "id": id, "count": count }))
+}
+
 // --- raw transport payloads ---
+
+/// The `GameSpy4` query protocol Java servers answer over UDP: LAN discovery,
+/// server-list pings, and the external query listener.
+///
+/// Every datagram starts with the `0xFEFD` magic, an opcode, and a session id,
+/// which is specific enough evidence to name even though the statistics
+/// payload's chunked key/value layout is only summarised, not walked.
+fn decode_query_protocol(payload: &[u8]) -> Option<PacketInsight> {
+    if payload.len() < 5 || payload.first()? != &0xFE || payload.get(1)? != &0xFD {
+        return None;
+    }
+    let opcode = *payload.get(2)?;
+    let session = i32::from_be_bytes(payload.get(3..7)?.try_into().ok()?);
+    let (name, summary_tail) = match opcode {
+        9 => {
+            // A handshake request ends in padding; the reply carries the
+            // challenge token as trailing text.
+            ("query_handshake", printable_run(&payload[7..], 1))
+        }
+        0 => {
+            // A stats request carries an 11-byte payload; replies carry the
+            // chunked key/value sections.
+            ("query_stats", printable_run(&payload[7..], 1))
+        }
+        _ => return None,
+    };
+    Some(PacketInsight {
+        name: Some(name.into()),
+        label: Some(title_case(name)),
+        summary: Some(format!("{name}: session {session}")),
+        fields: Some(json!({
+            "session": session,
+            "payload": summary_tail.unwrap_or_default(),
+        })),
+        identification: Identification::Structure,
+        ..PacketInsight::default()
+    })
+}
 
 /// Splits a passively captured TCP payload into Minecraft frames when it looks
 /// like plaintext protocol traffic. Encrypted or mid-stream payloads simply
@@ -1469,6 +2269,9 @@ fn inspect_transport_payload(
     payload: &[u8],
     protocol_version: Option<i32>,
 ) -> PacketInsight {
+    if let Some(query) = decode_query_protocol(payload) {
+        return query;
+    }
     let mut stream = Vec::new();
     let mut identified = 0usize;
     let mut cursor = 0usize;
@@ -1492,13 +2295,16 @@ fn inspect_transport_payload(
         if !(0..=0x03ff).contains(&packet_id) {
             break;
         }
-        let inner = inspect_packet(
+        // Shape only: a passively captured frame may belong to any state, so
+        // reading its id through the play table would name a login packet as
+        // whatever play packet shares its id.
+        let inner = structure_decode(
             ProtocolState::Play,
             direction,
-            packet_id,
             &frame[id_prefix..],
             protocol_version,
-        );
+        )
+        .unwrap_or_else(structural_read);
         if inner.identification != Identification::Unidentified {
             identified += 1;
         }
@@ -1591,26 +2397,6 @@ fn read_text_component(input: &[u8]) -> Option<(Value, usize)> {
     Some((value, reader.position()))
 }
 
-/// Rejects timestamps outside a plausible window, which is what separates a
-/// real chat timestamp from eight arbitrary bytes.
-fn plausible_timestamp(value: i64) -> bool {
-    const YEAR_2015: i64 = 1_420_070_400_000;
-    const YEAR_2100: i64 = 4_102_444_800_000;
-    (YEAR_2015..YEAR_2100).contains(&value)
-}
-
-fn format_millis(value: i64) -> String {
-    let seconds = value.div_euclid(1_000);
-    time::OffsetDateTime::from_unix_timestamp(seconds).map_or_else(
-        |_| value.to_string(),
-        |moment| {
-            moment
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| value.to_string())
-        },
-    )
-}
-
 fn loader_for_channel(channel: &str) -> Option<&'static str> {
     let lower = channel.to_ascii_lowercase();
     if lower.contains("neoforge") {
@@ -1661,12 +2447,22 @@ fn title_case(name: &str) -> String {
 fn summarize(name: &str, fields: &Value) -> String {
     for key in [
         "message",
+        "plain_message",
         "command",
+        "content_text",
+        "reason_text",
+        "text_rendered",
+        "title_text",
+        "header_text",
         "text",
+        "title",
+        "objective",
         "value",
         "channel",
         "server_address",
+        "host",
         "username",
+        "key",
         "response",
         "url",
         "locale",
@@ -1707,8 +2503,16 @@ mod tests {
         output.extend_from_slice(value.as_bytes());
     }
 
+    /// The shape tier on its own, as it runs for a release with no table: the
+    /// decoders still see the protocol, so version-gated layouts are tested.
     fn play(direction: Direction, body: &[u8]) -> PacketInsight {
-        inspect_packet(ProtocolState::Play, direction, 0x00, body, Some(767))
+        structure_decode(ProtocolState::Play, direction, body, Some(767))
+            .unwrap_or_else(structural_read)
+    }
+
+    fn play_untabulated(direction: Direction, body: &[u8]) -> PacketInsight {
+        structure_decode(ProtocolState::Play, direction, body, Some(763))
+            .unwrap_or_else(structural_read)
     }
 
     #[test]
@@ -1882,13 +2686,13 @@ mod tests {
         // 1.21.2 inserted the world-border flag in front of the sequence.
         body.push(0);
         body.extend_from_slice(&encode_var_i32(300));
-        let insight = inspect_packet(
+        let insight = structure_decode(
             ProtocolState::Play,
             Direction::ClientToServer,
-            0x00,
             &body,
             Some(768),
-        );
+        )
+        .unwrap_or_else(structural_read);
         assert_eq!(insight.name.as_deref(), Some("use_item_on"));
         let fields = insight.fields.unwrap();
         assert_eq!(fields["position"], "12, 70, -34");
@@ -1896,13 +2700,13 @@ mod tests {
 
         let mut older = classic;
         older.extend_from_slice(&encode_var_i32(300));
-        let insight = inspect_packet(
+        let insight = structure_decode(
             ProtocolState::Play,
             Direction::ClientToServer,
-            0x00,
             &older,
             Some(767),
-        );
+        )
+        .unwrap_or_else(structural_read);
         assert_eq!(insight.name.as_deref(), Some("use_item_on"));
         assert_eq!(insight.fields.unwrap()["face"], "top");
     }
@@ -1971,11 +2775,317 @@ mod tests {
         assert_eq!(insight.fields.unwrap()["position"], "1, 64, 2");
     }
 
+    fn nbt_text(text: &str) -> Vec<u8> {
+        // Network NBT: a root compound with no name, one string field, an end
+        // tag.
+        let mut bytes = vec![0x0a, 0x08];
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(b"text");
+        bytes.extend_from_slice(&u16::try_from(text.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0x00);
+        bytes
+    }
+
+    #[test]
+    fn decodes_boss_bar_actions() {
+        let uuid = [0x11_u8; 16];
+
+        // Add: title, health, colour, overlay, flags.
+        let mut body = uuid.to_vec();
+        body.extend_from_slice(&encode_var_i32(0));
+        body.extend_from_slice(&nbt_text("Ender Dragon"));
+        body.extend_from_slice(&0.75_f32.to_be_bytes());
+        body.extend_from_slice(&encode_var_i32(3));
+        body.extend_from_slice(&encode_var_i32(0));
+        body.push(0x01);
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("boss_bar"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["action"], "add");
+        assert_eq!(fields["title"], "Ender Dragon");
+        assert_eq!(fields["health"], 0.75);
+
+        // Health update, then removal.
+        let mut body = uuid.to_vec();
+        body.extend_from_slice(&encode_var_i32(1));
+        body.extend_from_slice(&0.5_f32.to_be_bytes());
+        assert_eq!(
+            play(Direction::ServerToClient, &body).fields.unwrap()["health"],
+            0.5
+        );
+
+        let mut body = uuid.to_vec();
+        body.extend_from_slice(&encode_var_i32(5));
+        let fields = play(Direction::ServerToClient, &body).fields.unwrap();
+        assert_eq!(fields["action"], "remove");
+
+        // An out-of-range action leaves the packet unnamed.
+        let mut body = uuid.to_vec();
+        body.extend_from_slice(&encode_var_i32(9));
+        assert_eq!(
+            play_untabulated(Direction::ServerToClient, &body).identification,
+            Identification::Unidentified
+        );
+    }
+
+    #[test]
+    fn decodes_a_sound_effect() {
+        let mut body = encode_var_i32(42).to_vec();
+        body.extend_from_slice(&encode_var_i32(4)); // block category
+        body.extend_from_slice(&packed_position(-12, 70, 300));
+        body.extend_from_slice(&0.8_f32.to_be_bytes());
+        body.extend_from_slice(&1.25_f32.to_be_bytes());
+        body.extend_from_slice(&9_i64.to_be_bytes());
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("sound_effect"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["category"], "block");
+        assert_eq!(fields["position"], "-12, 70, 300");
+        assert_eq!(fields["pitch"], 1.25);
+    }
+
+    #[test]
+    fn decodes_an_entity_spawning() {
+        let mut body = encode_var_i32(4_812).to_vec();
+        body.extend_from_slice(&[0x22_u8; 16]);
+        body.extend_from_slice(&encode_var_i32(95)); // creeper-ish type id
+        for value in [12.5_f64, 64.0, -30.25] {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+        body.push(128); // pitch
+        body.push(32); // yaw
+        body.extend_from_slice(&encode_var_i32(0));
+        for delta in [0_i16, -800, 1_600] {
+            body.extend_from_slice(&delta.to_be_bytes());
+        }
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("add_entity"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["entity_id"], 4_812);
+        assert_eq!(fields["type"], 95);
+        assert_eq!(fields["y"], 64.0);
+    }
+
+    #[test]
+    fn decodes_damage_and_death_packets() {
+        // Damage from a known attacker at a reported position.
+        let mut body = encode_var_i32(5).to_vec(); // damage type
+        body.push(1);
+        body.extend_from_slice(&encode_var_i32(4_812));
+        body.push(0);
+        body.push(1); // has position
+        for value in [8.5_f64, 64.0, -19.25] {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+        let insight = structure_decode(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &body,
+            Some(767),
+        )
+        .unwrap_or_else(structural_read);
+        assert_eq!(insight.name.as_deref(), Some("damage_event"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["source_entity"], 4_812);
+
+        // The same shape on an older release is not this packet.
+        let insight = structure_decode(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &body,
+            Some(758),
+        )
+        .unwrap_or_else(structural_read);
+        assert_ne!(insight.name.as_deref(), Some("damage_event"));
+
+        // Death: entity id plus nothing but a component.
+        let mut body = encode_var_i32(1).to_vec();
+        body.extend_from_slice(&nbt_text("Player fell from a high place"));
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("combat_death"));
+        assert!(insight.summary.unwrap().contains("fell"));
+    }
+
+    #[test]
+    fn decodes_window_properties_but_not_game_events() {
+        // A furnace progress bar: window 2, progress 40 of 100.
+        let mut body = vec![2_u8];
+        body.extend_from_slice(&40_i16.to_be_bytes());
+        body.extend_from_slice(&100_i16.to_be_bytes());
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("container_set_data"));
+
+        // A game event (change gamemode to 3) parses as a zero total here and
+        // must stay with its own decoder.
+        let mut body = vec![3_u8];
+        body.extend_from_slice(&3.0_f32.to_be_bytes());
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("game_event"));
+    }
+
+    #[test]
+    fn decodes_status_effects() {
+        let mut body = encode_var_i32(120).to_vec();
+        body.extend_from_slice(&encode_var_i32(10)); // speed
+        body.extend_from_slice(&encode_var_i32(1)); // amplifier
+        body.extend_from_slice(&encode_var_i32(-1)); // infinite
+        body.push(0b101);
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("entity_effect"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["duration"], "infinite");
+        assert_eq!(fields["particles"], false);
+
+        // Wearing off: entity id plus a namespaced effect.
+        let mut body = encode_var_i32(120).to_vec();
+        push_string(&mut body, "minecraft:speed");
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("remove_entity_effect"));
+    }
+
+    #[test]
+    fn decodes_scoreboard_packets() {
+        // Create an objective with an integer render type.
+        let mut body = push_objective_header("kills", 0);
+        body.extend_from_slice(&encode_var_i32(0));
+        let insight = play(Direction::ServerToClient, &body);
+        assert_eq!(insight.name.as_deref(), Some("scoreboard_objective"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["action"], "create");
+        assert_eq!(fields["title"], "Kills!");
+
+        // Remove it: name and mode only.
+        let mut body = Vec::new();
+        push_string(&mut body, "kills");
+        body.push(1);
+        assert_eq!(
+            play(Direction::ServerToClient, &body).name.as_deref(),
+            Some("scoreboard_objective")
+        );
+
+        // Set a score on 1.20.3+; on older releases the same bytes are not
+        // this packet because the shape did not exist yet.
+        let mut body = push_score_header(764);
+        body.extend_from_slice(&encode_var_i32(15));
+        let insight = structure_decode(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &body,
+            Some(764),
+        )
+        .unwrap_or_else(structural_read);
+        assert_eq!(insight.name.as_deref(), Some("update_score"));
+        assert_eq!(insight.fields.unwrap()["score"], 15);
+        let insight = structure_decode(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &body,
+            Some(758),
+        )
+        .unwrap_or_else(structural_read);
+        assert_ne!(insight.name.as_deref(), Some("update_score"));
+
+        // Reset that score: exactly two names.
+        let body = push_score_header(764);
+        let insight = structure_decode(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &body,
+            Some(764),
+        )
+        .unwrap_or_else(structural_read);
+        assert_eq!(insight.name.as_deref(), Some("reset_score"));
+    }
+
+    fn push_objective_header(name: &str, mode: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_string(&mut body, name);
+        body.push(mode);
+        if mode != 1 {
+            body.extend_from_slice(&nbt_text("Kills!"));
+        }
+        body
+    }
+
+    fn push_score_header(protocol: i32) -> Vec<u8> {
+        let _ = protocol;
+        let mut body = Vec::new();
+        push_string(&mut body, "MineBurpTester");
+        body.extend_from_slice(&encode_var_i32(5));
+        body.extend_from_slice(b"kills");
+        body
+    }
+
+    fn click_header(window_as_varint: bool) -> Vec<u8> {
+        // Window 1, state id 5, slot 45, button 0, mode 0.
+        let mut body = if window_as_varint {
+            encode_var_i32(1).to_vec()
+        } else {
+            vec![1]
+        };
+        body.extend_from_slice(&encode_var_i32(5));
+        body.extend_from_slice(&45_i16.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&encode_var_i32(0));
+        body
+    }
+
+    fn shape(direction: Direction, body: &[u8], protocol: i32) -> PacketInsight {
+        structure_decode(ProtocolState::Play, direction, body, Some(protocol))
+            .unwrap_or_else(structural_read)
+    }
+
+    #[test]
+    fn decodes_container_clicks_in_every_layout() {
+        // 1.20.5–1.21.1: window id, state id, …, an empty component stack.
+        let mut body = click_header(false);
+        body.extend_from_slice(&encode_var_i32(0)); // no changed slots
+        body.extend_from_slice(&encode_var_i32(0)); // empty carried stack
+        let insight = shape(Direction::ClientToServer, &body, 767);
+        assert_eq!(insight.name.as_deref(), Some("click_container"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["window_id"], 1);
+        assert_eq!(fields["state_id"], 5);
+        assert_eq!(fields["slot"], 45);
+        assert_eq!(fields["changed_slots"], json!([]));
+        assert_eq!(fields["carried_item"], Value::Null);
+
+        // Before 1.20.5: a presence flag for the carried stack.
+        let mut legacy = click_header(false);
+        legacy.extend_from_slice(&encode_var_i32(0));
+        legacy.push(0);
+        let insight = shape(Direction::ClientToServer, &legacy, 758);
+        assert_eq!(insight.name.as_deref(), Some("click_container"));
+
+        // 1.21.5: a VarInt window id and hashed stacks, which are walkable.
+        let mut hashed = click_header(true);
+        hashed.extend_from_slice(&encode_var_i32(1)); // one changed slot
+        hashed.extend_from_slice(&36_i16.to_be_bytes());
+        hashed.push(1); // present
+        hashed.extend_from_slice(&encode_var_i32(812)); // item id
+        hashed.extend_from_slice(&encode_var_i32(3)); // count
+        hashed.extend_from_slice(&encode_var_i32(1)); // one component hash
+        hashed.extend_from_slice(&encode_var_i32(9));
+        hashed.extend_from_slice(&0x1234_5678_i32.to_be_bytes());
+        hashed.extend_from_slice(&encode_var_i32(0)); // none removed
+        hashed.push(0); // carried stack absent
+        let insight = shape(Direction::ClientToServer, &hashed, 770);
+        assert_eq!(insight.name.as_deref(), Some("click_container"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["changed_slots"][0]["slot"], 36);
+        assert_eq!(fields["changed_slots"][0]["item"]["id"], 812);
+        assert_eq!(
+            fields["changed_slots"][0]["item"]["component_hashes"][0]["hash"],
+            "12345678"
+        );
+    }
+
     #[test]
     fn an_eight_byte_body_is_not_automatically_a_keep_alive() {
         // A packed chunk-position long: too large to be a counter and far from
         // any plausible clock, so it must not be named for its length alone.
-        let insight = play(
+        let insight = play_untabulated(
             Direction::ServerToClient,
             &0x2a3b_4c5d_6e7f_8091_u64.to_be_bytes(),
         );
@@ -2011,7 +3121,7 @@ mod tests {
     fn a_generated_table_names_the_packets_shape_can_never_reach() {
         // One byte holding a hand: an arm swing, a client command, and a
         // container close are byte-for-byte identical, so only the table can
-        // say which one this is.
+        // say which one this is — and the description then decodes it.
         let insight = inspect_packet(
             ProtocolState::Play,
             Direction::ClientToServer,
@@ -2021,10 +3131,9 @@ mod tests {
         );
         assert_eq!(insight.name.as_deref(), Some("swing"));
         assert_eq!(insight.identification, Identification::Registry);
-        assert!(
-            insight.fields.is_none(),
-            "a name from the table is not a decode: there are no fields to invent"
-        );
+        assert_eq!(insight.decoded_by.as_deref(), Some("definition"));
+        assert_eq!(insight.fields.unwrap()["hand"], 0);
+        assert!(insight.warnings.is_empty());
 
         // The same id on a version with no generated table stays unnamed rather
         // than borrowing a neighbouring release's numbering.
@@ -2033,21 +3142,22 @@ mod tests {
             Direction::ClientToServer,
             SWING,
             &[0x00],
-            Some(767),
+            Some(485),
         );
         assert_eq!(insight.identification, Identification::Unidentified);
     }
 
     #[test]
-    fn the_body_overrules_the_table_when_they_disagree() {
+    fn a_body_that_contradicts_its_table_name_is_flagged_rather_than_renamed() {
         let mut body = Vec::new();
         body.extend_from_slice(&8.5_f64.to_be_bytes());
         body.extend_from_slice(&64.0_f64.to_be_bytes());
         body.extend_from_slice(&(-19.25_f64).to_be_bytes());
         body.push(1);
 
-        // Sent under the id the table calls an arm swing: the bytes are a
-        // movement packet, and a client is free to lie about its version.
+        // Sent under the id the table calls an arm swing: the table is the
+        // stronger witness, so the name stays, and the mismatch — including
+        // what the bytes look like instead — is reported.
         let insight = inspect_packet(
             ProtocolState::Play,
             Direction::ClientToServer,
@@ -2055,11 +3165,19 @@ mod tests {
             &body,
             Some(769),
         );
-        assert_eq!(insight.name.as_deref(), Some("set_player_position"));
-        assert_eq!(insight.identification, Identification::Structure);
+        assert_eq!(insight.name.as_deref(), Some("swing"));
+        assert_eq!(insight.identification, Identification::Registry);
+        assert!(insight.error.is_some());
+        assert!(
+            insight
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("set_player_position")),
+            "{:?}",
+            insight.warnings
+        );
 
-        // Under the id the table agrees with, the same bytes are promoted: the
-        // id and the body are two independent witnesses to one name.
+        // Under the id the table agrees with, the same bytes decode cleanly.
         let insight = inspect_packet(
             ProtocolState::Play,
             Direction::ClientToServer,
@@ -2069,7 +3187,21 @@ mod tests {
         );
         assert_eq!(insight.name.as_deref(), Some("set_player_position"));
         assert_eq!(insight.identification, Identification::Registry);
+        assert!(insight.warnings.is_empty());
         assert_eq!(insight.fields.unwrap()["y"], 64.0);
+    }
+
+    #[test]
+    fn an_id_missing_from_a_table_is_not_guessed_from_its_shape() {
+        let insight = inspect_packet(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            0x7f,
+            &[0x00],
+            Some(769),
+        );
+        assert_eq!(insight.name, None);
+        assert_eq!(insight.warnings.len(), 1);
     }
 
     #[test]
@@ -2093,7 +3225,7 @@ mod tests {
                 Direction::ClientToServer,
                 SWING,
                 &huge,
-                Some(767)
+                Some(485)
             ),
             None
         );
@@ -2112,8 +3244,9 @@ mod tests {
         assert_eq!(insight.name.as_deref(), Some("keep_alive"));
         assert_eq!(insight.identification, Identification::Registry);
 
-        // The same id in 1.20.4 is ping, which takes four bytes, so the eight
-        // byte body must not be accepted under that name.
+        // The same id in 1.20.4 is ping, which takes four bytes. The table
+        // still names it ping; the eight-byte body is flagged, along with the
+        // packet it reads as instead.
         let insight = inspect_packet(
             ProtocolState::Configuration,
             Direction::ServerToClient,
@@ -2121,11 +3254,15 @@ mod tests {
             &7_i64.to_be_bytes(),
             Some(765),
         );
-        assert_eq!(insight.name.as_deref(), Some("keep_alive"));
-        assert_eq!(
-            insight.identification,
-            Identification::Structure,
-            "a body that contradicts the id table falls back to its shape"
+        assert_eq!(insight.name.as_deref(), Some("ping"));
+        assert_eq!(insight.identification, Identification::Registry);
+        assert!(
+            insight
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("keep_alive")),
+            "{:?}",
+            insight.warnings
         );
     }
 
@@ -2143,7 +3280,403 @@ mod tests {
             Some(767),
         );
         assert_eq!(insight.name.as_deref(), Some("known_packs"));
-        assert_eq!(insight.fields.unwrap()["packs"][0], "minecraft:core 1.21");
+        assert_eq!(insight.decoded_by.as_deref(), Some("definition"));
+        assert_eq!(
+            insight.fields.unwrap()["packs"][0],
+            json!({ "namespace": "minecraft", "id": "core", "version": "1.21" })
+        );
+        // The hand-written shape decoder, used where no description exists.
+        assert_eq!(
+            decode_known_packs(&body, None).unwrap().1["packs"][0],
+            "minecraft:core 1.21"
+        );
+    }
+
+    // --- table-first decoding of real bodies for 1.21.11 (protocol 774) ---
+
+    const MODERN: i32 = 774;
+
+    fn id_of(state: ProtocolState, direction: Direction, name: &str) -> i32 {
+        PacketRegistry::packet_id(state, direction, name, Some(MODERN))
+            .unwrap_or_else(|| panic!("{name} is in the {MODERN} table"))
+    }
+
+    fn nbt_string(output: &mut Vec<u8>, name: &str, value: &str) {
+        output.push(0x08);
+        output.extend_from_slice(&u16::try_from(name.len()).unwrap().to_be_bytes());
+        output.extend_from_slice(name.as_bytes());
+        output.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn textures_property() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(
+            r#"{"profileName":"Notch","textures":{"SKIN":{"url":"http://textures.minecraft.net/texture/abc"}}}"#,
+        )
+    }
+
+    #[test]
+    fn login_success_properties_and_skins_are_decoded() {
+        let mut body = vec![0x11; 16];
+        push_string(&mut body, "Notch");
+        body.extend_from_slice(&encode_var_i32(1));
+        push_string(&mut body, "textures");
+        push_string(&mut body, &textures_property());
+        body.push(0); // no signature
+        let insight = inspect_packet(
+            ProtocolState::Login,
+            Direction::ServerToClient,
+            2,
+            &body,
+            Some(MODERN),
+        );
+        assert_eq!(insight.name.as_deref(), Some("login_success"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["username"], "Notch");
+        assert_eq!(
+            fields["properties"][0]["decoded"]["skin_url"],
+            "http://textures.minecraft.net/texture/abc"
+        );
+    }
+
+    #[test]
+    fn player_info_updates_are_decoded_from_the_description() {
+        let mut body = vec![0x01]; // add_player only
+        body.extend_from_slice(&encode_var_i32(1));
+        body.extend_from_slice(&[0x22; 16]);
+        push_string(&mut body, "Notch");
+        body.extend_from_slice(&encode_var_i32(1));
+        push_string(&mut body, "textures");
+        push_string(&mut body, &textures_property());
+        body.push(0);
+        let id = id_of(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            "player_info_update",
+        );
+        let insight = inspect_packet(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            id,
+            &body,
+            Some(MODERN),
+        );
+        assert_eq!(insight.name.as_deref(), Some("player_info_update"));
+        assert_eq!(insight.decoded_by.as_deref(), Some("definition"));
+        assert!(insight.warnings.is_empty(), "{:?}", insight.warnings);
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["action"]["add_player"], true);
+        assert_eq!(fields["data"][0]["player"]["name"], "Notch");
+        assert_eq!(
+            fields["data"][0]["player"]["properties"][0]["decoded"]["profileName"],
+            "Notch"
+        );
+
+        // Every field has a span, so a rule can rename the player by path and
+        // the string's length prefix is rewritten with it.
+        let mut logical = encode_var_i32(id).to_vec();
+        logical.extend_from_slice(&body);
+        let layout = crate::layout::layout_logical(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &logical,
+            Some(MODERN),
+        );
+        assert!(layout.complete);
+        assert!(
+            layout
+                .fields
+                .iter()
+                .any(|field| field.name == "data[0].player.name")
+        );
+        let edited = crate::rewrite::apply_edits(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            Some(MODERN),
+            &logical,
+            &[mineburp_core::PacketEdit::Field {
+                name: "data[0].player.name".into(),
+                value: "Herobrine".into(),
+            }],
+        )
+        .expect("the field edit applies");
+        let insight = inspect_logical(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &edited,
+            Some(MODERN),
+        );
+        assert!(insight.warnings.is_empty(), "{:?}", insight.warnings);
+        assert_eq!(
+            insight.fields.unwrap()["data"][0]["player"]["name"],
+            "Herobrine"
+        );
+    }
+
+    #[test]
+    fn system_chat_click_actions_are_surfaced() {
+        let mut body = vec![0x0a];
+        nbt_string(&mut body, "text", "Free diamonds");
+        body.push(0x0a);
+        body.extend_from_slice(&11_u16.to_be_bytes());
+        body.extend_from_slice(b"click_event");
+        nbt_string(&mut body, "action", "run_command");
+        nbt_string(&mut body, "command", "/op attacker");
+        body.push(0x00); // end click_event
+        body.push(0x00); // end root
+        body.push(0x00); // not the action bar
+        let id = id_of(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            "system_chat",
+        );
+        let insight = inspect_packet(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            id,
+            &body,
+            Some(MODERN),
+        );
+        assert_eq!(insight.name.as_deref(), Some("system_chat"));
+        let fields = insight.fields.unwrap();
+        assert_eq!(fields["content_text"], "Free diamonds");
+        assert_eq!(fields["interactive_events"][0]["action"], "run_command");
+        assert_eq!(fields["interactive_events"][0]["value"], "/op attacker");
+        assert_eq!(
+            insight.summary.as_deref(),
+            Some("system_chat: Free diamonds")
+        );
+    }
+
+    #[test]
+    fn declared_commands_are_reconstructed_as_syntax() {
+        let mut body = encode_var_i32(3).to_vec();
+        // Root: type 0, one child.
+        body.push(0x00);
+        body.extend_from_slice(&encode_var_i32(1));
+        body.extend_from_slice(&encode_var_i32(1));
+        // Literal "give": type 1, one child.
+        body.push(0x01);
+        body.extend_from_slice(&encode_var_i32(1));
+        body.extend_from_slice(&encode_var_i32(2));
+        push_string(&mut body, "give");
+        // Argument "targets": type 2, executable (0x04), entity parser (6) with
+        // its one flags byte.
+        body.push(0x02 | 0x04);
+        body.extend_from_slice(&encode_var_i32(0));
+        push_string(&mut body, "targets");
+        body.extend_from_slice(&encode_var_i32(6));
+        body.push(0x00);
+        body.extend_from_slice(&encode_var_i32(0)); // root index
+        let id = id_of(ProtocolState::Play, Direction::ServerToClient, "commands");
+        let insight = inspect_packet(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            id,
+            &body,
+            Some(MODERN),
+        );
+        assert!(
+            insight.warnings.is_empty(),
+            "{:?} {:?}",
+            insight.warnings,
+            insight.fields
+        );
+        assert_eq!(
+            insight.fields.unwrap()["commands"],
+            json!(["/give <targets:entity>"])
+        );
+    }
+
+    /// Every name a shape decoder can report, by the direction it runs in.
+    const SHAPE_SERVERBOUND: &[&str] = &[
+        "keep_alive",
+        "client_information",
+        "set_player_position_and_rotation",
+        "set_player_position",
+        "set_player_rotation",
+        "move_vehicle",
+        "chat_message",
+        "chat_command",
+        "player_action",
+        "use_item_on",
+        "click_container",
+        "sign_update",
+        "interact",
+        "command_suggestion",
+        "player_command",
+        "custom_payload",
+        "use_item",
+        "set_held_item",
+    ];
+    const SHAPE_CLIENTBOUND: &[&str] = &[
+        "keep_alive",
+        "system_chat",
+        "update_time",
+        "player_abilities",
+        "set_health",
+        "set_experience",
+        "container_set_data",
+        "game_event",
+        "set_default_spawn_position",
+        "block_update",
+        "block_destruction",
+        "block_event",
+        "level_event",
+        "synchronize_player_position",
+        "teleport_entity",
+        "login",
+        "open_screen",
+        "boss_bar",
+        "sound_effect",
+        "add_entity",
+        "damage_event",
+        "entity_effect",
+        "remove_entity_effect",
+        "scoreboard_objective",
+        "update_score",
+        "reset_score",
+        "combat_death",
+        "player_info_remove",
+        "add_resource_pack",
+        "custom_payload",
+        "set_entity_motion",
+        "move_entity_pos",
+        "move_entity_pos_rot",
+        "move_entity_rot",
+        "remove_entities",
+    ];
+    /// Shape-only names, and the table names they stand in for. A shape
+    /// decoder can tell a lone text component from other packets but not a
+    /// disconnect from a title, so it uses a generic name; with a table the
+    /// specific one is reported instead.
+    const SHAPE_ONLY: &[(&str, &[&str])] = &[
+        (
+            "text_component",
+            &[
+                "disconnect",
+                "set_title_text",
+                "set_subtitle_text",
+                "set_action_bar_text",
+            ],
+        ),
+        ("string_payload", &[]),
+    ];
+
+    #[test]
+    fn every_shape_name_is_a_name_the_tables_use() {
+        // One packet is one name whichever tier identified it: a shape name the
+        // tables never produce would split one packet into two rows.
+        let table = |direction, name: &str| {
+            PacketRegistry::packet_id(ProtocolState::Play, direction, name, Some(MODERN))
+        };
+        for name in SHAPE_SERVERBOUND {
+            assert!(
+                table(Direction::ClientToServer, name).is_some(),
+                "serverbound {name}"
+            );
+        }
+        for name in SHAPE_CLIENTBOUND {
+            assert!(
+                table(Direction::ServerToClient, name).is_some(),
+                "clientbound {name}"
+            );
+        }
+        for (_, stands_for) in SHAPE_ONLY {
+            for name in *stands_for {
+                assert!(table(Direction::ServerToClient, name).is_some(), "{name}");
+            }
+        }
+        assert!(
+            PacketRegistry::packet_id(
+                ProtocolState::Configuration,
+                Direction::ClientToServer,
+                "known_packs",
+                Some(MODERN)
+            )
+            .is_some()
+        );
+        // And every name a hand decoder is keyed by is one some table uses.
+        for name in SHAPE_SERVERBOUND.iter().chain(SHAPE_CLIENTBOUND) {
+            assert!(
+                has_hand_decoder(ProtocolState::Play, name),
+                "{name} has no decoder"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tabulated_protocol_names_each_id_once_per_direction() {
+        for protocol in PacketRegistry::tabulated_protocols() {
+            for state in [
+                ProtocolState::Login,
+                ProtocolState::Configuration,
+                ProtocolState::Play,
+            ] {
+                for direction in [Direction::ClientToServer, Direction::ServerToClient] {
+                    let mut seen = std::collections::HashSet::new();
+                    for id in 0..512 {
+                        if let Some(name) =
+                            PacketRegistry::table_packet_name(state, direction, id, Some(protocol))
+                        {
+                            assert!(
+                                seen.insert(name),
+                                "{protocol} {state:?} {direction:?}: `{name}` twice"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_frames_through_inspection_and_layout_never_panic() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for protocol in [None, Some(763), Some(MODERN), Some(776)] {
+            for state_kind in [
+                ProtocolState::Login,
+                ProtocolState::Configuration,
+                ProtocolState::Play,
+            ] {
+                for direction in [Direction::ClientToServer, Direction::ServerToClient] {
+                    for id in 0..0x84 {
+                        for _ in 0..4 {
+                            let length = usize::try_from(next() % 600).unwrap();
+                            let mut logical = encode_var_i32(id).to_vec();
+                            logical.extend((0..length).map(|_| {
+                                let value = next();
+                                let bytes = value.to_le_bytes();
+                                if value % 3 == 0 {
+                                    bytes[1]
+                                } else {
+                                    bytes[0] % 3
+                                }
+                            }));
+                            let insight =
+                                inspect_logical(state_kind, direction, &logical, protocol);
+                            let _ = serde_json::to_string(&insight).unwrap();
+                            let layout = crate::layout::layout_logical(
+                                state_kind, direction, &logical, protocol,
+                            );
+                            assert!(
+                                layout
+                                    .fields
+                                    .iter()
+                                    .all(|field| { field.offset + field.length <= logical.len() })
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2194,7 +3727,7 @@ mod tests {
 
     #[test]
     fn unrecognised_bodies_report_nothing_rather_than_noise() {
-        let insight = play(Direction::ServerToClient, &[0xff, 0x00, 0x13, 0x37, 0x99]);
+        let insight = play_untabulated(Direction::ServerToClient, &[0xff, 0x00, 0x13, 0x37, 0x99]);
         assert_eq!(insight.identification, Identification::Unidentified);
         assert!(
             insight.fields.is_none(),
@@ -2214,5 +3747,44 @@ mod tests {
             None,
         );
         assert!(insight.stream.is_empty());
+    }
+
+    #[test]
+    fn names_a_query_protocol_datagram() {
+        let mut handshake = vec![0xFE, 0xFD, 0x09];
+        handshake.extend_from_slice(&0x1a2b_3c4d_i32.to_be_bytes());
+        handshake.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let insight = inspect_logical(
+            ProtocolState::Opaque,
+            Direction::ClientToServer,
+            &handshake,
+            None,
+        );
+        assert_eq!(insight.name.as_deref(), Some("query_handshake"));
+        assert_eq!(insight.fields.unwrap()["session"], 0x1a2b_3c4d);
+
+        // A stats reply from the server carries the same magic and session.
+        let mut stats = vec![0xFE, 0xFD, 0x00];
+        stats.extend_from_slice(&0x1a2b_3c4d_i32.to_be_bytes());
+        stats.extend_from_slice(b"hostname\0A server\0");
+        let insight = inspect_logical(
+            ProtocolState::Opaque,
+            Direction::ServerToClient,
+            &stats,
+            None,
+        );
+        assert_eq!(insight.name.as_deref(), Some("query_stats"));
+
+        // An unknown opcode under the real magic stays with the generic
+        // framing reader rather than being guessed into a query packet.
+        let unknown_opcode = [0xFE_u8, 0xFD, 0x08, 1, 2, 3, 4];
+        let insight = inspect_logical(
+            ProtocolState::Opaque,
+            Direction::ClientToServer,
+            &unknown_opcode,
+            None,
+        );
+        assert_eq!(insight.name.as_deref(), None);
     }
 }

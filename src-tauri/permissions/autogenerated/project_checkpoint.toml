@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-project-checkpoint"
+description = "Enables the project_checkpoint command without any pre-configured scope."
+commands.allow = ["project_checkpoint"]
+
+[[permission]]
+identifier = "deny-project-checkpoint"
+description = "Denies the project_checkpoint command without any pre-configured scope."
+commands.deny = ["project_checkpoint"]

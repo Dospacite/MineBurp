@@ -1,8 +1,8 @@
 import { Check, FileJson } from "lucide-react";
 import { useState } from "react";
-
-import { desktop } from "../lib/desktop";
 import { message } from "../hooks/useMineBurp";
+import { t } from "../i18n";
+import { desktop } from "../lib/desktop";
 
 const starter = `{
   "manifest": {
@@ -32,14 +32,21 @@ export function SchemasView({ onError }: { onError: (error: string) => void }) {
   return (
     <section className="schema-layout">
       <div className="schema-toolbar">
-        <span><FileJson size={15} /> Schema pack</span>
-        <button className="button primary" onClick={validate}>{valid ? <Check size={14} /> : null} Validate &amp; load</button>
+        <span>
+          <FileJson size={15} /> {t("schemas.pack")}
+        </span>
+        <button type="button" className="button primary" onClick={validate}>
+          {valid ? <Check size={14} /> : null} {t("schemas.validate")}
+        </button>
       </div>
       <textarea
         className="schema-editor"
         spellCheck={false}
         value={schema}
-        onChange={(event) => { setSchema(event.target.value); setValid(false); }}
+        onChange={(event) => {
+          setSchema(event.target.value);
+          setValid(false);
+        }}
       />
     </section>
   );

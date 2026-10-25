@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-capture-stats"
+description = "Enables the capture_stats command without any pre-configured scope."
+commands.allow = ["capture_stats"]
+
+[[permission]]
+identifier = "deny-capture-stats"
+description = "Denies the capture_stats command without any pre-configured scope."
+commands.deny = ["capture_stats"]

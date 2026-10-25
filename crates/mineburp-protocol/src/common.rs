@@ -2,7 +2,7 @@ use bytes::Bytes;
 use mineburp_core::{Direction, ProtocolState};
 use serde_json::{Value, json};
 
-use crate::{decode_handshake, decode_var_i32};
+use crate::{Reader, decode_handshake, decode_var_i32};
 
 #[derive(Debug, Clone, Default)]
 pub struct CommonPacketDecode {
@@ -59,17 +59,7 @@ fn decode_common_packet_inner(
             Ok(fields(json!({ "payload": timestamp })))
         }
         (ProtocolState::Login, Direction::ClientToServer, 0) => {
-            let (username, consumed) = read_string(body, 0)?;
-            // 1.19.1 through 1.20.1 put an optional signature block here; from
-            // 1.20.2 the player UUID always follows the name.
-            let uuid = body
-                .get(consumed..consumed + 16)
-                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-                .map(uuid::Uuid::from_bytes);
-            Ok(fields(match uuid {
-                Some(uuid) => json!({ "username": username, "uuid": uuid.to_string() }),
-                None => json!({ "username": username }),
-            }))
+            decode_login_start(body, protocol_version).map(fields)
         }
         (ProtocolState::Login, Direction::ServerToClient, 3) => {
             let (threshold, _) = decode_var_i32(body)
@@ -116,6 +106,68 @@ fn decode_common_packet_inner(
         }
         _ => Ok(CommonPacketDecode::default()),
     }
+}
+
+/// Login Start, whose tail changed four times:
+///
+/// - before 1.19 (759): the name alone;
+/// - 1.19 (759): an optional profile-key block (expiry, key, signature);
+/// - 1.19.1–1.19.2 (760): that block, then an optional UUID;
+/// - 1.19.3–1.20.1 (761–763): an optional UUID;
+/// - 1.20.2 (764) on: a UUID, always.
+///
+/// With no version known, a UUID is read only when it is exactly what is left.
+fn decode_login_start(body: &[u8], protocol_version: Option<i32>) -> Result<Value, String> {
+    let (username, consumed) = read_string(body, 0)?;
+    let mut reader = Reader::new(body);
+    reader.take(consumed).ok_or("truncated username")?;
+    let mut output = json!({ "username": username });
+    let signature_block = |reader: &mut Reader<'_>, output: &mut Value| -> Result<(), String> {
+        if reader.bool().ok_or("truncated profile key flag")? {
+            let expires_at = reader.i64().ok_or("truncated profile key expiry")?;
+            let key = reader.byte_array().ok_or("truncated profile public key")?;
+            let signature = reader
+                .byte_array()
+                .ok_or("truncated profile key signature")?;
+            output["profile_key"] = json!({
+                "expires_at": expires_at,
+                "public_key_bytes": key.len(),
+                "signature_bytes": signature.len(),
+            });
+        }
+        Ok(())
+    };
+    let optional_uuid = |reader: &mut Reader<'_>| -> Result<Option<uuid::Uuid>, String> {
+        if reader.bool().ok_or("truncated UUID flag")? {
+            return reader
+                .uuid()
+                .map(Some)
+                .ok_or_else(|| "truncated UUID".into());
+        }
+        Ok(None)
+    };
+    let uuid = match protocol_version {
+        Some(version) if version < 759 => None,
+        Some(759) => {
+            signature_block(&mut reader, &mut output)?;
+            None
+        }
+        Some(760) => {
+            signature_block(&mut reader, &mut output)?;
+            optional_uuid(&mut reader)?
+        }
+        Some(761..=763) => optional_uuid(&mut reader)?,
+        Some(_) => Some(reader.uuid().ok_or("truncated UUID")?),
+        None if reader.remaining() == 16 => reader.uuid(),
+        None => None,
+    };
+    if let Some(uuid) = uuid {
+        output["uuid"] = Value::String(uuid.to_string());
+    }
+    if protocol_version.is_some() && !reader.is_empty() {
+        output["trailing_bytes"] = Value::from(reader.remaining());
+    }
+    Ok(output)
 }
 
 fn fields(value: Value) -> CommonPacketDecode {
@@ -202,5 +254,74 @@ mod tests {
         );
         assert_eq!(decoded.channel.as_deref(), Some("fabric:registry/sync"));
         assert_eq!(decoded.loader.as_deref(), Some("fabric"));
+    }
+
+    fn login_start(name: &str, tail: &[u8]) -> Vec<u8> {
+        let mut body = encode_var_i32(i32::try_from(name.len()).unwrap()).to_vec();
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(tail);
+        body
+    }
+
+    fn decode_login(body: &[u8], version: Option<i32>) -> Value {
+        decode_common_packet(
+            ProtocolState::Login,
+            Direction::ClientToServer,
+            0,
+            body,
+            version,
+        )
+        .fields
+        .expect("login start decodes")
+    }
+
+    #[test]
+    fn login_start_follows_every_protocol_layout() {
+        let uuid = [0x11_u8; 16];
+        let expected_uuid = uuid::Uuid::from_bytes(uuid).to_string();
+
+        let legacy = decode_login(&login_start("Notch", &[]), Some(47));
+        assert_eq!(legacy, json!({ "username": "Notch" }));
+
+        // 1.19: a profile-key block, no UUID.
+        let mut signed = vec![1];
+        signed.extend_from_slice(&1_700_000_000_000_i64.to_be_bytes());
+        signed.extend_from_slice(&[3, 1, 2, 3]);
+        signed.extend_from_slice(&[2, 9, 9]);
+        let v759 = decode_login(&login_start("Notch", &signed), Some(759));
+        assert_eq!(v759["profile_key"]["public_key_bytes"], 3);
+        assert!(v759.get("uuid").is_none());
+
+        // 1.19.2: no key, then a present UUID.
+        let mut tail = vec![0, 1];
+        tail.extend_from_slice(&uuid);
+        let v760 = decode_login(&login_start("Notch", &tail), Some(760));
+        assert_eq!(v760["uuid"], expected_uuid);
+
+        // 1.19.3–1.20.1: an absent UUID is a single zero flag, not a UUID.
+        let v762 = decode_login(&login_start("Notch", &[0]), Some(762));
+        assert_eq!(v762, json!({ "username": "Notch" }));
+        let mut present = vec![1];
+        present.extend_from_slice(&uuid);
+        assert_eq!(
+            decode_login(&login_start("Notch", &present), Some(763))["uuid"],
+            expected_uuid
+        );
+
+        // 1.20.2 on: always a UUID.
+        let modern = decode_login(&login_start("Notch", &uuid), Some(767));
+        assert_eq!(modern["uuid"], expected_uuid);
+        let error = decode_common_packet(
+            ProtocolState::Login,
+            Direction::ClientToServer,
+            0,
+            &login_start("Notch", &[]),
+            Some(767),
+        )
+        .error;
+        assert!(
+            error.is_some(),
+            "a modern login start without its UUID is truncated"
+        );
     }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-schema-validate"
+description = "Enables the schema_validate command without any pre-configured scope."
+commands.allow = ["schema_validate"]
+
+[[permission]]
+identifier = "deny-schema-validate"
+description = "Denies the schema_validate command without any pre-configured scope."
+commands.deny = ["schema_validate"]

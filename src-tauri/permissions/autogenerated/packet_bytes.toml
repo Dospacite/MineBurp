@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-packet-bytes"
+description = "Enables the packet_bytes command without any pre-configured scope."
+commands.allow = ["packet_bytes"]
+
+[[permission]]
+identifier = "deny-packet-bytes"
+description = "Denies the packet_bytes command without any pre-configured scope."
+commands.deny = ["packet_bytes"]

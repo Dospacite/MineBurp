@@ -1,4 +1,4 @@
-import { Children, Fragment, useCallback, useRef, useState, type ReactNode } from "react";
+import { Children, Fragment, type ReactNode, useCallback, useRef, useState } from "react";
 
 /**
  * A resizable row or column of panes.
@@ -44,13 +44,16 @@ export function Split({
       if (total <= 0) return;
       const floor = minimum / total;
       const start = base ?? latest.current;
+      const current = start[index];
+      const following = start[index + 1];
+      if (current === undefined || following === undefined) return;
       let delta = pixels / total;
-      delta = Math.max(delta, floor - start[index]);
-      delta = Math.min(delta, start[index + 1] - floor);
+      delta = Math.max(delta, floor - current);
+      delta = Math.min(delta, following - floor);
       if (!Number.isFinite(delta) || delta === 0) return;
       const next = [...start];
-      next[index] = start[index] + delta;
-      next[index + 1] = start[index + 1] - delta;
+      next[index] = current + delta;
+      next[index + 1] = following - delta;
       latest.current = next;
       setSizes(next);
     },
@@ -86,7 +89,9 @@ export function Split({
     persist(storageKey, latest.current);
   }
 
-  const template = fractions.flatMap((size, index) => (index === 0 ? [`${size}fr`] : ["6px", `${size}fr`])).join(" ");
+  const template = fractions
+    .flatMap((size, index) => (index === 0 ? [`${size}fr`] : ["6px", `${size}fr`]))
+    .join(" ");
 
   return (
     <div
@@ -103,6 +108,9 @@ export function Split({
               tabIndex={0}
               aria-orientation={orientation === "columns" ? "vertical" : "horizontal"}
               aria-label="Resize panes"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(((sizes[index - 1] ?? 0) + (sizes[index] ?? 0)) * 100)}
               onPointerDown={(event) => drag(index - 1, event)}
               onKeyDown={(event) => key(index - 1, event)}
             />
@@ -123,7 +131,11 @@ function restore(key: string | undefined, count: number, initial?: number[]): nu
   if (!key) return fallback;
   try {
     const stored: unknown = JSON.parse(window.localStorage.getItem(`mineburp.split.${key}`) ?? "");
-    if (Array.isArray(stored) && stored.length === count && stored.every((value) => typeof value === "number" && value > 0)) {
+    if (
+      Array.isArray(stored) &&
+      stored.length === count &&
+      stored.every((value) => typeof value === "number" && value > 0)
+    ) {
       return stored as number[];
     }
   } catch {

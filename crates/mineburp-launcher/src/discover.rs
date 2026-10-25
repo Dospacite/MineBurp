@@ -12,7 +12,10 @@ use serde_json::Value;
 
 use crate::{
     AgentSetupKind, AgentSetupOutcome, InstanceDescriptor, LaunchError, LaunchOutcome,
-    LaunchRequest, LauncherAdapter, LauncherKind, LoaderKind, process::spawn_launcher,
+    LaunchRequest, LauncherAdapter, LauncherKind, LoaderKind,
+    fsutil::{backup_once, read_snapshot, write_atomic},
+    ini::IniDocument,
+    process::spawn_launcher,
 };
 
 const AGENT_MARKER: &str = "mineburp-agent.jar";
@@ -141,6 +144,20 @@ async fn rediscover_instance(
         .ok_or_else(|| LaunchError::InstanceNotFound(instance_id.to_owned()))
 }
 
+/// Runs blocking filesystem or process work off the async executor.
+///
+/// Discovery walks instance directories and reads profile JSON; launching
+/// spawns a process and reads `/proc`. None of it belongs on a runtime worker.
+async fn off_thread<T, F>(work: F) -> Result<T, LaunchError>
+where
+    F: FnOnce() -> Result<T, LaunchError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| LaunchError::Io(std::io::Error::other(error.to_string())))?
+}
+
 #[derive(Debug)]
 struct OfficialAdapter {
     executable: Option<PathBuf>,
@@ -154,10 +171,10 @@ impl LauncherAdapter for OfficialAdapter {
     }
 
     async fn discover(&self) -> Result<Vec<InstanceDescriptor>, LaunchError> {
-        let Some(root) = &self.root else {
+        let Some(root) = self.root.clone() else {
             return Ok(Vec::new());
         };
-        discover_official_instances(root)
+        off_thread(move || discover_official_instances(&root)).await
     }
 
     async fn launch(&self, _request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
@@ -165,7 +182,7 @@ impl LauncherAdapter for OfficialAdapter {
             .executable
             .clone()
             .ok_or(LaunchError::MissingExecutable("Minecraft Launcher"))?;
-        spawn_launcher(Command::new(&executable), executable)
+        off_thread(move || spawn_launcher(Command::new(&executable), executable)).await
     }
 
     async fn configure_client_assist(
@@ -174,7 +191,9 @@ impl LauncherAdapter for OfficialAdapter {
         jvm_argument: &str,
         enabled: bool,
     ) -> Result<AgentSetupOutcome, LaunchError> {
-        configure_official_profile(instance, jvm_argument, enabled)
+        let instance = instance.clone();
+        let jvm_argument = jvm_argument.to_owned();
+        off_thread(move || configure_official_profile(&instance, &jvm_argument, enabled)).await
     }
 }
 
@@ -212,10 +231,11 @@ impl LauncherAdapter for MultiMcAdapter {
     }
 
     async fn discover(&self) -> Result<Vec<InstanceDescriptor>, LaunchError> {
-        let Some(root) = &self.root else {
+        let Some(root) = self.root.clone() else {
             return Ok(Vec::new());
         };
-        discover_multimc_instances(root, self.kind)
+        let kind = self.kind;
+        off_thread(move || discover_multimc_instances(&root, kind)).await
     }
 
     async fn launch(&self, request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
@@ -223,12 +243,17 @@ impl LauncherAdapter for MultiMcAdapter {
             .executable
             .clone()
             .ok_or(LaunchError::MissingExecutable(self.label()))?;
-        let mut command = Command::new(&executable);
-        command.arg("--launch").arg(&request.instance.id);
-        if let Some(profile_name) = &request.profile_name {
-            command.arg("--profile").arg(profile_name);
-        }
-        spawn_launcher(command, executable)
+        let instance_id = request.instance.id.clone();
+        let profile_name = request.profile_name.clone();
+        off_thread(move || {
+            let mut command = Command::new(&executable);
+            command.arg("--launch").arg(&instance_id);
+            if let Some(profile_name) = profile_name {
+                command.arg("--profile").arg(profile_name);
+            }
+            spawn_launcher(command, executable)
+        })
+        .await
     }
 
     async fn configure_client_assist(
@@ -237,7 +262,9 @@ impl LauncherAdapter for MultiMcAdapter {
         jvm_argument: &str,
         enabled: bool,
     ) -> Result<AgentSetupOutcome, LaunchError> {
-        configure_multimc_profile(instance, jvm_argument, enabled)
+        let instance = instance.clone();
+        let jvm_argument = jvm_argument.to_owned();
+        off_thread(move || configure_multimc_profile(&instance, &jvm_argument, enabled)).await
     }
 }
 
@@ -254,10 +281,10 @@ impl LauncherAdapter for ModrinthAdapter {
     }
 
     async fn discover(&self) -> Result<Vec<InstanceDescriptor>, LaunchError> {
-        let Some(root) = &self.root else {
+        let Some(root) = self.root.clone() else {
             return Ok(Vec::new());
         };
-        discover_modrinth_instances(root)
+        off_thread(move || discover_modrinth_instances(&root)).await
     }
 
     async fn launch(&self, request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
@@ -271,9 +298,12 @@ impl LauncherAdapter for ModrinthAdapter {
             .path_segments_mut()
             .map_err(|()| LaunchError::InvalidMetadata("invalid Modrinth launch URL".into()))?
             .push(&request.instance.id);
-        let mut command = Command::new(&executable);
-        command.arg(launch_url.as_str());
-        spawn_launcher(command, executable)
+        off_thread(move || {
+            let mut command = Command::new(&executable);
+            command.arg(launch_url.as_str());
+            spawn_launcher(command, executable)
+        })
+        .await
     }
 }
 
@@ -293,10 +323,10 @@ impl LauncherAdapter for CurseForgeAdapter {
     }
 
     async fn discover(&self) -> Result<Vec<InstanceDescriptor>, LaunchError> {
-        let Some(root) = &self.root else {
+        let Some(root) = self.root.clone() else {
             return Ok(Vec::new());
         };
-        discover_curse_forge_instances(root)
+        off_thread(move || discover_curse_forge_instances(&root)).await
     }
 
     async fn launch(&self, request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
@@ -310,9 +340,12 @@ impl LauncherAdapter for CurseForgeAdapter {
             .query_pairs_mut()
             .append_pair("instanceId", &request.instance.id)
             .append_pair("gameId", "432");
-        let mut command = Command::new(&executable);
-        command.arg(launch_url.as_str());
-        spawn_launcher(command, executable)
+        off_thread(move || {
+            let mut command = Command::new(&executable);
+            command.arg(launch_url.as_str());
+            spawn_launcher(command, executable)
+        })
+        .await
     }
 }
 
@@ -382,12 +415,15 @@ fn discover_multimc_instances(
             continue;
         }
         let path = entry.path();
-        let config = parse_properties(&path.join("instance.cfg")).unwrap_or_default();
+        let config = std::fs::read_to_string(path.join("instance.cfg"))
+            .map(|text| IniDocument::parse(&text))
+            .ok();
+        let property = |key: &str| config.as_ref().and_then(|document| document.get(key));
         let id = entry.file_name().to_string_lossy().into_owned();
-        let name = config.get("name").cloned().unwrap_or_else(|| id.clone());
+        let name = property("name").unwrap_or_else(|| id.clone());
         let (minecraft_version, loader) = parse_mmc_components(&path.join("mmc-pack.json"));
-        let icon_path = config
-            .get("iconKey")
+        let icon_path = property("iconKey")
+            .filter(|key| is_safe_icon_key(key))
             .map(|key| root.join("icons").join(format!("{key}.png")))
             .filter(|icon| icon.is_file());
         instances.push(InstanceDescriptor {
@@ -399,8 +435,7 @@ fn discover_multimc_instances(
             loader,
             icon_path,
             supports_agent_configuration: true,
-            client_assist_configured: config
-                .get("JvmArgs")
+            client_assist_configured: property("JvmArgs")
                 .is_some_and(|arguments| arguments.contains(AGENT_MARKER)),
         });
     }
@@ -524,17 +559,13 @@ fn discover_curse_forge_instances(root: &Path) -> Result<Vec<InstanceDescriptor>
                 .and_then(|value| value.version.clone())
         });
         let loader = curse_forge_loader(Some(&metadata), manifest.as_ref());
+        // The metadata names the image; only an image inside the instance's
+        // own directory is believed, so a crafted file cannot use discovery
+        // to probe for arbitrary paths.
         let icon_path = metadata
             .profile_image_path
             .clone()
-            .map(|icon| {
-                if icon.is_absolute() {
-                    icon
-                } else {
-                    path.join(icon)
-                }
-            })
-            .filter(|icon| icon.is_file());
+            .and_then(|icon| contained_file(&path, &icon));
 
         instances.push(InstanceDescriptor {
             id,
@@ -561,6 +592,51 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 struct ManagedAgentState {
     #[serde(default)]
     arguments: HashMap<String, String>,
+    /// Arguments `MineBurp` wrote earlier that a later edit was replacing when
+    /// it was interrupted. They are still removed on the next edit, so a crash
+    /// between writing this state and writing the launcher's file never leaves
+    /// an argument behind that nothing knows to clean up.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    superseded: HashMap<String, Vec<String>>,
+}
+
+impl ManagedAgentState {
+    fn is_empty(&self) -> bool {
+        self.arguments.is_empty() && self.superseded.is_empty()
+    }
+
+    /// Every argument this state says `MineBurp` may have written for `id`.
+    fn known(&self, id: &str) -> Vec<String> {
+        self.arguments
+            .get(id)
+            .into_iter()
+            .chain(self.superseded.get(id).into_iter().flatten())
+            .cloned()
+            .collect()
+    }
+
+    /// Records the intended argument *before* the launcher file is touched.
+    fn begin(&mut self, id: &str, requested: &str, enabled: bool) {
+        if let Some(previous) = self.arguments.get(id).cloned()
+            && (previous != requested || !enabled)
+        {
+            let superseded = self.superseded.entry(id.to_owned()).or_default();
+            if !superseded.contains(&previous) {
+                superseded.push(previous);
+            }
+        }
+        if enabled {
+            self.arguments.insert(id.to_owned(), requested.to_owned());
+        }
+    }
+
+    /// Settles the state once the launcher file holds the new arguments.
+    fn finish(&mut self, id: &str, enabled: bool) {
+        self.superseded.remove(id);
+        if !enabled {
+            self.arguments.remove(id);
+        }
+    }
 }
 
 fn configure_multimc_profile(
@@ -570,20 +646,45 @@ fn configure_multimc_profile(
 ) -> Result<AgentSetupOutcome, LaunchError> {
     let config_path = instance.path.join("instance.cfg");
     let state_path = instance.path.join(".mineburp-client-assistance.json");
-    let text = std::fs::read_to_string(&config_path)?;
-    let properties = parse_properties(&config_path)?;
-    let current = properties.get("JvmArgs").cloned().unwrap_or_default();
+    let snapshot = read_snapshot(&config_path)?;
+    let mut document = IniDocument::parse(&snapshot.text);
+    let current = document.get("JvmArgs").unwrap_or_default();
     let mut state = read_json::<ManagedAgentState>(&state_path).unwrap_or_default();
-    let previous = state.arguments.remove(&instance.id);
-    let updated = update_managed_argument(&current, previous.as_deref(), jvm_argument, enabled)?;
-    std::fs::write(&config_path, set_property(&text, "JvmArgs", &updated))?;
-    if enabled {
-        state
-            .arguments
-            .insert(instance.id.clone(), jvm_argument.to_owned());
-    }
-    write_agent_state(&state_path, &state)?;
+    let updated =
+        update_managed_argument(&current, &state.known(&instance.id), jvm_argument, enabled)?;
+    document.set("JvmArgs", &updated);
+    apply_managed_edit(
+        &mut state,
+        &state_path,
+        &instance.id,
+        jvm_argument,
+        enabled,
+        || {
+            backup_once(&config_path)?;
+            write_atomic(&config_path, document.render().as_bytes(), Some(&snapshot))
+        },
+    )?;
     Ok(managed_outcome(enabled, jvm_argument))
+}
+
+/// Writes the state file, then the launcher's file, then settles the state.
+///
+/// The order is what keeps the edit reversible: whichever write a crash
+/// interrupts, the state file already names every argument the launcher's file
+/// might now contain.
+fn apply_managed_edit(
+    state: &mut ManagedAgentState,
+    state_path: &Path,
+    id: &str,
+    jvm_argument: &str,
+    enabled: bool,
+    write_launcher_file: impl FnOnce() -> Result<(), LaunchError>,
+) -> Result<(), LaunchError> {
+    state.begin(id, jvm_argument, enabled);
+    write_agent_state(state_path, state)?;
+    write_launcher_file()?;
+    state.finish(id, enabled);
+    write_agent_state(state_path, state)
 }
 
 fn configure_official_profile(
@@ -592,7 +693,10 @@ fn configure_official_profile(
     enabled: bool,
 ) -> Result<AgentSetupOutcome, LaunchError> {
     let profiles_path = &instance.path;
-    let mut document: Value = serde_json::from_str(&std::fs::read_to_string(profiles_path)?)
+    let snapshot = read_snapshot(profiles_path)?;
+    // `serde_json` keeps key order here (`preserve_order`), so the launcher's
+    // file is rewritten with its keys where they were.
+    let mut document: Value = serde_json::from_str(&snapshot.text)
         .map_err(|error| LaunchError::InvalidMetadata(error.to_string()))?;
     let profile = document
         .get_mut("profiles")
@@ -603,38 +707,47 @@ fn configure_official_profile(
     let current = profile
         .get("javaArgs")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     let state_path = profiles_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".mineburp-client-assistance.json");
     let mut state = read_json::<ManagedAgentState>(&state_path).unwrap_or_default();
-    let previous = state.arguments.remove(&instance.id);
-    let updated = update_managed_argument(current, previous.as_deref(), jvm_argument, enabled)?;
+    let updated =
+        update_managed_argument(&current, &state.known(&instance.id), jvm_argument, enabled)?;
     profile.insert("javaArgs".into(), Value::String(updated));
-    std::fs::write(
-        profiles_path,
-        serde_json::to_string_pretty(&document)
-            .map_err(|error| LaunchError::InvalidMetadata(error.to_string()))?,
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| LaunchError::InvalidMetadata(error.to_string()))?;
+    apply_managed_edit(
+        &mut state,
+        &state_path,
+        &instance.id,
+        jvm_argument,
+        enabled,
+        || {
+            backup_once(profiles_path)?;
+            write_atomic(profiles_path, text.as_bytes(), Some(&snapshot))
+        },
     )?;
-    if enabled {
-        state
-            .arguments
-            .insert(instance.id.clone(), jvm_argument.to_owned());
-    }
-    write_agent_state(&state_path, &state)?;
     Ok(managed_outcome(enabled, jvm_argument))
 }
 
 fn update_managed_argument(
     current: &str,
-    previous: Option<&str>,
+    known: &[String],
     requested: &str,
     enabled: bool,
 ) -> Result<String, LaunchError> {
-    let without_previous = if let Some(previous) = previous {
-        current.replace(previous, "")
-    } else if current.contains(AGENT_MARKER) {
+    let mut without_managed = current.to_owned();
+    let mut removed = false;
+    for argument in known.iter().map(String::as_str).chain([requested]) {
+        if !argument.is_empty() && without_managed.contains(argument) {
+            without_managed = without_managed.replace(argument, "");
+            removed = true;
+        }
+    }
+    if !removed && known.is_empty() && current.contains(AGENT_MARKER) {
         if enabled {
             return Ok(current.to_owned());
         }
@@ -642,12 +755,10 @@ fn update_managed_argument(
             "the profile contains an agent argument not managed by MineBurp; remove it in the launcher"
                 .into(),
         ));
-    } else {
-        current.to_owned()
-    };
+    }
     // Only trim the whitespace directly exposed by removing our own argument.
     // Quoting and intentional spacing elsewhere belongs to the launcher/user.
-    let base = without_previous.trim();
+    let base = without_managed.trim();
     if enabled {
         Ok(if base.is_empty() {
             requested.to_owned()
@@ -659,32 +770,31 @@ fn update_managed_argument(
     }
 }
 
-fn set_property(text: &str, key: &str, value: &str) -> String {
-    let mut found = false;
-    let mut lines = text
-        .lines()
-        .map(|line| {
-            if line
-                .split_once('=')
-                .is_some_and(|(candidate, _)| candidate.trim() == key)
-            {
-                found = true;
-                format!("{key}={value}")
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>();
-    if !found {
-        lines.push(format!("{key}={value}"));
-    }
-    let mut output = lines.join("\n");
-    output.push('\n');
-    output
+/// Whether an `iconKey` names a file inside the icons directory.
+fn is_safe_icon_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && !key.contains("..")
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+}
+
+/// `candidate` (absolute, or relative to `root`) when it is a file inside
+/// `root` after resolving links and `..`.
+fn contained_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let joined = if candidate.is_absolute() {
+        candidate.to_owned()
+    } else {
+        root.join(candidate)
+    };
+    let resolved = joined.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    (resolved.starts_with(&root) && resolved.is_file()).then_some(resolved)
 }
 
 fn write_agent_state(path: &Path, state: &ManagedAgentState) -> Result<(), LaunchError> {
-    if state.arguments.is_empty() {
+    if state.is_empty() {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -692,8 +802,7 @@ fn write_agent_state(path: &Path, state: &ManagedAgentState) -> Result<(), Launc
     }
     let text = serde_json::to_string_pretty(state)
         .map_err(|error| LaunchError::InvalidMetadata(error.to_string()))?;
-    std::fs::write(path, text)?;
-    Ok(())
+    write_atomic(path, text.as_bytes(), None)
 }
 
 fn managed_outcome(enabled: bool, jvm_argument: &str) -> AgentSetupOutcome {
@@ -746,14 +855,6 @@ fn curse_forge_loader(
                 .or_else(|| value.mod_loaders.first())
         });
     manifest_loader.map_or(LoaderKind::Vanilla, |loader| infer_loader(&loader.id))
-}
-
-fn parse_properties(path: &Path) -> Result<HashMap<String, String>, std::io::Error> {
-    Ok(std::fs::read_to_string(path)?
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-        .collect())
 }
 
 fn parse_mmc_components(path: &Path) -> (Option<String>, LoaderKind) {
@@ -953,10 +1054,11 @@ mod tests {
         let argument = "-javaagent:/opt/mineburp-agent.jar=config=/tmp/client.properties";
         configure_multimc_profile(&instance, argument, true).expect("agent configuration");
         configure_multimc_profile(&instance, argument, false).expect("agent removal");
-        let restored = parse_properties(&instance_path.join("instance.cfg"))
-            .expect("restored instance config");
+        let restored = IniDocument::parse(
+            &fs::read_to_string(instance_path.join("instance.cfg")).expect("restored config"),
+        );
         assert_eq!(
-            restored.get("JvmArgs").map(String::as_str),
+            restored.get("JvmArgs").as_deref(),
             Some("-Xmx6G  -Dquoted=\"a b\"")
         );
     }
@@ -1003,5 +1105,132 @@ mod tests {
                 .expect("untouched substituted profile")
                 .contains(argument)
         );
+    }
+
+    fn prism_instance(root: &Path, config: &str) -> InstanceDescriptor {
+        let instance_path = root.join("instances/prism");
+        fs::create_dir_all(&instance_path).expect("instance directory");
+        fs::write(instance_path.join("instance.cfg"), config).expect("instance config");
+        InstanceDescriptor {
+            id: "prism".into(),
+            launcher: LauncherKind::Prism,
+            name: "Prism".into(),
+            path: instance_path,
+            minecraft_version: None,
+            loader: LoaderKind::Fabric,
+            icon_path: None,
+            supports_agent_configuration: true,
+            client_assist_configured: false,
+        }
+    }
+
+    #[test]
+    fn prism_settings_escape_a_quoted_agent_path() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let instance = prism_instance(temp.path(), "[General]\r\nJvmArgs=-Xmx4G\r\nname=Prism\r\n");
+        let argument = "-javaagent:\"/home/me/Mine Burp/mineburp-agent.jar\"=config=\"/home/me/a b.properties\"";
+        configure_multimc_profile(&instance, argument, true).expect("agent configuration");
+        let text = fs::read_to_string(instance.path.join("instance.cfg")).expect("config");
+        assert!(
+            text.contains("JvmArgs=\"-Xmx4G -javaagent:\\\"/home/me/Mine Burp"),
+            "{text}"
+        );
+        assert!(text.contains("\r\n"), "CRLF endings are kept");
+        assert_eq!(
+            IniDocument::parse(&text).get("JvmArgs").as_deref(),
+            Some(format!("-Xmx4G {argument}").as_str())
+        );
+        // The pre-edit file is kept once.
+        assert_eq!(
+            fs::read_to_string(crate::fsutil::backup_path(
+                &instance.path.join("instance.cfg")
+            ))
+            .expect("backup"),
+            "[General]\r\nJvmArgs=-Xmx4G\r\nname=Prism\r\n"
+        );
+        configure_multimc_profile(&instance, argument, false).expect("agent removal");
+        let restored = fs::read_to_string(instance.path.join("instance.cfg")).expect("config");
+        assert_eq!(
+            IniDocument::parse(&restored).get("JvmArgs").as_deref(),
+            Some("-Xmx4G")
+        );
+        assert!(
+            !instance
+                .path
+                .join(".mineburp-client-assistance.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn an_interrupted_change_of_argument_is_still_removable() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let old = "-javaagent:/old/mineburp-agent.jar=config=/old.properties";
+        let new = "-javaagent:/new/mineburp-agent.jar=config=/new.properties";
+        let instance = prism_instance(temp.path(), &format!("name=x\nJvmArgs=-Xmx1G {old}\n"));
+        // State as a crash would leave it: the new argument recorded, the old
+        // one superseded, the launcher file still holding the old one.
+        fs::write(
+            instance.path.join(".mineburp-client-assistance.json"),
+            format!(r#"{{"arguments":{{"prism":"{new}"}},"superseded":{{"prism":["{old}"]}}}}"#),
+        )
+        .expect("state");
+        configure_multimc_profile(&instance, new, false).expect("agent removal");
+        let restored = fs::read_to_string(instance.path.join("instance.cfg")).expect("config");
+        assert_eq!(
+            IniDocument::parse(&restored).get("JvmArgs").as_deref(),
+            Some("-Xmx1G")
+        );
+    }
+
+    #[test]
+    fn official_profiles_keep_their_key_order() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let profiles = temp.path().join("launcher_profiles.json");
+        fs::write(
+            &profiles,
+            r#"{"settings":{"z":1,"a":2},"profiles":{"p":{"type":"custom","name":"P","lastVersionId":"1.21.1"}},"version":3}"#,
+        )
+        .expect("profiles");
+        let instance = discover_official_instances(temp.path())
+            .expect("discovery")
+            .pop()
+            .expect("profile");
+        configure_official_profile(&instance, "-javaagent:/x/mineburp-agent.jar", true)
+            .expect("configuration");
+        let text = fs::read_to_string(&profiles).expect("profiles");
+        let settings = text.find("\"settings\"").unwrap();
+        let profiles_key = text.find("\"profiles\"").unwrap();
+        let version = text.find("\"version\"").unwrap();
+        assert!(settings < profiles_key && profiles_key < version, "{text}");
+        assert!(text.find("\"z\"").unwrap() < text.find("\"a\"").unwrap());
+        assert!(text.find("\"type\"").unwrap() < text.find("\"javaArgs\"").unwrap());
+    }
+
+    #[test]
+    fn icon_lookups_stay_inside_their_directories() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let outside = temp.path().join("secret.png");
+        fs::write(&outside, b"x").expect("outside file");
+        let root = temp.path().join("multimc");
+        fs::create_dir_all(root.join("icons")).expect("icons");
+        fs::create_dir_all(root.join("instances/one")).expect("instance");
+        fs::write(
+            root.join("instances/one/instance.cfg"),
+            "name=One\niconKey=../../secret\n",
+        )
+        .expect("config");
+        let instances = discover_multimc_instances(&root, LauncherKind::MultiMc).expect("found");
+        assert!(instances[0].icon_path.is_none());
+        assert!(is_safe_icon_key("flame"));
+        assert!(!is_safe_icon_key("../x"));
+        assert!(!is_safe_icon_key("a/b"));
+
+        let instance = temp.path().join("Instances/Pack");
+        fs::create_dir_all(instance.join("profileImage")).expect("instance");
+        fs::write(instance.join("profileImage/icon.png"), b"x").expect("icon");
+        assert!(contained_file(&instance, Path::new("profileImage/icon.png")).is_some());
+        assert!(contained_file(&instance, &outside).is_none());
+        assert!(contained_file(&instance, Path::new("../../secret.png")).is_none());
     }
 }

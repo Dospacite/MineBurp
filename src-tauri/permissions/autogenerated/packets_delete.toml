@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-packets-delete"
+description = "Enables the packets_delete command without any pre-configured scope."
+commands.allow = ["packets_delete"]
+
+[[permission]]
+identifier = "deny-packets-delete"
+description = "Denies the packets_delete command without any pre-configured scope."
+commands.deny = ["packets_delete"]

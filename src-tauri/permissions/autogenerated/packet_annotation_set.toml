@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-packet-annotation-set"
+description = "Enables the packet_annotation_set command without any pre-configured scope."
+commands.allow = ["packet_annotation_set"]
+
+[[permission]]
+identifier = "deny-packet-annotation-set"
+description = "Denies the packet_annotation_set command without any pre-configured scope."
+commands.deny = ["packet_annotation_set"]

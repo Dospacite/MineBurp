@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-network-conditions-get"
+description = "Enables the network_conditions_get command without any pre-configured scope."
+commands.allow = ["network_conditions_get"]
+
+[[permission]]
+identifier = "deny-network-conditions-get"
+description = "Denies the network_conditions_get command without any pre-configured scope."
+commands.deny = ["network_conditions_get"]

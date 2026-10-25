@@ -25,7 +25,7 @@ If assistance is needed, fully stop every running Minecraft process before relau
 
 The desktop app then presents its own RSA key to the client, decrypts the client-side AES stream, re-encrypts a separate stream to the real server, and records decoded frames between the two links. The loopback port is private to that route, bound only on `127.0.0.1`, and is never shown as a user-managed listener. If route setup fails, the agent leaves the original destination untouched.
 
-This client-assisted route adapter avoids silently installing privileged TUN or `nftables` rules. It deliberately ignores Netty connects without a `net.minecraft.*` caller, leaving separate launcher/mod TLS traffic — including certificate-pinned traffic — outside MineBurp's decrypt path.
+This client-assisted route adapter avoids silently installing privileged TUN or `nftables` rules. It deliberately ignores any Netty connect whose direct caller is not Minecraft's own connection class — matched by name under Mojang, MCP, intermediary, and Yarn naming, and on obfuscated releases by shape, as a default-package Netty inbound handler — leaving separate launcher/mod TLS traffic — including certificate-pinned traffic — outside MineBurp's decrypt path.
 
 ## Authentication sequence
 
@@ -47,13 +47,26 @@ MineBurp terminates the client-facing and upstream-facing RSA handshakes with di
 
 The desktop app creates a random loopback TCP port and a 256-bit capability on every start. It atomically writes `client-assistance.properties` into the per-user application configuration directory with mode `0600` on Unix. The desktop API exposes the endpoint and JVM argument for setup, but never the capability.
 
-The line protocol is deliberately small:
+The line protocol is deliberately small. Every connection opens with a mutual challenge, version 2 of the protocol:
 
-- `HELLO` authenticates the agent connection with the protocol version and capability.
-- `READY` registers a URL-safe-base64 client hash and profile identifier.
+```text
+agent  → HELLO      2  <agent nonce>
+broker → CHALLENGE  <broker nonce>  <broker proof>
+agent  → AUTH       <agent proof>
+broker → HELLO_OK   <agent id>
+agent  → SESSION | ROUTE <host> <port>
+```
+
+Nonces are 32 random bytes; nonces and proofs are URL-safe base64 without padding. A proof is HMAC-SHA256 keyed by the capability over a role label (`mineburp-client-assistance-v2 broker` or `… agent`), a zero byte, the agent nonce, and the broker nonce. The capability never crosses the socket. The broker proves itself first: an agent that cannot verify the broker's proof closes the connection without sending `AUTH`, registers no session with it, and follows none of its routes. Because each side contributes a fresh nonce, a recorded `AUTH` or `CHALLENGE` is useless on any other connection. A broker that receives another protocol version answers `ERROR unsupported_protocol 2`, and the agent reports the mismatch once and stays off.
+
+After the handshake:
+
+- `SESSION` keeps the connection open for Authlib joins; `READY` registers a URL-safe-base64 client hash and profile identifier on it.
 - `ROUTE` asks for a private port for one original host and port; `ROUTE_OK` returns that port and closes the short-lived route request.
 - `JOIN` contains a random request ID plus the client and upstream hashes.
 - `RESULT` reports success or a sanitized error.
+
+The handshake and the purpose line must arrive within 5 seconds, and at most 64 broker connections may be open at once. A `READY` session expires after 60 seconds. An agent can only register, replace, and answer its own sessions: a client hash another agent holds is not overwritten, a `RESULT` counts only from the agent its `JOIN` was sent to, and pending joins fail as soon as their agent disconnects.
 
 Access and refresh tokens are not fields in this protocol. The Java agent holds only the objects already passed to Authlib, clears each credential after its one allowed assisted join or after 60 seconds, and never logs token values. Routes are consumed before a `JOIN` is sent and results time out. The agent accepts only a loopback broker address and the Rust broker rejects non-loopback peers.
 

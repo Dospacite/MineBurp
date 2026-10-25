@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-auth-complete"
+description = "Enables the auth_complete command without any pre-configured scope."
+commands.allow = ["auth_complete"]
+
+[[permission]]
+identifier = "deny-auth-complete"
+description = "Denies the auth_complete command without any pre-configured scope."
+commands.deny = ["auth_complete"]

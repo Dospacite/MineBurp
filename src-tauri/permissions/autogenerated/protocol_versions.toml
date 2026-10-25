@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-protocol-versions"
+description = "Enables the protocol_versions command without any pre-configured scope."
+commands.allow = ["protocol_versions"]
+
+[[permission]]
+identifier = "deny-protocol-versions"
+description = "Denies the protocol_versions command without any pre-configured scope."
+commands.deny = ["protocol_versions"]

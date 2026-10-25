@@ -19,6 +19,12 @@ thiserror.workspace = true
 url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+keyring = { version = "3.6", optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+os-keyring = ["keyring", "tokio"]
 
 [lints]
 workspace = true

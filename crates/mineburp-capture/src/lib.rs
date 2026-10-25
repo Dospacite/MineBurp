@@ -14,9 +14,20 @@ use thiserror::Error;
 use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
+mod import;
 mod minecraft_filter;
+mod minecraft_stream;
+mod packet;
+mod pcap;
+mod pipeline;
+mod reassembly;
+mod synthetic;
 mod system_backend;
 
+pub use import::{ImportOptions, ImportSummary, import_capture};
+pub use minecraft_stream::ImportedPacket;
+pub use pcap::{CaptureReader, CaptureRecord, EXPORT_INTERFACE, MAX_RECORD, PcapngWriter};
+pub use synthetic::{SYNTHETIC_LINKTYPE, SyntheticEndpoints, SyntheticStreams};
 pub use system_backend::SystemCapture;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,10 +41,27 @@ pub struct CaptureCapabilities {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CaptureStats {
+    /// Whether a capture is running right now; a capture whose dumpcap died
+    /// reports `false` with the reason in `last_error`.
+    pub running: bool,
+    /// Every record dumpcap delivered, attributed or not.
     pub frames_seen: u64,
     pub bytes_seen: u64,
+    /// Frames published for Minecraft flows, after reassembly.
     pub frames_emitted: u64,
+    pub bytes_emitted: u64,
+    /// Minecraft-flow frames that could not be kept.
     pub frames_dropped: u64,
+    /// Frames waiting for their flow to be attributed.
+    pub frames_held: u64,
+    /// Retransmitted segments removed.
+    pub retransmissions: u64,
+    /// Segments that arrived out of order and were put back in sequence.
+    pub reordered: u64,
+    /// Sequence holes that never filled and were skipped.
+    pub gaps: u64,
+    pub errors: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +107,12 @@ impl Default for NoopCapture {
     }
 }
 
+/// Noop backend used on platforms without a native capture implementation.
+/// On Windows this would require `WinPcap`/`Npcap` with `GetExtendedTcpTable`;
+/// on macOS it would use `lsof`/`proc_pidinfo`. Both remain future work and
+/// intentionally report unavailable rather than claiming attribution they cannot prove.
 #[async_trait]
+#[allow(clippy::doc_markdown)]
 impl SideCapture for NoopCapture {
     fn capabilities(&self) -> CaptureCapabilities {
         CaptureCapabilities {

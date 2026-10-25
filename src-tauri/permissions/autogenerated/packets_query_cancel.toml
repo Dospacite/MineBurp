@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-packets-query-cancel"
+description = "Enables the packets_query_cancel command without any pre-configured scope."
+commands.allow = ["packets_query_cancel"]
+
+[[permission]]
+identifier = "deny-packets-query-cancel"
+description = "Denies the packets_query_cancel command without any pre-configured scope."
+commands.deny = ["packets_query_cancel"]

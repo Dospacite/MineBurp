@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-intercept-resolve"
+description = "Enables the intercept_resolve command without any pre-configured scope."
+commands.allow = ["intercept_resolve"]
+
+[[permission]]
+identifier = "deny-intercept-resolve"
+description = "Denies the intercept_resolve command without any pre-configured scope."
+commands.deny = ["intercept_resolve"]

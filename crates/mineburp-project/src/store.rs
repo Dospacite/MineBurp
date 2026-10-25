@@ -1,25 +1,47 @@
 use std::{
+    io::Read as _,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use mineburp_core::{
     Comparison, ConnectionSnapshot, Direction, Disposition, FilterExpression, FilterField,
-    FilterValue, InterceptRule, PacketDetail, PacketSummary, ProtocolState, RepeaterTab,
-    ReplacementRule, Target, TrafficSource,
+    FilterValue, PacketDetail, PacketSummary, ProtocolState, RepeaterTab, ReplacementRule, Target,
+    TrafficSource,
 };
 use mineburp_protocol::SchemaPack;
 use parking_lot::Mutex;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, ErrorCode, InterruptHandle, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior, params, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroize as _;
 
-const PROJECT_SCHEMA_VERSION: i32 = 3;
+const PROJECT_SCHEMA_VERSION: i32 = 5;
+
+/// How long one read query may run before it is interrupted.
+///
+/// A payload search over a long capture decompresses a blob per row; without a
+/// ceiling one search could hold a reader for minutes. The UI reports the
+/// interruption and the operator narrows the filter.
+pub const DEFAULT_QUERY_BUDGET: Duration = Duration::from_secs(15);
+
+/// Read connections per project. Reads never wait on the writer (WAL), and
+/// with a few of them a long search does not make the next page wait either.
+const READER_COUNT: usize = 3;
+
+/// Rows inserted between two `PRAGMA optimize` runs.
+const OPTIMIZE_EVERY: u64 = 50_000;
 
 const INSERT_PACKET_SQL: &str = "INSERT INTO packets(
         sequence, connection_id, timestamp_micros, source, direction, state,
@@ -180,7 +202,13 @@ pub struct PacketQuery {
     pub before_id: Option<i64>,
     /// Keyset cursor for the live tail (`id > after_id`), used to append new
     /// packets without re-reading and re-rendering the page the operator is on.
+    ///
+    /// With only this cursor set, the page is the *oldest* `limit` rows after
+    /// it (still returned newest first), so a tail that fell more than a page
+    /// behind catches up page by page instead of skipping the rows between.
     pub after_id: Option<i64>,
+    /// Only bookmarked (`Some(true)`) or only unbookmarked (`Some(false)`) rows.
+    pub bookmarked: Option<bool>,
 }
 
 /// A slice of one packet's payload plus everything needed to describe it.
@@ -216,13 +244,87 @@ pub enum ProjectError {
     InvalidSearch(String),
     #[error("filter is not valid: {0}")]
     InvalidFilter(String),
+    #[error("a project passphrase must not be empty; leave it unset for an unencrypted project")]
+    EmptyPassphrase,
+    #[error("query was stopped: {0}")]
+    Interrupted(String),
+    #[error("annotation is not valid: {0}")]
+    InvalidAnnotation(String),
+    #[error("packet {0} does not exist")]
+    PacketNotFound(i64),
+    #[error("project storage error: {0}")]
+    Storage(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct ProjectStore {
-    connection: Arc<Mutex<Connection>>,
+    /// The writer. Every insert, update, and migration goes through it; on a
+    /// read-only project it is also the only connection.
+    pub(crate) connection: Arc<Mutex<Connection>>,
+    /// Readers for history queries, so a long search never blocks capture's
+    /// writes and capture's writes never block a page load.
+    pub(crate) readers: Arc<ReaderPool>,
     info: ProjectInfo,
     read_only: bool,
+    budget_millis: Arc<AtomicU64>,
+    inserted_since_optimize: Arc<AtomicU64>,
+}
+
+/// A few read-only connections to the same file.
+pub(crate) struct ReaderPool {
+    connections: Vec<Mutex<Connection>>,
+    interrupts: Vec<InterruptHandle>,
+    next: AtomicUsize,
+}
+
+impl std::fmt::Debug for ReaderPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReaderPool")
+            .field("connections", &self.connections.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReaderPool {
+    fn open(path: &Path, passphrase: Option<&str>) -> Result<Self, ProjectError> {
+        let mut connections = Vec::with_capacity(READER_COUNT);
+        let mut interrupts = Vec::with_capacity(READER_COUNT);
+        for _ in 0..READER_COUNT {
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            configure_connection(&connection, passphrase, true)?;
+            interrupts.push(connection.get_interrupt_handle());
+            connections.push(Mutex::new(connection));
+        }
+        Ok(Self {
+            connections,
+            interrupts,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// An idle reader if there is one, otherwise the next in turn.
+    fn acquire(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        for connection in &self.connections {
+            if let Some(guard) = connection.try_lock() {
+                return guard;
+            }
+        }
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
+        self.connections[index].lock()
+    }
+}
+
+fn validate_passphrase(passphrase: Option<&str>) -> Result<(), ProjectError> {
+    // An empty SQLCipher key silently means "no encryption", which would leave
+    // a project the metadata calls encrypted readable as plain SQLite.
+    if passphrase.is_some_and(str::is_empty) {
+        return Err(ProjectError::EmptyPassphrase);
+    }
+    Ok(())
 }
 
 impl ProjectStore {
@@ -230,9 +332,22 @@ impl ProjectStore {
     pub fn create(
         path: impl AsRef<Path>,
         name: &str,
-        options: ProjectOptions,
+        mut options: ProjectOptions,
     ) -> Result<Self, ProjectError> {
-        let path = path.as_ref().to_path_buf();
+        let result = Self::create_inner(path.as_ref(), name, &options);
+        if let Some(passphrase) = options.passphrase.as_mut() {
+            passphrase.zeroize();
+        }
+        result
+    }
+
+    fn create_inner(
+        path: &Path,
+        name: &str,
+        options: &ProjectOptions,
+    ) -> Result<Self, ProjectError> {
+        validate_passphrase(options.passphrase.as_deref())?;
+        let path = path.to_path_buf();
         if path.exists() {
             return Err(ProjectError::AlreadyExists(path));
         }
@@ -254,21 +369,32 @@ impl ProjectStore {
                 "false"
             }],
         )?;
-        Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
-            info: ProjectInfo {
+        let readers = ReaderPool::open(&path, options.passphrase.as_deref())?;
+        Ok(Self::assemble(
+            connection,
+            readers,
+            ProjectInfo {
                 path,
                 name: name.to_owned(),
                 encrypted: options.passphrase.is_some(),
                 schema_version: PROJECT_SCHEMA_VERSION,
             },
-            read_only: false,
-        })
+            false,
+        ))
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn open(path: impl AsRef<Path>, options: ProjectOptions) -> Result<Self, ProjectError> {
-        let path = path.as_ref().to_path_buf();
+    pub fn open(path: impl AsRef<Path>, mut options: ProjectOptions) -> Result<Self, ProjectError> {
+        let result = Self::open_inner(path.as_ref(), &options);
+        if let Some(passphrase) = options.passphrase.as_mut() {
+            passphrase.zeroize();
+        }
+        result
+    }
+
+    fn open_inner(path: &Path, options: &ProjectOptions) -> Result<Self, ProjectError> {
+        validate_passphrase(options.passphrase.as_deref())?;
+        let path = path.to_path_buf();
         let flags = if options.read_only {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
         } else {
@@ -287,6 +413,10 @@ impl ProjectStore {
         }
         if !options.read_only {
             migrate(&connection)?;
+            // Gathers planner statistics where they are missing or stale, so
+            // the history queries pick their indexes. Bounded by
+            // `analysis_limit`, so a large project does not make opening slow.
+            connection.execute_batch("PRAGMA analysis_limit=1000; PRAGMA optimize=0x10002;")?;
         }
         let name = meta_value(&connection, "name")?.unwrap_or_else(|| {
             path.file_stem()
@@ -296,15 +426,95 @@ impl ProjectStore {
         });
         let encrypted = meta_value(&connection, "encrypted")?.is_some_and(|value| value == "true")
             || options.passphrase.is_some();
-        Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
-            info: ProjectInfo {
+        let readers = ReaderPool::open(&path, options.passphrase.as_deref())?;
+        Ok(Self::assemble(
+            connection,
+            readers,
+            ProjectInfo {
                 path,
                 name,
                 encrypted,
                 schema_version: PROJECT_SCHEMA_VERSION,
             },
-            read_only: options.read_only,
+            options.read_only,
+        ))
+    }
+
+    fn assemble(
+        connection: Connection,
+        readers: ReaderPool,
+        info: ProjectInfo,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            connection: Arc::new(Mutex::new(connection)),
+            readers: Arc::new(readers),
+            info,
+            read_only,
+            budget_millis: Arc::new(AtomicU64::new(
+                u64::try_from(DEFAULT_QUERY_BUDGET.as_millis()).unwrap_or(u64::MAX),
+            )),
+            inserted_since_optimize: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Changes how long a read query may run before it is interrupted.
+    pub fn set_query_budget(&self, budget: Duration) {
+        self.budget_millis.store(
+            u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Stops every read query running right now; each fails with
+    /// [`ProjectError::Interrupted`]. Writes are not affected.
+    pub fn interrupt_reads(&self) {
+        for handle in &self.readers.interrupts {
+            handle.interrupt();
+        }
+    }
+
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Runs `work` on a reader under the query budget.
+    pub(crate) fn with_reader<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, ProjectError>,
+    ) -> Result<T, ProjectError> {
+        let connection = self.readers.acquire();
+        let budget = Duration::from_millis(self.budget_millis.load(Ordering::Relaxed));
+        let deadline = Instant::now() + budget;
+        let expired = Arc::new(AtomicBool::new(false));
+        let flag = expired.clone();
+        connection.progress_handler(
+            10_000,
+            Some(move || {
+                let over = Instant::now() >= deadline;
+                if over {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                over
+            }),
+        )?;
+        let result = work(&connection);
+        connection.progress_handler(0, None::<fn() -> bool>)?;
+        result.map_err(|error| match error {
+            ProjectError::Database(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == ErrorCode::OperationInterrupted =>
+            {
+                ProjectError::Interrupted(if expired.load(Ordering::Relaxed) {
+                    format!(
+                        "it ran longer than {} s; narrow the filter or the payload search",
+                        budget.as_secs()
+                    )
+                } else {
+                    "a newer query replaced it".into()
+                })
+            }
+            other => other,
         })
     }
 
@@ -357,36 +567,37 @@ impl ProjectStore {
     /// is the only listing that can offer the operator all of the traffic the
     /// history actually contains.
     pub fn list_connections(&self, limit: usize) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
-        let connection = self.connection.lock();
-        let mut statement = connection.prepare_cached(
-            "SELECT id, target_host, target_port, listener_address, status, state,
-                    protocol_version, minecraft_version, loader, compression_threshold,
-                    encrypted_client, encrypted_server, packet_count, byte_count, last_error
-             FROM connections ORDER BY packet_count DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok(ConnectionSnapshot {
-                id: parse_uuid(&row.get::<_, String>(0)?)?,
-                target: Target {
-                    host: row.get(1)?,
-                    port: row.get(2)?,
-                },
-                listener_address: row.get(3)?,
-                status: parse_json(&row.get::<_, String>(4)?)?,
-                state: parse_json(&row.get::<_, String>(5)?)?,
-                protocol_version: row.get(6)?,
-                minecraft_version: row.get(7)?,
-                loader: row.get(8)?,
-                compression_threshold: row.get(9)?,
-                encrypted_client: row.get(10)?,
-                encrypted_server: row.get(11)?,
-                packet_count: row_u64(row, 12)?,
-                byte_count: row_u64(row, 13)?,
-                last_error: row.get(14)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(ProjectError::from)
+        self.with_reader(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT id, target_host, target_port, listener_address, status, state,
+                        protocol_version, minecraft_version, loader, compression_threshold,
+                        encrypted_client, encrypted_server, packet_count, byte_count, last_error
+                 FROM connections ORDER BY packet_count DESC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(ConnectionSnapshot {
+                    id: parse_uuid(&row.get::<_, String>(0)?)?,
+                    target: Target {
+                        host: row.get(1)?,
+                        port: row.get(2)?,
+                    },
+                    listener_address: row.get(3)?,
+                    status: parse_json(&row.get::<_, String>(4)?)?,
+                    state: parse_json(&row.get::<_, String>(5)?)?,
+                    protocol_version: row.get(6)?,
+                    minecraft_version: row.get(7)?,
+                    loader: row.get(8)?,
+                    compression_threshold: row.get(9)?,
+                    encrypted_client: row.get(10)?,
+                    encrypted_server: row.get(11)?,
+                    packet_count: row_u64(row, 12)?,
+                    byte_count: row_u64(row, 13)?,
+                    last_error: row.get(14)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(ProjectError::from)
+        })
     }
 
     /// Inserts a batch of packets in one transaction.
@@ -417,30 +628,58 @@ impl ProjectStore {
             }
         }
         transaction.commit()?;
+        drop(connection);
+        self.note_inserted(ids.len());
         Ok(ids)
     }
 
+    /// Keeps planner statistics current as the capture grows: every
+    /// [`OPTIMIZE_EVERY`] rows the writer runs a bounded `PRAGMA optimize`.
+    fn note_inserted(&self, count: usize) {
+        let total = self
+            .inserted_since_optimize
+            .fetch_add(count as u64, Ordering::Relaxed)
+            + count as u64;
+        if total >= OPTIMIZE_EVERY {
+            self.inserted_since_optimize.store(0, Ordering::Relaxed);
+            let _ = self
+                .connection
+                .lock()
+                .execute_batch("PRAGMA analysis_limit=1000; PRAGMA optimize;");
+        }
+    }
+
     /// Reads one packet's metadata plus a bounded slice of its payload.
+    ///
+    /// Only the bytes up to the end of the window are decompressed, so paging
+    /// through a multi-megabyte packet does not inflate all of it per page.
     pub fn packet_window(
         &self,
         id: i64,
         offset: usize,
         limit: usize,
     ) -> Result<Option<PacketWindow>, ProjectError> {
-        let Some(detail) = self.packet_detail(id)? else {
+        let Some(stored) = self.with_reader(|connection| read_stored_packet(connection, id))?
+        else {
             return Ok(None);
         };
-        let total_bytes = detail.logical_bytes.len();
+        let total_bytes = stored.summary.size;
         let start = offset.min(total_bytes);
         let end = start.saturating_add(limit).min(total_bytes);
+        let mut decoder = zstd::stream::Decoder::new(stored.compressed.as_slice())?;
+        std::io::copy(&mut (&mut decoder).take(start as u64), &mut std::io::sink())?;
+        let mut bytes = Vec::with_capacity(end - start);
+        (&mut decoder)
+            .take((end - start) as u64)
+            .read_to_end(&mut bytes)?;
         Ok(Some(PacketWindow {
-            summary: detail.summary,
-            wire: detail.wire,
-            stored_decoded: detail.decoded,
-            stored_decode_error: detail.decode_error,
+            summary: stored.summary,
+            wire: stored.wire,
+            stored_decoded: stored.decoded,
+            stored_decode_error: stored.decode_error,
             total_bytes,
             offset: start,
-            bytes: detail.logical_bytes.slice(start..end),
+            bytes: Bytes::from(bytes),
         }))
     }
 
@@ -452,7 +691,10 @@ impl ProjectStore {
             INSERT_PACKET_SQL,
             params_from_iter(packet_params(detail, &compressed)?),
         )?;
-        Ok(connection.last_insert_rowid())
+        let id = connection.last_insert_rowid();
+        drop(connection);
+        self.note_inserted(1);
+        Ok(id)
     }
 
     pub fn query_packets(
@@ -473,169 +715,141 @@ impl ProjectStore {
         &self,
         query: &PacketQuery,
     ) -> Result<Vec<PacketSummary>, ProjectError> {
-        let mut builder = ClauseBuilder::default();
-        if let Some(connection_id) = query.connection_id {
-            builder.push(
-                "connection_id = ?",
-                [Value::from(connection_id.to_string())],
-            );
-        }
-        builder.push_enum_set("direction", &query.directions)?;
-        builder.push_enum_set("state", &query.states)?;
-        builder.push_enum_set("source", &query.sources)?;
-        builder.push_enum_set("disposition", &query.dispositions)?;
-        if let Some(before_id) = query.before_id {
-            builder.push("id < ?", [Value::from(before_id)]);
-        }
-        if let Some(after_id) = query.after_id {
-            builder.push("id > ?", [Value::from(after_id)]);
-        }
-        if let Some(minimum) = query.min_size {
-            builder.push(
-                "size >= ?",
-                [Value::from(i64::try_from(minimum).unwrap_or(0))],
-            );
-        }
-        if let Some(maximum) = query.max_size {
-            builder.push(
-                "size <= ?",
-                [Value::from(i64::try_from(maximum).unwrap_or(i64::MAX))],
-            );
-        }
-        builder.push_name_list(&query.include_names, false);
-        builder.push_name_list(&query.exclude_names, true);
-        if let Some(search) = &query.search {
-            push_search(&mut builder, search)?;
-        }
-        if let Some(expression) = &query.expression {
-            let (sql, values) = compile_expression(expression)?;
-            builder.push_owned(sql, values);
-        }
-        // Deliberately last: every clause above answers from an indexed column,
-        // while this one decompresses a blob per surviving row. Pushing it to
-        // the end of the conjunction lets the cheap filters reject first.
-        let matcher = query
-            .content
-            .as_ref()
-            // Whitespace-only text yields no terms, and a matcher with no terms
-            // matches nothing — which would silently empty the history.
-            .filter(|content| !content.text.trim().is_empty())
-            .map(|content| {
-                ContentMatcher::compile(content).map(|matcher| (Arc::new(matcher), content.negate))
-            })
-            .transpose()?;
-        if let Some((_, negate)) = &matcher {
-            let call = "payload_search(logical_bytes_zstd, size)";
-            builder.push_owned(
-                if *negate {
-                    format!("NOT {call}")
-                } else {
-                    call.to_owned()
-                },
-                Vec::new(),
-            );
-        }
-
-        let where_clause = builder.where_clause();
+        let compiled = compile_query(query)?;
+        // A tail read (`after_id` alone) takes the oldest rows past the cursor:
+        // the newest ones would leave a hole whenever more than a page arrived
+        // between two reads.
+        let ascending = query.after_id.is_some() && query.before_id.is_none();
+        let order = if ascending { "ASC" } else { "DESC" };
         let sql = format!(
-            "SELECT id, sequence, connection_id, timestamp_micros, source, direction, state,
-                    protocol_version, packet_id, name, channel, loader, size, disposition, flow_json
-             FROM packets{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+            "SELECT {SUMMARY_COLUMNS} FROM packets{} ORDER BY id {order} LIMIT ? OFFSET ?",
+            compiled.where_clause
         );
-        let connection = self.connection.lock();
-        if let Some((matcher, _)) = matcher {
-            register_payload_search(&connection, matcher)?;
+        let mut rows = self.with_reader(|connection| {
+            compiled.install(connection)?;
+            let mut values = compiled.values.clone();
+            values.push(i64::try_from(query.limit).unwrap_or(i64::MAX).into());
+            values.push(i64::try_from(query.offset).unwrap_or(i64::MAX).into());
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(values), summary_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(ProjectError::from)
+        })?;
+        if ascending {
+            rows.reverse();
         }
-        let mut values = builder.values;
-        let mut statement = connection.prepare(&sql)?;
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<PacketSummary> {
-            let connection_text: String = row.get(2)?;
-            let source_text: String = row.get(4)?;
-            let direction_text: String = row.get(5)?;
-            let state_text: String = row.get(6)?;
-            let disposition_text: String = row.get(13)?;
-            let flow_text: Option<String> = row.get(14)?;
-            Ok(PacketSummary {
-                id: row.get(0)?,
-                sequence: row_u64(row, 1)?,
-                connection_id: parse_uuid(&connection_text)?,
-                timestamp_micros: row.get(3)?,
-                source: parse_json(&source_text)?,
-                direction: parse_json(&direction_text)?,
-                state: parse_json(&state_text)?,
-                protocol_version: row.get(7)?,
-                packet_id: row.get(8)?,
-                name: row.get(9)?,
-                channel: row.get(10)?,
-                loader: row.get(11)?,
-                size: row_usize(row, 12)?,
-                disposition: parse_json(&disposition_text)?,
-                flow: parse_optional_json(flow_text.as_deref())?,
-            })
-        };
-        values.push(i64::try_from(query.limit).unwrap_or(i64::MAX).into());
-        values.push(i64::try_from(query.offset).unwrap_or(i64::MAX).into());
-        let rows = statement.query_map(params_from_iter(values), map_row)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(ProjectError::from)
+        Ok(rows)
     }
 
     pub fn packet_detail(&self, id: i64) -> Result<Option<PacketDetail>, ProjectError> {
-        let connection = self.connection.lock();
-        connection
-            .query_row(
-                "SELECT id, sequence, connection_id, timestamp_micros, source, direction, state,
-                        protocol_version, packet_id, name, channel, loader, size, disposition,
-                        flow_json, logical_bytes_zstd, decoded_json, decode_error, wire_json
-                 FROM packets WHERE id=?1",
-                [id],
-                |row| {
-                    let flow_text: Option<String> = row.get(14)?;
-                    let compressed: Vec<u8> = row.get(15)?;
-                    let decoded_text: Option<String> = row.get(16)?;
-                    let wire_text: String = row.get(18)?;
-                    let logical =
-                        zstd::stream::decode_all(compressed.as_slice()).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                compressed.len(),
-                                rusqlite::types::Type::Blob,
-                                Box::new(error),
-                            )
-                        })?;
-                    Ok(PacketDetail {
-                        summary: PacketSummary {
-                            id: row.get(0)?,
-                            sequence: row_u64(row, 1)?,
-                            connection_id: parse_uuid(&row.get::<_, String>(2)?)?,
-                            timestamp_micros: row.get(3)?,
-                            source: parse_json(&row.get::<_, String>(4)?)?,
-                            direction: parse_json(&row.get::<_, String>(5)?)?,
-                            state: parse_json(&row.get::<_, String>(6)?)?,
-                            protocol_version: row.get(7)?,
-                            packet_id: row.get(8)?,
-                            name: row.get(9)?,
-                            channel: row.get(10)?,
-                            loader: row.get(11)?,
-                            size: row_usize(row, 12)?,
-                            disposition: parse_json(&row.get::<_, String>(13)?)?,
-                            flow: parse_optional_json(flow_text.as_deref())?,
-                        },
-                        logical_bytes: Bytes::from(logical),
-                        decoded: parse_optional_json(decoded_text.as_deref())?,
-                        decode_error: row.get(17)?,
-                        wire: parse_json(&wire_text)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(ProjectError::from)
+        let Some(stored) = self.with_reader(|connection| read_stored_packet(connection, id))?
+        else {
+            return Ok(None);
+        };
+        let logical = decode_payload(&stored.compressed, stored.summary.size)?;
+        Ok(Some(PacketDetail {
+            summary: stored.summary,
+            logical_bytes: Bytes::from(logical),
+            decoded: stored.decoded,
+            decode_error: stored.decode_error,
+            wire: stored.wire,
+        }))
     }
 
     pub fn checkpoint(&self) -> Result<(), ProjectError> {
-        self.connection
-            .lock()
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        if self.read_only {
+            return Ok(());
+        }
+        self.connection.lock().execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA analysis_limit=1000; PRAGMA optimize;",
+        )?;
         Ok(())
+    }
+
+    /// Copies everything this project holds into a new file and opens the copy.
+    ///
+    /// This is how a temporary session becomes a kept one: creating an empty
+    /// project in its place would discard every packet captured so far. The
+    /// copy is re-keyed with `passphrase` (or left plaintext without one), so
+    /// the new file does not inherit the source's encryption.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn save_as(
+        &self,
+        path: impl AsRef<Path>,
+        name: &str,
+        mut options: ProjectOptions,
+    ) -> Result<Self, ProjectError> {
+        let result = self.save_as_inner(path.as_ref(), name, &options);
+        if let Some(passphrase) = options.passphrase.as_mut() {
+            passphrase.zeroize();
+        }
+        result
+    }
+
+    fn save_as_inner(
+        &self,
+        path: &Path,
+        name: &str,
+        options: &ProjectOptions,
+    ) -> Result<Self, ProjectError> {
+        validate_passphrase(options.passphrase.as_deref())?;
+        let path = path.to_path_buf();
+        if path.exists() {
+            return Err(ProjectError::AlreadyExists(path));
+        }
+        let target = path
+            .to_str()
+            .ok_or_else(|| ProjectError::Corrupt("project path is not valid UTF-8".into()))?;
+        {
+            let connection = self.connection.lock();
+            let version: i32 =
+                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            // An empty key attaches the copy as plaintext SQLite.
+            connection.execute(
+                "ATTACH DATABASE ?1 AS saved KEY ?2",
+                params![target, options.passphrase.as_deref().unwrap_or("")],
+            )?;
+            let exported = connection
+                .query_row("SELECT sqlcipher_export('saved')", [], |_| Ok(()))
+                .and_then(|()| {
+                    connection.execute_batch(&format!("PRAGMA saved.user_version = {version};"))
+                });
+            connection.execute_batch("DETACH DATABASE saved;")?;
+            if let Err(error) = exported {
+                let _ = std::fs::remove_file(&path);
+                return Err(error.into());
+            }
+        }
+        let copy = Self::open_inner(
+            &path,
+            &ProjectOptions {
+                passphrase: options.passphrase.clone(),
+                read_only: false,
+            },
+        )?;
+        {
+            let connection = copy.connection.lock();
+            connection.execute(
+                "INSERT OR REPLACE INTO project_meta(key, value) VALUES ('name', ?1)",
+                [name],
+            )?;
+            connection.execute(
+                "INSERT OR REPLACE INTO project_meta(key, value) VALUES ('encrypted', ?1)",
+                [if options.passphrase.is_some() {
+                    "true"
+                } else {
+                    "false"
+                }],
+            )?;
+        }
+        Ok(Self {
+            info: ProjectInfo {
+                name: name.to_owned(),
+                encrypted: options.passphrase.is_some(),
+                ..copy.info.clone()
+            },
+            ..copy
+        })
     }
 
     pub fn save_schema_pack(&self, pack: &SchemaPack) -> Result<(), ProjectError> {
@@ -656,15 +870,12 @@ impl ProjectStore {
     }
 
     pub fn load_schema_packs(&self) -> Result<Vec<SchemaPack>, ProjectError> {
-        let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare("SELECT payload_json FROM schema_packs ORDER BY id ASC, version DESC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            let payload = row?;
-            serde_json::from_str(&payload).map_err(|error| ProjectError::Corrupt(error.to_string()))
+        self.with_reader(|connection| {
+            load_json_rows(
+                connection,
+                "SELECT payload_json FROM schema_packs ORDER BY id ASC, version DESC",
+            )
         })
-        .collect()
     }
 
     pub fn save_repeater_tab(&self, tab: &RepeaterTab) -> Result<(), ProjectError> {
@@ -691,48 +902,12 @@ impl ProjectStore {
     }
 
     pub fn load_repeater_tabs(&self) -> Result<Vec<RepeaterTab>, ProjectError> {
-        let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare("SELECT payload_json FROM repeater_tabs ORDER BY updated_at_micros DESC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            serde_json::from_str(&row?).map_err(|error| ProjectError::Corrupt(error.to_string()))
+        self.with_reader(|connection| {
+            load_json_rows(
+                connection,
+                "SELECT payload_json FROM repeater_tabs ORDER BY updated_at_micros DESC",
+            )
         })
-        .collect()
-    }
-
-    pub fn save_intercept_rules(&self, rules: &[InterceptRule]) -> Result<(), ProjectError> {
-        self.ensure_writable()?;
-        let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM intercept_rules", [])?;
-        for (position, rule) in rules.iter().enumerate() {
-            let payload = serde_json::to_string(rule)
-                .map_err(|error| ProjectError::Corrupt(error.to_string()))?;
-            transaction.execute(
-                "INSERT INTO intercept_rules(id, name, payload_json, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    rule.id.to_string(),
-                    rule.name,
-                    payload,
-                    i64::try_from(position).unwrap_or(i64::MAX),
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn load_intercept_rules(&self) -> Result<Vec<InterceptRule>, ProjectError> {
-        let connection = self.connection.lock();
-        let mut statement =
-            connection.prepare("SELECT payload_json FROM intercept_rules ORDER BY position ASC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            serde_json::from_str(&row?).map_err(|error| ProjectError::Corrupt(error.to_string()))
-        })
-        .collect()
     }
 
     pub fn save_replacement_rules(&self, rules: &[ReplacementRule]) -> Result<(), ProjectError> {
@@ -759,23 +934,215 @@ impl ProjectStore {
     }
 
     pub fn load_replacement_rules(&self) -> Result<Vec<ReplacementRule>, ProjectError> {
-        let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare("SELECT payload_json FROM replacement_rules ORDER BY position ASC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
-            serde_json::from_str(&row?).map_err(|error| ProjectError::Corrupt(error.to_string()))
+        self.with_reader(|connection| {
+            load_json_rows(
+                connection,
+                "SELECT payload_json FROM replacement_rules ORDER BY position ASC",
+            )
         })
-        .collect()
     }
 
-    fn ensure_writable(&self) -> Result<(), ProjectError> {
+    pub(crate) fn ensure_writable(&self) -> Result<(), ProjectError> {
         if self.read_only {
             Err(ProjectError::ReadOnly)
         } else {
             Ok(())
         }
     }
+}
+
+/// The columns [`summary_from_row`] reads, in order.
+pub(crate) const SUMMARY_COLUMNS: &str = "id, sequence, connection_id, timestamp_micros, source, \
+     direction, state, protocol_version, packet_id, name, channel, loader, size, disposition, \
+     flow_json";
+
+pub(crate) fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PacketSummary> {
+    let connection_text: String = row.get(2)?;
+    let source_text: String = row.get(4)?;
+    let direction_text: String = row.get(5)?;
+    let state_text: String = row.get(6)?;
+    let disposition_text: String = row.get(13)?;
+    let flow_text: Option<String> = row.get(14)?;
+    Ok(PacketSummary {
+        id: row.get(0)?,
+        sequence: row_u64(row, 1)?,
+        connection_id: parse_uuid(&connection_text)?,
+        timestamp_micros: row.get(3)?,
+        source: parse_json(&source_text)?,
+        direction: parse_json(&direction_text)?,
+        state: parse_json(&state_text)?,
+        protocol_version: row.get(7)?,
+        packet_id: row.get(8)?,
+        name: row.get(9)?,
+        channel: row.get(10)?,
+        loader: row.get(11)?,
+        size: row_usize(row, 12)?,
+        disposition: parse_json(&disposition_text)?,
+        flow: parse_optional_json(flow_text.as_deref())?,
+    })
+}
+
+/// One packet row with its payload still compressed.
+pub(crate) struct StoredPacket {
+    pub summary: PacketSummary,
+    pub compressed: Vec<u8>,
+    pub decoded: Option<serde_json::Value>,
+    pub decode_error: Option<String>,
+    pub wire: mineburp_core::WireMetadata,
+}
+
+pub(crate) fn read_stored_packet(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<StoredPacket>, ProjectError> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {SUMMARY_COLUMNS}, logical_bytes_zstd, decoded_json, decode_error, wire_json
+                 FROM packets WHERE id=?1"
+            ),
+            [id],
+            |row| {
+                let decoded_text: Option<String> = row.get(16)?;
+                let wire_text: String = row.get(18)?;
+                Ok(StoredPacket {
+                    summary: summary_from_row(row)?,
+                    compressed: row.get(15)?,
+                    decoded: parse_optional_json(decoded_text.as_deref())?,
+                    decode_error: row.get(17)?,
+                    wire: parse_json(&wire_text)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(ProjectError::from)
+}
+
+/// Decompresses a stored payload, refusing to produce more than the row's
+/// recorded size: a crafted project file must not be able to make opening one
+/// packet inflate gigabytes.
+pub(crate) fn decode_payload(compressed: &[u8], size: usize) -> Result<Vec<u8>, ProjectError> {
+    let mut output = Vec::with_capacity(size.min(16 * 1024 * 1024));
+    zstd::stream::Decoder::new(compressed)?
+        .take(size as u64 + 1)
+        .read_to_end(&mut output)?;
+    if output.len() > size {
+        return Err(ProjectError::Corrupt(format!(
+            "payload decompresses past its recorded size of {size} bytes"
+        )));
+    }
+    Ok(output)
+}
+
+/// A history filter compiled to SQL once, then run by whichever query needs
+/// it — a page, the statistics, an export, or a delete.
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledQuery {
+    /// Empty, or ` WHERE …`.
+    pub where_clause: String,
+    pub values: Vec<Value>,
+    matcher: Option<Arc<ContentMatcher>>,
+}
+
+impl CompiledQuery {
+    /// Registers the payload matcher on the connection about to run the query.
+    pub fn install(&self, connection: &Connection) -> Result<(), ProjectError> {
+        if let Some(matcher) = &self.matcher {
+            register_payload_search(connection, matcher.clone())?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn compile_query(query: &PacketQuery) -> Result<CompiledQuery, ProjectError> {
+    let mut builder = ClauseBuilder::default();
+    if let Some(connection_id) = query.connection_id {
+        builder.push(
+            "connection_id = ?",
+            [Value::from(connection_id.to_string())],
+        );
+    }
+    builder.push_enum_set("direction", &query.directions)?;
+    builder.push_enum_set("state", &query.states)?;
+    builder.push_enum_set("source", &query.sources)?;
+    builder.push_enum_set("disposition", &query.dispositions)?;
+    if let Some(before_id) = query.before_id {
+        builder.push("id < ?", [Value::from(before_id)]);
+    }
+    if let Some(after_id) = query.after_id {
+        builder.push("id > ?", [Value::from(after_id)]);
+    }
+    if let Some(minimum) = query.min_size {
+        builder.push(
+            "size >= ?",
+            [Value::from(i64::try_from(minimum).unwrap_or(0))],
+        );
+    }
+    if let Some(maximum) = query.max_size {
+        builder.push(
+            "size <= ?",
+            [Value::from(i64::try_from(maximum).unwrap_or(i64::MAX))],
+        );
+    }
+    if let Some(bookmarked) = query.bookmarked {
+        let membership = if bookmarked { "IN" } else { "NOT IN" };
+        builder.push(
+            &format!(
+                "id {membership} (SELECT packet_id FROM packet_annotations WHERE bookmarked = 1)"
+            ),
+            [],
+        );
+    }
+    builder.push_name_list(&query.include_names, false);
+    builder.push_name_list(&query.exclude_names, true);
+    if let Some(search) = &query.search {
+        push_search(&mut builder, search)?;
+    }
+    if let Some(expression) = &query.expression {
+        let (sql, values) = compile_expression(expression)?;
+        builder.push_owned(sql, values);
+    }
+    // Deliberately last: every clause above answers from an indexed column,
+    // while this one decompresses a blob per surviving row. Pushing it to the
+    // end of the conjunction lets the cheap filters reject first.
+    let matcher = query
+        .content
+        .as_ref()
+        // Whitespace-only text yields no terms, and a matcher with no terms
+        // matches nothing — which would silently empty the history.
+        .filter(|content| !content.text.trim().is_empty())
+        .map(|content| {
+            ContentMatcher::compile(content).map(|matcher| (Arc::new(matcher), content.negate))
+        })
+        .transpose()?;
+    if let Some((_, negate)) = &matcher {
+        let call = "payload_search(logical_bytes_zstd, size)";
+        builder.push_owned(
+            if *negate {
+                format!("NOT {call}")
+            } else {
+                call.to_owned()
+            },
+            Vec::new(),
+        );
+    }
+    Ok(CompiledQuery {
+        where_clause: builder.where_clause(),
+        values: builder.values,
+        matcher: matcher.map(|(matcher, _)| matcher),
+    })
+}
+
+fn load_json_rows<T: for<'de> Deserialize<'de>>(
+    connection: &Connection,
+    sql: &str,
+) -> Result<Vec<T>, ProjectError> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.map(|row| {
+        serde_json::from_str(&row?).map_err(|error| ProjectError::Corrupt(error.to_string()))
+    })
+    .collect()
 }
 
 fn configure_connection(
@@ -872,15 +1239,44 @@ fn register_regexp(connection: &Connection) -> Result<(), ProjectError> {
     Ok(())
 }
 
+/// Brings the schema up to [`PROJECT_SCHEMA_VERSION`], one version at a time.
+///
+/// Each step runs in its own immediate transaction together with its
+/// `user_version` bump, so a step that fails rolls back completely and leaves
+/// the project at the last version it fully reached.
 fn migrate(connection: &Connection) -> Result<(), ProjectError> {
     let current: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current > PROJECT_SCHEMA_VERSION {
         return Err(ProjectError::NewerSchema(current));
     }
-    if current < 1 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS project_meta(
+    for (version, sql) in MIGRATIONS {
+        if current < *version {
+            run_migration(connection, *version, sql)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn run_migration(
+    connection: &Connection,
+    version: i32,
+    sql: &str,
+) -> Result<(), ProjectError> {
+    // Dropping the transaction without committing rolls it back.
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    transaction.execute_batch(sql)?;
+    transaction.pragma_update(None, "user_version", version)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Every schema step. Steps are additive: tables and indexes are only ever
+/// added, so an older build's rows survive and a newer-compatible project
+/// still opens read-only.
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        1,
+        "             CREATE TABLE IF NOT EXISTS project_meta(
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
@@ -932,6 +1328,9 @@ fn migrate(connection: &Connection) -> Result<(), ProjectError> {
                payload_json TEXT NOT NULL,
                updated_at_micros INTEGER NOT NULL
              );
+             -- Interactive interception was removed, but the table stays so
+             -- migrations remain additive and a project written by an older
+             -- build still opens with its rows intact.
              CREATE TABLE IF NOT EXISTS intercept_rules(
                id TEXT PRIMARY KEY,
                name TEXT NOT NULL,
@@ -945,42 +1344,57 @@ fn migrate(connection: &Connection) -> Result<(), ProjectError> {
                payload_json TEXT NOT NULL,
                PRIMARY KEY(id, version)
              );
-             PRAGMA user_version=1;
-             COMMIT;",
-        )?;
-    }
-    if current < 2 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE INDEX IF NOT EXISTS idx_packets_history_state
-               ON packets(connection_id, source, direction, state, id DESC);
-             CREATE INDEX IF NOT EXISTS idx_packets_history_global
-               ON packets(source, direction, state, id DESC);
-             PRAGMA user_version=2;
-             COMMIT;",
-        )?;
-    }
-    if current < 3 {
-        add_replacement_rules(connection)?;
-    }
-    Ok(())
-}
-
-/// Schema 3: the rules that rewrite packets automatically.
-fn add_replacement_rules(connection: &Connection) -> Result<(), ProjectError> {
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS replacement_rules(
+",
+    ),
+    (
+        2,
+        "CREATE INDEX IF NOT EXISTS idx_packets_history_state
+           ON packets(connection_id, source, direction, state, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_packets_history_global
+           ON packets(source, direction, state, id DESC);",
+    ),
+    (
+        3,
+        "CREATE TABLE IF NOT EXISTS replacement_rules(
            id TEXT PRIMARY KEY,
            name TEXT NOT NULL,
            payload_json TEXT NOT NULL,
            position INTEGER NOT NULL
+         );",
+    ),
+    (
+        4,
+        "CREATE INDEX IF NOT EXISTS idx_packets_disposition ON packets(disposition);
+         CREATE INDEX IF NOT EXISTS idx_packets_size ON packets(size);",
+    ),
+    (
+        5,
+        // Expression indexes match the `LOWER(column)` the filters compile
+        // to, so a case-insensitive name or channel test is an index lookup
+        // rather than a scan. A single-column index is implicitly ordered by
+        // rowid, so `state = ? ORDER BY id DESC LIMIT n` reads n entries.
+        "CREATE INDEX IF NOT EXISTS idx_packets_name_lower ON packets(LOWER(name));
+         CREATE INDEX IF NOT EXISTS idx_packets_channel_lower ON packets(LOWER(channel));
+         CREATE INDEX IF NOT EXISTS idx_packets_state ON packets(state);
+         CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp_micros);
+         CREATE TABLE IF NOT EXISTS packet_annotations(
+           packet_id INTEGER PRIMARY KEY REFERENCES packets(id) ON DELETE CASCADE,
+           bookmarked INTEGER NOT NULL DEFAULT 0,
+           color TEXT,
+           note TEXT,
+           updated_at_micros INTEGER NOT NULL
          );
-         PRAGMA user_version=3;
-         COMMIT;",
-    )?;
-    Ok(())
-}
+         CREATE INDEX IF NOT EXISTS idx_packet_annotations_bookmarked
+           ON packet_annotations(packet_id) WHERE bookmarked = 1;
+         CREATE TABLE IF NOT EXISTS saved_filters(
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           filter_json TEXT NOT NULL,
+           created_at_micros INTEGER NOT NULL,
+           updated_at_micros INTEGER NOT NULL
+         );",
+    ),
+];
 
 /// Accumulates `WHERE` fragments alongside their bound values.
 ///
@@ -1003,21 +1417,34 @@ impl ClauseBuilder {
         self.values.extend(values);
     }
 
-    /// `column IN (…)` for a set of enum values; an empty set means "any".
+    /// A set of enum values; an empty set means "any".
+    ///
+    /// One value compiles to `column = ?`, which an index ordered by rowid
+    /// answers in history order. Several values compile to `+column IN (…)`:
+    /// the unary plus keeps the planner off that column's index, because an
+    /// `IN` over a handful of enum values selects a large share of the table,
+    /// and reading it through the index means sorting every match before the
+    /// first page — where a newest-first scan stops after one page.
     fn push_enum_set<T: Serialize>(
         &mut self,
         column: &str,
         selected: &[T],
     ) -> Result<(), ProjectError> {
-        if selected.is_empty() {
-            return Ok(());
-        }
-        let placeholders = vec!["?"; selected.len()].join(", ");
         let mut values = Vec::with_capacity(selected.len());
         for value in selected {
-            values.push(Value::from(enum_json(value)?));
+            let value = Value::from(enum_json(value)?);
+            if !values.contains(&value) {
+                values.push(value);
+            }
         }
-        self.push_owned(format!("{column} IN ({placeholders})"), values);
+        match values.len() {
+            0 => {}
+            1 => self.push_owned(format!("{column} = ?"), values),
+            count => {
+                let placeholders = vec!["?"; count].join(", ");
+                self.push_owned(format!("+{column} IN ({placeholders})"), values);
+            }
+        }
         Ok(())
     }
 
@@ -1327,7 +1754,7 @@ fn parse_hex(input: &str) -> Result<Vec<u8>, ProjectError> {
     if digits.is_empty() {
         return Ok(Vec::new());
     }
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return Err(ProjectError::InvalidSearch(
             "hex search needs complete byte pairs".into(),
         ));
@@ -1431,10 +1858,12 @@ fn compile_predicate(
             Comparison::GreaterOrEqual => ">=",
             Comparison::Less => "<",
             Comparison::LessOrEqual => "<=",
-            // `contains` on a number is a digit match in the evaluator.
+            // `contains` on a number is a digit match in the evaluator. The
+            // guard keeps an absent value false rather than NULL, so `NOT`
+            // around it behaves as it does in memory.
             Comparison::Contains => {
                 return Ok((
-                    format!("(CAST({column} AS TEXT) LIKE ? ESCAPE '\\')"),
+                    format!("({column} IS NOT NULL AND CAST({column} AS TEXT) LIKE ? ESCAPE '\\')"),
                     vec![Value::from(format!(
                         "%{}%",
                         escape_like(&number.to_string())
@@ -1452,14 +1881,13 @@ fn compile_predicate(
                 "`{column}` requires a text value"
             )));
         };
-        // Enum columns are stored as JSON, so an equality test compares against
-        // the quoted form while a substring test does not.
-        let stored = |text: &str| {
-            if field.is_enumerated() {
-                format!("\"{text}\"")
-            } else {
-                text.to_owned()
-            }
+        // Enum columns are stored as JSON strings; comparing the unquoted
+        // text keeps a quote in the operator's value from matching the
+        // storage quotes, which the in-memory evaluator never sees.
+        let subject = if field.is_enumerated() {
+            format!("TRIM({column}, '\"')")
+        } else {
+            column.to_owned()
         };
         let guard = if field.is_optional() {
             format!("{column} IS NOT NULL AND ")
@@ -1468,15 +1896,15 @@ fn compile_predicate(
         };
         match comparison {
             Comparison::Equal => (
-                format!("({guard}LOWER({column}) = LOWER(?))"),
-                vec![Value::from(stored(text))],
+                format!("({guard}LOWER({subject}) = LOWER(?))"),
+                vec![Value::from(text.clone())],
             ),
             Comparison::NotEqual => (
-                format!("({guard}LOWER({column}) <> LOWER(?))"),
-                vec![Value::from(stored(text))],
+                format!("({guard}LOWER({subject}) <> LOWER(?))"),
+                vec![Value::from(text.clone())],
             ),
             Comparison::Contains => (
-                format!("({guard}LOWER({column}) LIKE LOWER(?) ESCAPE '\\')"),
+                format!("({guard}LOWER({subject}) LIKE LOWER(?) ESCAPE '\\')"),
                 vec![Value::from(format!("%{}%", escape_like(text)))],
             ),
             Comparison::Greater
@@ -1521,7 +1949,7 @@ fn optional_json<T: Serialize>(value: Option<&T>) -> Result<Option<String>, Proj
         .map_err(|error| ProjectError::Corrupt(error.to_string()))
 }
 
-fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+pub(crate) fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(index)?;
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
@@ -1531,7 +1959,7 @@ fn row_usize(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<usize> {
     usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
-fn parse_json<T: for<'de> Deserialize<'de>>(value: &str) -> rusqlite::Result<T> {
+pub(crate) fn parse_json<T: for<'de> Deserialize<'de>>(value: &str) -> rusqlite::Result<T> {
     serde_json::from_str(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             value.len(),
@@ -1547,7 +1975,7 @@ fn parse_optional_json<T: for<'de> Deserialize<'de>>(
     value.map(parse_json).transpose()
 }
 
-fn parse_uuid(value: &str) -> rusqlite::Result<Uuid> {
+pub(crate) fn parse_uuid(value: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
             value.len(),
@@ -1567,7 +1995,7 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1580,8 +2008,8 @@ fn now_micros() -> i64 {
 mod tests {
     use bytes::Bytes;
     use mineburp_core::{
-        ConnectionStatus, Direction, Disposition, InterceptDecision, InterceptRule, PacketDetail,
-        PacketSummary, ProtocolState, RepeaterTab, Target, TrafficSource, WireMetadata,
+        ConnectionStatus, Direction, Disposition, PacketDetail, PacketSummary, ProtocolState,
+        RepeaterTab, Target, TrafficSource, WireMetadata,
     };
     use mineburp_protocol::{SchemaPack, SchemaPackManifest};
     use tempfile::tempdir;
@@ -2437,18 +2865,6 @@ mod tests {
         store.save_repeater_tab(&tab).unwrap();
         assert_eq!(store.load_repeater_tabs().unwrap(), vec![tab]);
 
-        let rule = InterceptRule {
-            id: Uuid::new_v4(),
-            name: "Hold plugin data".into(),
-            enabled: true,
-            expression: "channel contains fabric".into(),
-            action: InterceptDecision::Hold,
-        };
-        store
-            .save_intercept_rules(std::slice::from_ref(&rule))
-            .unwrap();
-        assert_eq!(store.load_intercept_rules().unwrap(), vec![rule]);
-
         let schema = SchemaPack {
             manifest: SchemaPackManifest {
                 id: "test.pack".into(),
@@ -2627,5 +3043,523 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn save_as_copies_history_and_rekeys() {
+        let directory = tempdir().unwrap();
+        let source = ProjectStore::create(
+            directory.path().join("session.mineburp"),
+            "Temporary session",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        source.save_connection(&snapshot(id)).unwrap();
+        for mut summary in corpus() {
+            summary.connection_id = id;
+            source
+                .insert_packet(&PacketDetail {
+                    summary,
+                    logical_bytes: Bytes::from_static(&[1, 2, 3]),
+                    decoded: None,
+                    decode_error: None,
+                    wire: WireMetadata::default(),
+                })
+                .unwrap();
+        }
+        let rules = vec![];
+        source.save_replacement_rules(&rules).unwrap();
+
+        let path = directory.path().join("kept.mineburp");
+        let secure = ProjectOptions {
+            passphrase: Some("correct horse".into()),
+            read_only: false,
+        };
+        let copy = source.save_as(&path, "Kept", secure.clone()).unwrap();
+        assert_eq!(copy.info().name, "Kept");
+        assert!(copy.info().encrypted);
+        let expected = source.query_packets(None, 0, 100).unwrap().len();
+        assert!(expected > 0);
+        assert_eq!(copy.query_packets(None, 0, 100).unwrap().len(), expected);
+        assert_eq!(copy.list_connections(10).unwrap().len(), 1);
+        drop(copy);
+
+        let reopened = ProjectStore::open(&path, secure).unwrap();
+        assert_eq!(reopened.info().name, "Kept");
+        assert_eq!(
+            reopened.query_packets(None, 0, 100).unwrap().len(),
+            expected
+        );
+        assert!(ProjectStore::open(&path, ProjectOptions::default()).is_err());
+        assert!(matches!(
+            source.save_as(&path, "Again", ProjectOptions::default()),
+            Err(ProjectError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn a_tail_read_returns_the_oldest_rows_past_its_cursor() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("tail.mineburp"),
+            "Tail",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let connection = Uuid::from_u128(3);
+        store.save_connection(&snapshot(connection)).unwrap();
+        let details = (1..=12)
+            .map(|sequence| packet(connection, sequence, b"x"))
+            .collect::<Vec<_>>();
+        let ids = store.insert_packets(&details).unwrap();
+        // Ten rows arrived since the cursor; a page of four must be the four
+        // right after it, not the newest four, or six rows are never seen.
+        let page = store
+            .query_packets_filtered(&PacketQuery {
+                after_id: Some(ids[1]),
+                limit: 4,
+                ..PacketQuery::default()
+            })
+            .unwrap();
+        let got = page.iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(got, vec![ids[5], ids[4], ids[3], ids[2]], "newest first");
+        // Paging the tail forward from the newest row seen reaches the end.
+        let next = store
+            .query_packets_filtered(&PacketQuery {
+                after_id: Some(ids[5]),
+                limit: 100,
+                ..PacketQuery::default()
+            })
+            .unwrap();
+        assert_eq!(next.len(), 6);
+        assert_eq!(next[0].id, ids[11]);
+    }
+
+    /// A corpus with the values that trip SQL/memory disagreements: absent
+    /// optional fields, mixed case, non-ASCII, and SQL wildcard characters.
+    fn parity_corpus() -> Vec<PacketSummary> {
+        let names: [Option<&str>; 9] = [
+            None,
+            Some("keep_alive"),
+            Some("KEEP_ALIVE"),
+            Some("Ärger"),
+            Some("ärger"),
+            Some("100%_done"),
+            Some("quote\"name"),
+            Some("back\\slash"),
+            Some(""),
+        ];
+        let channels = [None, Some("fabric:registry/sync"), Some("MINECRAFT:brand")];
+        let loaders = [None, Some("fabric"), Some("Forge")];
+        let states = [
+            ProtocolState::Play,
+            ProtocolState::Login,
+            ProtocolState::Opaque,
+            ProtocolState::Configuration,
+        ];
+        let dispositions = [
+            Disposition::Forwarded,
+            Disposition::Edited,
+            Disposition::Dropped,
+            Disposition::Observed,
+        ];
+        let connections = [Uuid::from_u128(7), Uuid::from_u128(0xabc)];
+        (0..72_usize)
+            .map(|index| PacketSummary {
+                id: 0,
+                sequence: index as u64 + 1,
+                connection_id: connections[index % 2],
+                timestamp_micros: i64::try_from(index).unwrap() * 1_000,
+                source: if index % 5 == 0 {
+                    TrafficSource::SideChannel
+                } else {
+                    TrafficSource::Minecraft
+                },
+                direction: if index % 3 == 0 {
+                    Direction::ServerToClient
+                } else {
+                    Direction::ClientToServer
+                },
+                state: states[index % states.len()],
+                protocol_version: [None, Some(767), Some(4)][index % 3],
+                packet_id: [None, Some(0), Some(1), Some(-5), Some(127)][index % 5],
+                name: names[index % names.len()].map(str::to_owned),
+                channel: channels[index % channels.len()].map(str::to_owned),
+                loader: loaders[(index / 2) % loaders.len()].map(str::to_owned),
+                size: [0, 8, 9, 10, 128, 1_400, 4_096][index % 7],
+                disposition: dispositions[(index / 3) % dispositions.len()],
+                flow: None,
+            })
+            .collect()
+    }
+
+    fn expression_strategy() -> impl proptest::strategy::Strategy<Value = FilterExpression> {
+        use mineburp_core::{Comparison, FilterField, FilterValue};
+        use proptest::prelude::*;
+
+        let fields = prop_oneof![
+            Just(FilterField::Source),
+            Just(FilterField::Direction),
+            Just(FilterField::State),
+            Just(FilterField::Protocol),
+            Just(FilterField::PacketId),
+            Just(FilterField::Name),
+            Just(FilterField::Channel),
+            Just(FilterField::Loader),
+            Just(FilterField::Size),
+            Just(FilterField::Disposition),
+            Just(FilterField::Connection),
+        ];
+        let comparisons = prop_oneof![
+            Just(Comparison::Equal),
+            Just(Comparison::NotEqual),
+            Just(Comparison::Greater),
+            Just(Comparison::GreaterOrEqual),
+            Just(Comparison::Less),
+            Just(Comparison::LessOrEqual),
+            Just(Comparison::Contains),
+        ];
+        let texts = proptest::sample::select(vec![
+            "",
+            "keep",
+            "KEEP_alive",
+            "alive",
+            "\"",
+            "%",
+            "_",
+            "\\",
+            "play",
+            "PLAY",
+            "login",
+            "client_to_server",
+            "server",
+            "fabric",
+            "FORGE",
+            "ärger",
+            "Ä",
+            "ÄRGER",
+            "x\"y",
+            "a b",
+            "opaque",
+            "side_channel",
+            "minecraft",
+            "edited",
+            "dropped",
+            "100%",
+            "00000000-0000-0000-0000-000000000007",
+            "abc",
+            "7",
+            "registry/",
+        ]);
+        let numbers = prop_oneof![
+            proptest::sample::select(vec![
+                -5_i64, -1, 0, 1, 4, 8, 9, 10, 12, 127, 767, 1_400, 4_096
+            ]),
+            -5_000_i64..5_000,
+        ];
+        let predicate =
+            (fields, comparisons, texts, numbers).prop_map(|(field, comparison, text, number)| {
+                FilterExpression::Predicate {
+                    field,
+                    comparison,
+                    value: if field.is_numeric() {
+                        FilterValue::Integer(number)
+                    } else {
+                        FilterValue::String(text.to_owned())
+                    },
+                }
+            });
+        let leaf = prop_oneof![9 => predicate, 1 => Just(FilterExpression::MatchAll)];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                inner.clone().prop_map(|expression| FilterExpression::Not {
+                    expression: Box::new(expression)
+                }),
+                proptest::collection::vec(inner.clone(), 0..4)
+                    .prop_map(|expressions| FilterExpression::And { expressions }),
+                proptest::collection::vec(inner, 0..4)
+                    .prop_map(|expressions| FilterExpression::Or { expressions }),
+            ]
+        })
+    }
+
+    #[test]
+    fn generated_expressions_select_the_same_packets_in_sql_and_in_memory() {
+        use proptest::test_runner::{Config, TestRunner};
+
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("parity.mineburp"),
+            "Parity",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let corpus = parity_corpus();
+        for connection in [Uuid::from_u128(7), Uuid::from_u128(0xabc)] {
+            store.save_connection(&snapshot(connection)).unwrap();
+        }
+        let details = corpus
+            .iter()
+            .map(|summary| PacketDetail {
+                summary: summary.clone(),
+                logical_bytes: Bytes::from(vec![0_u8; summary.size]),
+                decoded: None,
+                decode_error: None,
+                wire: WireMetadata::default(),
+            })
+            .collect::<Vec<_>>();
+        store.insert_packets(&details).unwrap();
+
+        let mut runner = TestRunner::new(Config {
+            cases: 600,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner
+            .run(&expression_strategy(), |expression| {
+                let in_memory = sequences(
+                    &corpus
+                        .iter()
+                        .filter(|summary| expression.matches(summary))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
+                let in_sql = sequences(
+                    &store
+                        .query_packets_filtered(&PacketQuery {
+                            expression: Some(expression.clone()),
+                            limit: 500,
+                            ..PacketQuery::default()
+                        })
+                        .map_err(|error| {
+                            proptest::test_runner::TestCaseError::fail(error.to_string())
+                        })?,
+                );
+                proptest::prop_assert_eq!(in_sql, in_memory, "expression {:?}", expression);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn query_plan(store: &ProjectStore, query: &PacketQuery) -> String {
+        let compiled = compile_query(query).unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT {SUMMARY_COLUMNS} FROM packets{} ORDER BY id DESC LIMIT 250",
+            compiled.where_clause
+        );
+        let connection = store.connection.lock();
+        let mut statement = connection.prepare(&sql).unwrap();
+        let rows = statement
+            .query_map(params_from_iter(compiled.values.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn history_queries_avoid_sorting_the_whole_match() {
+        let directory = tempdir().unwrap();
+        let (store, _) = seeded_store(&directory);
+        let multi_state = query_plan(
+            &store,
+            &PacketQuery {
+                states: vec![ProtocolState::Play, ProtocolState::Configuration],
+                ..PacketQuery::default()
+            },
+        );
+        assert!(
+            !multi_state.contains("TEMP B-TREE"),
+            "a multi-state page must not sort every match:\n{multi_state}"
+        );
+        let one_state = query_plan(
+            &store,
+            &PacketQuery {
+                states: vec![ProtocolState::Login],
+                ..PacketQuery::default()
+            },
+        );
+        assert!(!one_state.contains("TEMP B-TREE"), "{one_state}");
+        let name_lookup = query_plan(
+            &store,
+            &PacketQuery {
+                expression: Some(FilterExpression::parse("name == keep_alive").unwrap()),
+                ..PacketQuery::default()
+            },
+        );
+        assert!(!name_lookup.contains("TEMP B-TREE"), "{name_lookup}");
+        // The expression index is usable for the case-insensitive lookup.
+        let indexed = {
+            let connection = store.connection.lock();
+            let mut statement = connection
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT id FROM packets
+                     WHERE name IS NOT NULL AND LOWER(name) = LOWER(?1)",
+                )
+                .unwrap();
+            statement
+                .query_map(["keep_alive"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(indexed.contains("idx_packets_name_lower"), "{indexed}");
+    }
+
+    #[test]
+    fn an_empty_passphrase_is_refused_everywhere() {
+        let directory = tempdir().unwrap();
+        let empty = || ProjectOptions {
+            passphrase: Some(String::new()),
+            read_only: false,
+        };
+        let path = directory.path().join("empty.mineburp");
+        assert!(matches!(
+            ProjectStore::create(&path, "Empty", empty()),
+            Err(ProjectError::EmptyPassphrase)
+        ));
+        assert!(
+            !path.exists(),
+            "nothing is written for a refused passphrase"
+        );
+        let store = ProjectStore::create(&path, "Plain", ProjectOptions::default()).unwrap();
+        assert!(matches!(
+            store.save_as(directory.path().join("copy.mineburp"), "Copy", empty()),
+            Err(ProjectError::EmptyPassphrase)
+        ));
+        drop(store);
+        assert!(matches!(
+            ProjectStore::open(&path, empty()),
+            Err(ProjectError::EmptyPassphrase)
+        ));
+    }
+
+    #[test]
+    fn a_payload_that_inflates_past_its_size_is_refused() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("bomb.mineburp"),
+            "Bomb",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let connection = Uuid::from_u128(9);
+        store.save_connection(&snapshot(connection)).unwrap();
+        let id = store
+            .insert_packet(&packet(connection, 1, b"tiny"))
+            .unwrap();
+        // Swap in a blob that inflates to a megabyte while the row says 4 bytes.
+        let bomb = zstd::stream::encode_all(vec![0_u8; 1 << 20].as_slice(), 19).unwrap();
+        store
+            .connection
+            .lock()
+            .execute(
+                "UPDATE packets SET logical_bytes_zstd = ?1 WHERE id = ?2",
+                params![bomb, id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.packet_detail(id),
+            Err(ProjectError::Corrupt(_))
+        ));
+        // A window never decodes past its own end.
+        let window = store.packet_window(id, 0, 4).unwrap().unwrap();
+        assert_eq!(window.bytes.len(), 4);
+        assert_eq!(window.total_bytes, 4);
+    }
+
+    #[test]
+    fn packet_windows_decode_only_their_slice() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("window.mineburp"),
+            "Window",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let connection = Uuid::from_u128(10);
+        store.save_connection(&snapshot(connection)).unwrap();
+        let payload = (0..100_000_u32)
+            .map(|value| u8::try_from(value % 251).unwrap())
+            .collect::<Vec<_>>();
+        let id = store
+            .insert_packet(&packet(connection, 1, &payload))
+            .unwrap();
+        for (offset, limit) in [(0, 10), (99_990, 100), (50_000, 4_096), (200_000, 5)] {
+            let window = store.packet_window(id, offset, limit).unwrap().unwrap();
+            let start = offset.min(payload.len());
+            let end = (start + limit).min(payload.len());
+            assert_eq!(window.bytes.as_ref(), &payload[start..end]);
+            assert_eq!(window.offset, start);
+            assert_eq!(window.total_bytes, payload.len());
+        }
+    }
+
+    #[test]
+    fn a_failed_migration_step_rolls_back_entirely() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("migrate.mineburp"),
+            "Migrate",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let connection = store.connection.lock();
+        let error = run_migration(
+            &connection,
+            99,
+            "CREATE TABLE half_done(x INTEGER); SELECT no_such_function();",
+        );
+        assert!(error.is_err());
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, PROJECT_SCHEMA_VERSION);
+        let leftover: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'half_done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "the partial step was rolled back");
+        // The connection is usable afterwards: no transaction was left open.
+        connection.execute_batch("BEGIN; COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn reads_neither_block_writes_nor_outlive_their_budget() {
+        let directory = tempdir().unwrap();
+        let (store, _) = seeded_store(&directory);
+        let connection = Uuid::from_u128(11);
+        store.save_connection(&snapshot(connection)).unwrap();
+        // A writer insert from inside a read does not deadlock: they hold
+        // different connections.
+        store
+            .with_reader(|_| {
+                store.insert_packet(&packet(connection, 99, b"w"))?;
+                Ok(())
+            })
+            .unwrap();
+        store.set_query_budget(Duration::from_millis(20));
+        let result = store.with_reader(|reader| {
+            reader
+                .query_row(
+                    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n)
+                     SELECT COUNT(*) FROM n",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ProjectError::from)
+        });
+        assert!(
+            matches!(result, Err(ProjectError::Interrupted(ref reason)) if reason.contains("longer than")),
+            "{result:?}"
+        );
+        // The reader is fine afterwards.
+        store.set_query_budget(DEFAULT_QUERY_BUDGET);
+        assert!(!store.query_packets(None, 0, 10).unwrap().is_empty());
     }
 }

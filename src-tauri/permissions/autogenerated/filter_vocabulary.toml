@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-filter-vocabulary"
+description = "Enables the filter_vocabulary command without any pre-configured scope."
+commands.allow = ["filter_vocabulary"]
+
+[[permission]]
+identifier = "deny-filter-vocabulary"
+description = "Denies the filter_vocabulary command without any pre-configured scope."
+commands.deny = ["filter_vocabulary"]

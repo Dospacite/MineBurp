@@ -7,8 +7,7 @@
 
 use crate::varint::{decode_var_i32, decode_var_i64};
 
-/// Minecraft caps strings by character count; four bytes per character is the
-/// protocol's own upper bound on the byte length.
+/// Hard ceiling on any string's byte length, whatever budget a field claims.
 const MAX_STRING_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
@@ -107,10 +106,14 @@ impl<'a> Reader<'a> {
 
     /// A length-prefixed UTF-8 string, rejected when it exceeds the character
     /// budget the protocol gives that field.
+    ///
+    /// The rule is vanilla's `readUtf`: at most three bytes per character on
+    /// the wire, and the budget counts UTF-16 code units, so an emoji spends
+    /// two of them.
     pub fn string(&mut self, max_characters: usize) -> Option<String> {
         let start = self.cursor;
         let length = usize::try_from(self.var_i32()?).ok()?;
-        if length > MAX_STRING_BYTES || length > max_characters.saturating_mul(4) {
+        if length > MAX_STRING_BYTES || length > max_characters.saturating_mul(3) {
             self.cursor = start;
             return None;
         }
@@ -122,7 +125,7 @@ impl<'a> Reader<'a> {
             self.cursor = start;
             return None;
         };
-        if value.chars().count() > max_characters {
+        if value.encode_utf16().count() > max_characters {
             self.cursor = start;
             return None;
         }
@@ -231,6 +234,23 @@ mod tests {
             0,
             "a failed read must not consume the length prefix"
         );
+    }
+
+    #[test]
+    fn string_budgets_count_utf16_units() {
+        let emoji = "\u{1F600}";
+        let mut bytes = vec![4];
+        bytes.extend_from_slice(emoji.as_bytes());
+        assert_eq!(Reader::new(&bytes).string(2).as_deref(), Some(emoji));
+        assert_eq!(
+            Reader::new(&bytes).string(1),
+            None,
+            "one emoji is two UTF-16 units"
+        );
+        // Three bytes per character is the wire ceiling.
+        let mut long = vec![7];
+        long.extend_from_slice(b"abcdefg");
+        assert_eq!(Reader::new(&long).string(2), None);
     }
 
     fn pack(x: i64, y: i64, z: i64) -> i64 {

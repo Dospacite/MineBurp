@@ -6,9 +6,13 @@ Before submitting a change, run:
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace --exclude mineburp-desktop
-cargo check -p mineburp-capture
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+npm run typecheck
+npm run lint
+npm run test
 npm run build
+npm run test:agent
 ```
 
 On a Linux machine with the Tauri system prerequisites installed, also run `npm run tauri build -- --no-bundle`.

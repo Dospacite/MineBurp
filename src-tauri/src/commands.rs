@@ -3,32 +3,38 @@
     reason = "Tauri command state is supplied by its by-value State extractor"
 )]
 
-use std::path::PathBuf;
+use std::{io::Write as _, path::PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use mineburp_auth::{AuthClient, AuthConfig, MinecraftProfile, MinecraftSession};
-use mineburp_capture::{CaptureCapabilities, CaptureStats};
+use mineburp_capture::{CaptureCapabilities, CaptureStats, ImportOptions, ImportSummary};
 use mineburp_core::{
-    ConnectionSnapshot, Direction, Disposition, FilterExpression, FilterField, InterceptRule,
-    PacketEdit, PacketSummary, ProtocolState, RepeaterTab, ReplacementRule, TrafficSource,
+    ConnectionSnapshot, Direction, Disposition, FilterExpression, FilterField, PacketEdit,
+    PacketSummary, ProtocolState, RepeaterTab, ReplacementRule, TrafficSource,
 };
 use mineburp_launcher::{AgentSetupOutcome, InstanceDescriptor, LaunchOutcome, LaunchRequest};
 use mineburp_project::{
-    ContentMode, ContentQuery, ContentScope, PacketQuery, ProjectInfo, ProjectOptions,
-    ProjectStore, SearchTerm,
+    CompactSummary, ContentMode, ContentQuery, ContentScope, DeleteSummary, PacketAnnotation,
+    PacketQuery, ProjectInfo, ProjectOptions, ProjectStore, SavedFilter, SearchTerm, StatsOptions,
+    TrafficStats,
 };
 use mineburp_protocol::{
     DecodeContext, FieldKind, PacketInsight, PacketLayout, PacketRegistry, ProtocolVersion,
     SchemaPack, apply_edits, decode_schema, encode_field, inspect_logical, layout_logical,
 };
-use mineburp_proxy::HeldPacketDecision;
+use mineburp_proxy::{InterceptDecision, InterceptSettings, NetworkConditions};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use url::Url;
 use uuid::Uuid;
 
-use crate::state::{AuthenticatedAccount, DesktopState, PendingAuth};
+use crate::{
+    capture_project::persist,
+    export::{PcapExportSummary, write_pcapng},
+    paths::{PathPurpose, validate_path},
+    state::{AuthenticatedAccount, DesktopState, PendingAuth},
+};
 
 type CommandResult<T> = Result<T, String>;
 const AUTH_CALLBACK_URL: &str = "http://localhost:53682/callback";
@@ -48,16 +54,22 @@ pub struct DecryptModeStatus {
     active_sessions: usize,
 }
 
+/// Probing capture runs `dumpcap -D`, which can take seconds; a synchronous
+/// command would run it on the main thread and freeze the window.
 #[tauri::command]
-pub fn app_capabilities(state: State<'_, DesktopState>) -> AppCapabilities {
+pub async fn app_capabilities(state: State<'_, DesktopState>) -> CommandResult<AppCapabilities> {
+    let capture = state.capture.clone();
+    let side_capture = tauri::async_runtime::spawn_blocking(move || capture.capabilities())
+        .await
+        .map_err(|error| error.to_string())?;
     let registry = PacketRegistry::bundled();
     let protocols = registry.supported_protocols();
-    AppCapabilities {
-        side_capture: state.capture.capabilities(),
+    Ok(AppCapabilities {
+        side_capture,
         project_encryption: true,
         protocol_min: protocols.first().map_or(4, |entry| entry.protocol),
         protocol_max: protocols.last().map_or(4, |entry| entry.protocol),
-    }
+    })
 }
 
 #[tauri::command]
@@ -128,6 +140,7 @@ pub async fn project_create(
     name: String,
     passphrase: Option<String>,
 ) -> CommandResult<ProjectView> {
+    let path = validate_path(&path, PathPurpose::NewProject, &[])?;
     let store = tauri::async_runtime::spawn_blocking(move || {
         ProjectStore::create(
             path,
@@ -141,32 +154,7 @@ pub async fn project_create(
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
-    let info = store.info().clone();
-    let asset_store = store.clone();
-    let (packs, rules, replacements) = tauri::async_runtime::spawn_blocking(move || {
-        Ok::<_, mineburp_project::ProjectError>((
-            asset_store.load_schema_packs()?,
-            asset_store.load_intercept_rules()?,
-            asset_store.load_replacement_rules()?,
-        ))
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-    state
-        .proxy
-        .set_schema_packs(packs)
-        .map_err(|error| error.to_string())?;
-    state
-        .proxy
-        .set_intercept_rules(rules)
-        .map_err(|error| error.to_string())?;
-    state
-        .proxy
-        .set_replacement_rules(replacements)
-        .map_err(|error| error.to_string())?;
-    state.adopt_project(store);
-    Ok(ProjectView::new(info, false))
+    install_project(&state, store).await
 }
 
 #[tauri::command]
@@ -177,6 +165,7 @@ pub async fn project_open(
     read_only: Option<bool>,
 ) -> CommandResult<ProjectView> {
     let read_only = read_only.unwrap_or(false);
+    let path = validate_path(&path, PathPurpose::ExistingProject, &[])?;
     let store = tauri::async_runtime::spawn_blocking(move || {
         ProjectStore::open(
             path,
@@ -189,12 +178,43 @@ pub async fn project_open(
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
+    install_project(&state, store).await
+}
+
+/// Copies the open project — usually the temporary session — to `path` and
+/// switches to the copy, so everything captured so far is kept.
+#[tauri::command]
+pub async fn project_save_as(
+    state: State<'_, DesktopState>,
+    path: PathBuf,
+    name: String,
+    passphrase: Option<String>,
+) -> CommandResult<ProjectView> {
+    let source = current_project(&state)?;
+    let path = validate_path(&path, PathPurpose::NewProject, &[])?;
+    let store = tauri::async_runtime::spawn_blocking(move || {
+        source.save_as(
+            path,
+            &name,
+            ProjectOptions {
+                passphrase,
+                read_only: false,
+            },
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    install_project(&state, store).await
+}
+
+/// Loads a project's schema packs and rules into the proxy and makes it current.
+async fn install_project(state: &DesktopState, store: ProjectStore) -> CommandResult<ProjectView> {
     let info = store.info().clone();
     let asset_store = store.clone();
-    let (packs, rules, replacements) = tauri::async_runtime::spawn_blocking(move || {
+    let (packs, replacements) = tauri::async_runtime::spawn_blocking(move || {
         Ok::<_, mineburp_project::ProjectError>((
             asset_store.load_schema_packs()?,
-            asset_store.load_intercept_rules()?,
             asset_store.load_replacement_rules()?,
         ))
     })
@@ -204,10 +224,6 @@ pub async fn project_open(
     state
         .proxy
         .set_schema_packs(packs)
-        .map_err(|error| error.to_string())?;
-    state
-        .proxy
-        .set_intercept_rules(rules)
         .map_err(|error| error.to_string())?;
     state
         .proxy
@@ -260,6 +276,7 @@ pub async fn project_checkpoint(state: State<'_, DesktopState>) -> CommandResult
 /// already keeps it as a single piece of state.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PacketFilterInput {
     connection_id: Option<Uuid>,
     offset: usize,
@@ -276,7 +293,7 @@ pub struct PacketFilterInput {
     exclude_names: Vec<String>,
     min_size: Option<usize>,
     max_size: Option<usize>,
-    /// The operator's filter expression, in the same language intercept rules use.
+    /// The operator's filter expression, in the same language replacement rules use.
     expression: Option<String>,
     /// A search through the payload bytes rather than the row's metadata.
     content: Option<String>,
@@ -286,6 +303,8 @@ pub struct PacketFilterInput {
     content_negate: bool,
     before_id: Option<i64>,
     after_id: Option<i64>,
+    /// Only bookmarked rows (`true`) or only rows without a bookmark (`false`).
+    bookmarked: Option<bool>,
 }
 
 /// How the webview labels the payload-search modes.
@@ -381,6 +400,7 @@ impl PacketFilterInput {
             content,
             before_id: self.before_id,
             after_id: self.after_id,
+            bookmarked: self.bookmarked,
         })
     }
 }
@@ -396,6 +416,54 @@ pub async fn packets_query(
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
+}
+
+/// Writes every packet matching `filter` to `path` as a JSON array, newest first.
+///
+/// Pages through the history by id in the backend: a single history query is
+/// capped, and handing the webview the whole capture to serialise would stall it.
+/// Returns how many packets were written.
+#[tauri::command]
+pub async fn packets_export(
+    state: State<'_, DesktopState>,
+    path: PathBuf,
+    filter: PacketFilterInput,
+) -> CommandResult<usize> {
+    const EXPORT_PAGE: usize = 500;
+    let store = current_project(&state)?;
+    let path = validate_path(&path, PathPurpose::ExportJson, &[&store.info().path])?;
+    let mut query = filter.into_query()?;
+    query.limit = EXPORT_PAGE;
+    query.offset = 0;
+    query.after_id = None;
+    tauri::async_runtime::spawn_blocking(move || -> CommandResult<usize> {
+        let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
+        let mut out = std::io::BufWriter::new(file);
+        let mut written = 0usize;
+        out.write_all(b"[").map_err(|error| error.to_string())?;
+        loop {
+            let page = store
+                .query_packets_filtered(&query)
+                .map_err(|error| error.to_string())?;
+            for packet in &page {
+                if written > 0 {
+                    out.write_all(b",").map_err(|error| error.to_string())?;
+                }
+                out.write_all(b"\n  ").map_err(|error| error.to_string())?;
+                serde_json::to_writer(&mut out, packet).map_err(|error| error.to_string())?;
+                written += 1;
+            }
+            match page.last() {
+                Some(last) if page.len() == EXPORT_PAGE => query.before_id = Some(last.id),
+                _ => break,
+            }
+        }
+        out.write_all(b"\n]\n").map_err(|error| error.to_string())?;
+        out.flush().map_err(|error| error.to_string())?;
+        Ok(written)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// The vocabulary the filter expression accepts, for the UI's help affordance.
@@ -579,23 +647,38 @@ pub async fn packet_bytes(
     .map_err(|error| error.to_string())
 }
 
+/// Runs CPU-bound work on the blocking pool.
+///
+/// A synchronous Tauri command runs on the main thread, so decoding a large
+/// frame there froze the whole window for as long as the decode took.
+async fn off_main<T: Send + 'static>(
+    work: impl FnOnce() -> CommandResult<T> + Send + 'static,
+) -> CommandResult<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Walks a frame into editable field spans — the Repeater's decoded view.
 #[tauri::command]
-pub fn packet_layout(
+pub async fn packet_layout(
     logical_base64: String,
     protocol_state: ProtocolState,
     direction: Direction,
     protocol_version: Option<i32>,
 ) -> CommandResult<PacketLayout> {
-    let bytes = STANDARD
-        .decode(logical_base64)
-        .map_err(|error| error.to_string())?;
-    Ok(layout_logical(
-        protocol_state,
-        direction,
-        &bytes,
-        protocol_version,
-    ))
+    off_main(move || {
+        let bytes = STANDARD
+            .decode(logical_base64)
+            .map_err(|error| error.to_string())?;
+        Ok(layout_logical(
+            protocol_state,
+            direction,
+            &bytes,
+            protocol_version,
+        ))
+    })
+    .await
 }
 
 /// Re-encodes one decoded field and splices it back into the frame.
@@ -604,12 +687,22 @@ pub fn packet_layout(
 /// of every field kind — and the length prefix a resized field has to rewrite —
 /// lives in one place next to the decoder that produced the span.
 #[tauri::command]
-pub fn field_edit(
+pub async fn field_edit(
     logical_base64: String,
     offset: usize,
     length: usize,
     kind: FieldKind,
     value: serde_json::Value,
+) -> CommandResult<String> {
+    off_main(move || splice_field(&logical_base64, offset, length, kind, &value)).await
+}
+
+fn splice_field(
+    logical_base64: &str,
+    offset: usize,
+    length: usize,
+    kind: FieldKind,
+    value: &serde_json::Value,
 ) -> CommandResult<String> {
     let bytes = STANDARD
         .decode(logical_base64)
@@ -618,7 +711,7 @@ pub fn field_edit(
         .checked_add(length)
         .filter(|end| *end <= bytes.len())
         .ok_or("field span is outside the frame")?;
-    let encoded = encode_field(kind, &value)?;
+    let encoded = encode_field(kind, value)?;
     let mut edited = Vec::with_capacity(bytes.len() - length + encoded.len());
     edited.extend_from_slice(&bytes[..offset]);
     edited.extend_from_slice(&encoded);
@@ -629,21 +722,24 @@ pub fn field_edit(
 /// Decodes an arbitrary logical frame on demand — used by the Repeater, which
 /// composes frames that were never captured.
 #[tauri::command]
-pub fn inspect_bytes(
+pub async fn inspect_bytes(
     logical_base64: String,
     protocol_state: ProtocolState,
     direction: Direction,
     protocol_version: Option<i32>,
 ) -> CommandResult<PacketInsight> {
-    let bytes = STANDARD
-        .decode(logical_base64)
-        .map_err(|error| error.to_string())?;
-    Ok(inspect_logical(
-        protocol_state,
-        direction,
-        &bytes,
-        protocol_version,
-    ))
+    off_main(move || {
+        let bytes = STANDARD
+            .decode(logical_base64)
+            .map_err(|error| error.to_string())?;
+        Ok(inspect_logical(
+            protocol_state,
+            direction,
+            &bytes,
+            protocol_version,
+        ))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -652,30 +748,105 @@ pub fn proxy_sessions(state: State<'_, DesktopState>) -> Vec<ConnectionSnapshot>
 }
 
 #[tauri::command]
-pub async fn intercept_rules_set(
+pub fn intercept_settings_get(state: State<'_, DesktopState>) -> InterceptSettings {
+    state.proxy.intercept_settings()
+}
+
+/// Changes what Intercept holds; turning it off forwards everything held.
+#[tauri::command]
+pub fn intercept_settings_set(
     state: State<'_, DesktopState>,
-    rules: Vec<InterceptRule>,
-) -> CommandResult<()> {
+    settings: InterceptSettings,
+) -> CommandResult<InterceptSettings> {
     state
         .proxy
-        .set_intercept_rules(rules.clone())
+        .set_intercept_settings(settings)
         .map_err(|error| error.to_string())?;
-    let store = current_project(&state)?;
-    tauri::async_runtime::spawn_blocking(move || store.save_intercept_rules(&rules))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    Ok(state.proxy.intercept_settings())
+}
+
+/// A frame Intercept is holding, as the webview shows it.
+#[derive(Debug, Serialize)]
+pub struct InterceptedView {
+    id: u64,
+    summary: PacketSummary,
+    target: String,
+    held_at_micros: i64,
+    /// When the frame is forwarded automatically, if Intercept has a deadline.
+    deadline_micros: Option<i64>,
+    bytes_base64: String,
 }
 
 #[tauri::command]
-pub async fn intercept_rules_get(
+pub fn intercept_pending(state: State<'_, DesktopState>) -> Vec<InterceptedView> {
+    state
+        .proxy
+        .intercepted()
+        .into_iter()
+        .map(|held| InterceptedView {
+            id: held.id,
+            summary: held.summary,
+            target: held.target,
+            held_at_micros: held.held_at_micros,
+            deadline_micros: held.deadline_micros,
+            bytes_base64: STANDARD.encode(&held.logical_bytes),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptAction {
+    Forward,
+    Drop,
+}
+
+/// Releases one held frame. `logical_base64`, when given, replaces the frame.
+#[tauri::command]
+pub fn intercept_resolve(
     state: State<'_, DesktopState>,
-) -> CommandResult<Vec<InterceptRule>> {
-    let store = current_project(&state)?;
-    tauri::async_runtime::spawn_blocking(move || store.load_intercept_rules())
-        .await
-        .map_err(|error| error.to_string())?
+    id: u64,
+    action: InterceptAction,
+    logical_base64: Option<String>,
+) -> CommandResult<()> {
+    let decision = match (action, logical_base64) {
+        (InterceptAction::Drop, _) => InterceptDecision::Drop,
+        (InterceptAction::Forward, None) => InterceptDecision::Forward,
+        (InterceptAction::Forward, Some(encoded)) => InterceptDecision::Replace(Bytes::from(
+            STANDARD
+                .decode(encoded)
+                .map_err(|error| error.to_string())?,
+        )),
+    };
+    state
+        .proxy
+        .resolve_intercept(id, decision)
         .map_err(|error| error.to_string())
+}
+
+/// Forwards every held frame unchanged and returns how many there were.
+#[tauri::command]
+pub fn intercept_forward_all(state: State<'_, DesktopState>) -> usize {
+    state.proxy.forward_all_intercepted()
+}
+
+/// The delay, jitter and bandwidth limit applied to proxied connections.
+#[tauri::command]
+pub fn network_conditions_get(state: State<'_, DesktopState>) -> NetworkConditions {
+    state.proxy.network_conditions()
+}
+
+/// Changes network shaping for every proxied connection, open ones included.
+#[tauri::command]
+pub fn network_conditions_set(
+    state: State<'_, DesktopState>,
+    conditions: NetworkConditions,
+) -> CommandResult<NetworkConditions> {
+    state
+        .proxy
+        .set_network_conditions(conditions)
+        .map_err(|error| error.to_string())?;
+    Ok(state.proxy.network_conditions())
 }
 
 /// The rules that rewrite packets automatically, as the operator ordered them.
@@ -711,46 +882,22 @@ pub async fn replacement_rules_get(
 /// The rules tab uses this to show the operator what a rule does to a real
 /// packet before it is ever applied to live traffic.
 #[tauri::command]
-pub fn replacement_preview(
+pub async fn replacement_preview(
     logical_base64: String,
     protocol_state: ProtocolState,
     direction: Direction,
     protocol_version: Option<i32>,
     edits: Vec<PacketEdit>,
 ) -> CommandResult<String> {
-    let bytes = STANDARD
-        .decode(logical_base64)
-        .map_err(|error| error.to_string())?;
-    let rewritten = apply_edits(protocol_state, direction, protocol_version, &bytes, &edits)
-        .map_err(|error| error.to_string())?;
-    Ok(STANDARD.encode(rewritten))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum HeldResolution {
-    Forward,
-    Drop,
-    ReplaceBase64(String),
-}
-
-#[tauri::command]
-pub fn held_resolve(
-    state: State<'_, DesktopState>,
-    id: Uuid,
-    resolution: HeldResolution,
-) -> CommandResult<()> {
-    let resolution = match resolution {
-        HeldResolution::Forward => HeldPacketDecision::Forward,
-        HeldResolution::Drop => HeldPacketDecision::Drop,
-        HeldResolution::ReplaceBase64(value) => HeldPacketDecision::Replace(Bytes::from(
-            STANDARD.decode(value).map_err(|error| error.to_string())?,
-        )),
-    };
-    state
-        .proxy
-        .resolve_held(id, resolution)
-        .map_err(|error| error.to_string())
+    off_main(move || {
+        let bytes = STANDARD
+            .decode(logical_base64)
+            .map_err(|error| error.to_string())?;
+        let rewritten = apply_edits(protocol_state, direction, protocol_version, &bytes, &edits)
+            .map_err(|error| error.to_string())?;
+        Ok(STANDARD.encode(rewritten))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -954,14 +1101,11 @@ pub async fn auth_complete(
     callback_url: String,
 ) -> CommandResult<AuthSessionView> {
     let (code, returned_state) = parse_auth_callback(&callback_url)?;
-    let pending = state
-        .pending_auth
-        .write()
-        .take()
-        .ok_or("no sign-in is pending")?;
-    if pending.state != returned_state {
-        return Err("OAuth state did not match".into());
-    }
+    // The state is checked before the pending sign-in is taken: a stray or
+    // forged callback must not cancel the sign-in the operator is completing.
+    let pending = take_matching(&state.pending_auth, |pending| {
+        pending.state == returned_state
+    })?;
     let session = pending
         .client
         .exchange_code(&code, &pending.verifier)
@@ -977,6 +1121,20 @@ pub async fn auth_complete(
         .set_session_join_provider(Some(std::sync::Arc::new(account.clone())));
     *state.auth_session.write() = Some(account);
     Ok(view)
+}
+
+/// Takes the value out of `slot` only when `matches` accepts it, leaving a
+/// non-matching value in place.
+fn take_matching<T>(
+    slot: &parking_lot::RwLock<Option<T>>,
+    matches: impl FnOnce(&T) -> bool,
+) -> CommandResult<T> {
+    let mut slot = slot.write();
+    match slot.as_ref() {
+        None => Err("no sign-in is pending".into()),
+        Some(current) if !matches(current) => Err("OAuth state did not match".into()),
+        Some(_) => slot.take().ok_or_else(|| "no sign-in is pending".into()),
+    }
 }
 
 fn parse_auth_callback(callback_url: &str) -> CommandResult<(String, String)> {
@@ -1050,6 +1208,237 @@ pub fn auth_sign_out(state: State<'_, DesktopState>) {
     state.use_client_assist_provider();
 }
 
+/// Stops every history query that is running, e.g. a payload search the
+/// operator has replaced with a new filter.
+#[tauri::command]
+pub fn packets_query_cancel(state: State<'_, DesktopState>) -> CommandResult<()> {
+    current_project(&state)?.interrupt_reads();
+    Ok(())
+}
+
+/// Writes every packet matching `filter` to `path` as pcapng, oldest first,
+/// one synthetic TCP stream per connection. See `tools/wireshark/`.
+#[tauri::command]
+pub async fn packets_export_pcapng(
+    state: State<'_, DesktopState>,
+    path: PathBuf,
+    filter: PacketFilterInput,
+) -> CommandResult<PcapExportSummary> {
+    let store = current_project(&state)?;
+    let path = validate_path(&path, PathPurpose::ExportPcap, &[&store.info().path])?;
+    let mut query = filter.into_query()?;
+    query.offset = 0;
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
+        write_pcapng(&store, &query, std::io::BufWriter::new(file))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Reads a pcap or pcapng file into the open project.
+///
+/// Flows are recognised by server port (`options.serverPorts`, default
+/// 25565) because an imported file has no process to attribute them to.
+/// Retransmissions are removed and segments reordered exactly as in live
+/// capture, then each TCP stream is split into Minecraft packets: one row per
+/// packet, with its state, id and name. Encrypted or unsynchronised stream
+/// data is kept as labelled raw rows.
+#[tauri::command]
+pub async fn capture_import(
+    state: State<'_, DesktopState>,
+    path: PathBuf,
+    options: Option<ImportOptions>,
+) -> CommandResult<ImportSummary> {
+    const BATCH: usize = 512;
+    let store = current_project(&state)?;
+    if store.is_read_only() {
+        return Err("the open project is read-only".into());
+    }
+    let path = validate_path(&path, PathPurpose::ImportCapture, &[])?;
+    let options = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+        let mut pending = Vec::with_capacity(BATCH);
+        // One connection row per connection per batch: the snapshot each row
+        // carries is cumulative, so only the latest matters.
+        let mut touched: std::collections::HashMap<Uuid, ConnectionSnapshot> =
+            std::collections::HashMap::new();
+        let flush = |pending: &mut Vec<_>,
+                     touched: &mut std::collections::HashMap<Uuid, ConnectionSnapshot>|
+         -> Result<(), String> {
+            let result =
+                persist(&store, touched.values(), pending).map_err(|error| error.to_string());
+            pending.clear();
+            touched.clear();
+            result
+        };
+        let mut summary =
+            mineburp_capture::import_capture(std::io::BufReader::new(file), &options, |row| {
+                touched.insert(row.connection.id, row.connection);
+                pending.push(row.detail);
+                if pending.len() >= BATCH {
+                    flush(&mut pending, &mut touched)?;
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        flush(&mut pending, &mut touched)?;
+        if summary.frames_imported == 0 && summary.error.is_none() {
+            summary.error = Some(if options.server_ports.is_empty() {
+                "the capture contains no TCP or UDP payloads".into()
+            } else {
+                format!(
+                    "no traffic on server port(s) {:?}; set the ports the server used",
+                    options.server_ports
+                )
+            });
+        }
+        Ok(summary)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Deletes every packet matching `filter` (its `limit` is ignored).
+#[tauri::command]
+pub async fn packets_delete(
+    state: State<'_, DesktopState>,
+    filter: PacketFilterInput,
+    prune_connections: Option<bool>,
+) -> CommandResult<DeleteSummary> {
+    let store = current_project(&state)?;
+    let query = filter.into_query()?;
+    let prune = prune_connections.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || store.delete_packets(&query, prune))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Returns space freed by deleted history to the filesystem.
+#[tauri::command]
+pub async fn project_compact(state: State<'_, DesktopState>) -> CommandResult<CompactSummary> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || store.compact())
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Counts, a timeline, rankings, and a size histogram for `filter`.
+#[tauri::command]
+pub async fn traffic_stats(
+    state: State<'_, DesktopState>,
+    filter: PacketFilterInput,
+    options: Option<StatsOptions>,
+) -> CommandResult<TrafficStats> {
+    let store = current_project(&state)?;
+    let query = filter.into_query()?;
+    let options = options.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || store.traffic_stats(&query, options))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// The annotations of the given packets — the rows on screen.
+#[tauri::command]
+pub async fn packet_annotations_get(
+    state: State<'_, DesktopState>,
+    ids: Vec<i64>,
+) -> CommandResult<Vec<PacketAnnotation>> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || store.annotations(&ids))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Every annotation in the project, newest packet first.
+#[tauri::command]
+pub async fn packet_annotations_list(
+    state: State<'_, DesktopState>,
+    limit: Option<usize>,
+) -> CommandResult<Vec<PacketAnnotation>> {
+    let store = current_project(&state)?;
+    let limit = limit.unwrap_or(1_000).clamp(1, 10_000);
+    tauri::async_runtime::spawn_blocking(move || store.list_annotations(limit))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Sets one packet's bookmark, colour, and note; returns `null` when the
+/// update cleared all three.
+#[tauri::command]
+pub async fn packet_annotation_set(
+    state: State<'_, DesktopState>,
+    packet_id: i64,
+    bookmarked: bool,
+    color: Option<String>,
+    note: Option<String>,
+) -> CommandResult<Option<PacketAnnotation>> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        store.set_annotation(packet_id, bookmarked, color, note)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn saved_filters_list(state: State<'_, DesktopState>) -> CommandResult<Vec<SavedFilter>> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || store.load_saved_filters())
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// A saved filter as the webview sends it: an id is assigned when absent.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFilterInput {
+    id: Option<Uuid>,
+    name: String,
+    filter: serde_json::Value,
+}
+
+/// Creates or updates a saved filter. The filter must be one the history
+/// accepts, so a saved filter can always be applied.
+#[tauri::command]
+pub async fn saved_filter_save(
+    state: State<'_, DesktopState>,
+    filter: SavedFilterInput,
+) -> CommandResult<SavedFilter> {
+    let store = current_project(&state)?;
+    serde_json::from_value::<PacketFilterInput>(filter.filter.clone())
+        .map_err(|error| format!("the saved filter is not a history filter: {error}"))?
+        .into_query()?;
+    let saved = SavedFilter {
+        id: filter.id.unwrap_or_else(Uuid::new_v4),
+        name: filter.name,
+        filter: filter.filter,
+        created_at_micros: 0,
+        updated_at_micros: 0,
+    };
+    tauri::async_runtime::spawn_blocking(move || store.save_filter(&saved))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn saved_filter_delete(state: State<'_, DesktopState>, id: Uuid) -> CommandResult<bool> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || store.delete_saved_filter(id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
 fn current_project(state: &State<'_, DesktopState>) -> CommandResult<ProjectStore> {
     state
         .project
@@ -1060,7 +1449,7 @@ fn current_project(state: &State<'_, DesktopState>) -> CommandResult<ProjectStor
 
 #[cfg(test)]
 mod tests {
-    use super::{PacketFilterInput, parse_auth_callback};
+    use super::{PacketFilterInput, parse_auth_callback, take_matching};
 
     fn filter_from(json: &str) -> PacketFilterInput {
         serde_json::from_str(json).expect("the webview's filter shape must deserialize")
@@ -1169,6 +1558,26 @@ mod tests {
             .into_query()
             .expect("filter");
         assert!(query.expression.is_some());
+    }
+
+    #[test]
+    fn a_mismatched_callback_does_not_cancel_the_pending_sign_in() {
+        let slot = parking_lot::RwLock::new(Some("expected".to_owned()));
+        assert!(take_matching(&slot, |state| state == "forged").is_err());
+        assert!(slot.read().is_some(), "the real sign-in is still pending");
+        assert_eq!(
+            take_matching(&slot, |state| state == "expected").unwrap(),
+            "expected"
+        );
+        assert!(take_matching(&slot, |_| true).is_err(), "taken once");
+    }
+
+    #[test]
+    fn the_bookmark_filter_reaches_the_query() {
+        let query = filter_from(r#"{"bookmarked": true}"#)
+            .into_query()
+            .expect("filter");
+        assert_eq!(query.bookmarked, Some(true));
     }
 
     #[test]

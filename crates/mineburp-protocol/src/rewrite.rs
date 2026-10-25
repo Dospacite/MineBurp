@@ -7,8 +7,13 @@
 //! leaving a frame that decodes as garbage. The byte edits do exactly what they
 //! are told, which is what makes them useful for the cases no decoder covers.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+};
+
 use mineburp_core::{Direction, PacketEdit, ProtocolState};
-use regex::bytes::{Regex, RegexBuilder};
+use regex::bytes::{NoExpand, Regex, RegexBuilder};
 use serde_json::Value;
 
 use crate::layout::{encode_field, layout_logical};
@@ -74,11 +79,14 @@ fn apply_edit(
             case_insensitive,
         } => {
             if *case_insensitive {
-                let pattern = RegexBuilder::new(&regex::escape(find))
-                    .case_insensitive(true)
-                    .build()
-                    .map_err(|error| RewriteError::Pattern(error.to_string()))?;
-                return Ok(replace_pattern(&pattern, frame, replace.as_bytes(), *all));
+                let pattern = compiled(find, true)?;
+                // The replacement is literal text: `$1` must not expand.
+                let replacement = NoExpand(replace.as_bytes());
+                return Ok(if *all {
+                    pattern.replace_all(frame, replacement).into_owned()
+                } else {
+                    pattern.replace(frame, replacement).into_owned()
+                });
             }
             Ok(replace_sequence(
                 frame,
@@ -92,8 +100,7 @@ fn apply_edit(
             replace,
             all,
         } => {
-            let compiled =
-                Regex::new(pattern).map_err(|error| RewriteError::Pattern(error.to_string()))?;
+            let compiled = compiled(pattern, false)?;
             Ok(replace_pattern(&compiled, frame, replace.as_bytes(), *all))
         }
         PacketEdit::Field { name, value } => {
@@ -110,8 +117,7 @@ fn apply_edit(
         } => {
             let (span, current) = find_field(state, direction, protocol_version, frame, name)?;
             let updated = if *regex {
-                let compiled =
-                    Regex::new(find).map_err(|error| RewriteError::Pattern(error.to_string()))?;
+                let compiled = compiled(find, false)?;
                 String::from_utf8_lossy(&replace_pattern(
                     &compiled,
                     current.as_bytes(),
@@ -127,6 +133,50 @@ fn apply_edit(
             splice(frame, span.offset, span.length, &encoded)
         }
     }
+}
+
+/// Patterns compiled so far, keyed by source and whether it is literal text
+/// matched case-insensitively. Rules run against every passing packet, so a
+/// pattern is compiled once rather than once per packet.
+type PatternCache = Mutex<HashMap<(String, bool), Arc<Regex>>>;
+
+/// Bounds the cache so an operator editing rules for hours cannot grow it
+/// without limit; clearing it only costs a recompile.
+const MAX_CACHED_PATTERNS: usize = 256;
+
+/// Bounds a compiled program so one pattern cannot take an unbounded amount of
+/// memory. Matching is linear-time in the `regex` crate whatever the pattern.
+const MAX_PATTERN_SIZE: usize = 2 * 1024 * 1024;
+
+fn compiled(source: &str, literal_case_insensitive: bool) -> Result<Arc<Regex>, RewriteError> {
+    static CACHE: OnceLock<PatternCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(PatternCache::default);
+    let key = (source.to_owned(), literal_case_insensitive);
+    if let Some(pattern) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(Arc::clone(pattern));
+    }
+    let pattern = if literal_case_insensitive {
+        RegexBuilder::new(&regex::escape(source))
+            .case_insensitive(true)
+            .size_limit(MAX_PATTERN_SIZE)
+            .build()
+    } else {
+        RegexBuilder::new(source)
+            .size_limit(MAX_PATTERN_SIZE)
+            .build()
+    }
+    .map_err(|error| RewriteError::Pattern(error.to_string()))?;
+    let pattern = Arc::new(pattern);
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if cache.len() >= MAX_CACHED_PATTERNS {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&pattern));
+    Ok(pattern)
 }
 
 /// Finds a field by name, accepting the spaced or underscored spelling.
@@ -182,7 +232,8 @@ fn replace_sequence(frame: &[u8], find: &[u8], replace: &[u8], all: bool) -> Vec
     }
     let mut output = Vec::with_capacity(frame.len());
     let mut cursor = 0;
-    while cursor <= frame.len().saturating_sub(find.len()) {
+    // `cursor + find.len()` cannot overflow: both are bounded by slice lengths.
+    while cursor + find.len() <= frame.len() {
         if frame[cursor..].starts_with(find) {
             output.extend_from_slice(replace);
             cursor += find.len();
@@ -206,18 +257,38 @@ fn replace_pattern(pattern: &Regex, frame: &[u8], replace: &[u8], all: bool) -> 
     }
 }
 
+/// Parses operator-typed hex.
+///
+/// Whitespace, commas, colons, and underscores separate tokens, and each token
+/// may carry a `0x` or `\x` prefix. Anything else is an error: silently
+/// dropping a stray `g` would rewrite the frame with bytes nobody typed.
 fn parse_hex(input: &str) -> Result<Vec<u8>, RewriteError> {
-    let digits: String = input.chars().filter(char::is_ascii_hexdigit).collect();
+    let mut digits = Vec::with_capacity(input.len());
+    for token in input
+        .split(|character: char| character.is_whitespace() || matches!(character, ',' | ':' | '_'))
+    {
+        let token = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .or_else(|| token.strip_prefix("\\x"))
+            .unwrap_or(token);
+        for byte in token.bytes() {
+            let digit = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => return Err(RewriteError::Hex(input.to_owned())),
+            };
+            digits.push(digit);
+        }
+    }
     if !digits.len().is_multiple_of(2) {
         return Err(RewriteError::Hex(input.to_owned()));
     }
-    (0..digits.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&digits[index..index + 2], 16)
-                .map_err(|_| RewriteError::Hex(input.to_owned()))
-        })
-        .collect()
+    Ok(digits
+        .chunks_exact(2)
+        .map(|pair| (pair[0] << 4) | pair[1])
+        .collect())
 }
 
 #[cfg(test)]
@@ -368,5 +439,94 @@ mod tests {
         )
         .expect_err("an unknown field must not silently do nothing");
         assert!(error.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn byte_edits_on_short_frames_do_not_panic() {
+        for frame in [vec![], vec![0x01]] {
+            let edited = apply_edits(
+                ProtocolState::Play,
+                Direction::ClientToServer,
+                None,
+                &frame,
+                &[PacketEdit::Bytes {
+                    find: "0102".into(),
+                    replace: "03".into(),
+                    all: true,
+                }],
+            )
+            .unwrap();
+            assert_eq!(edited, frame);
+        }
+        // An empty frame followed by a byte edit, the sequence that used to panic.
+        let edited = apply_edits(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            None,
+            &[0x01, 0x02],
+            &[
+                PacketEdit::Frame {
+                    bytes: String::new(),
+                },
+                PacketEdit::Bytes {
+                    find: "01".into(),
+                    replace: "02".into(),
+                    all: false,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(edited.is_empty());
+    }
+
+    #[test]
+    fn literal_text_replacements_do_not_expand_capture_groups() {
+        let frame = b"\x00Hello world".to_vec();
+        let edited = rewrite(
+            &frame,
+            &PacketEdit::Text {
+                find: "hello".into(),
+                replace: "$5 cash".into(),
+                all: true,
+                case_insensitive: true,
+            },
+        );
+        assert_eq!(edited, b"\x00$5 cash world".to_vec());
+    }
+
+    #[test]
+    fn hex_parsing_is_strict() {
+        assert_eq!(
+            parse_hex("de ad,be:ef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(
+            parse_hex("0xde 0XAD \\xbe").unwrap(),
+            vec![0xde, 0xad, 0xbe]
+        );
+        assert_eq!(parse_hex("").unwrap(), Vec::<u8>::new());
+        assert!(
+            parse_hex("zz").is_err(),
+            "non-hex is an error, not an empty frame"
+        );
+        assert!(parse_hex("41 gg 42").is_err());
+        assert!(parse_hex("abc").is_err());
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_reported() {
+        let error = apply_edits(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            None,
+            &[0],
+            &[PacketEdit::Regex {
+                pattern: "(".into(),
+                replace: String::new(),
+                all: true,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, RewriteError::Pattern(_)));
     }
 }

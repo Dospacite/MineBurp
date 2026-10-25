@@ -7,78 +7,16 @@
 
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use common::{Link, ORIGINAL, PROTOCOL_VERSION, run_server};
 use mineburp_core::{PacketEdit, ReplacementRule, Target};
-use mineburp_protocol::{FrameCodec, Handshake, PacketFrame, encode_handshake, encode_var_i32};
+use mineburp_protocol::{Handshake, encode_handshake};
 use mineburp_proxy::{ProxyService, SessionOptions};
-use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
-    net::{TcpListener, TcpStream},
-};
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
-const PROTOCOL_VERSION: i32 = 767;
-const ORIGINAL: &str = r#"{"description":"Original"}"#;
+mod common;
+
 const REWRITTEN: &str = r#"{"description":"Rewritten by a rule"}"#;
-
-struct Link {
-    stream: TcpStream,
-    buffer: BytesMut,
-    codec: FrameCodec,
-}
-
-impl Link {
-    fn new(stream: TcpStream) -> Self {
-        Self {
-            stream,
-            buffer: BytesMut::new(),
-            codec: FrameCodec::default(),
-        }
-    }
-
-    async fn send(&mut self, id: i32, body: &[u8]) {
-        let frame = PacketFrame {
-            id,
-            body: Bytes::copy_from_slice(body),
-            compressed: false,
-            wire_length: 0,
-        };
-        let bytes = self.codec.encode(&frame).expect("encode");
-        self.stream.write_all(&bytes).await.expect("write");
-        self.stream.flush().await.expect("flush");
-    }
-
-    async fn receive(&mut self) -> PacketFrame {
-        loop {
-            if let Some(frame) = self.codec.try_decode(&mut self.buffer).expect("decode") {
-                return frame;
-            }
-            let mut chunk = vec![0_u8; 8 * 1024];
-            let read = self.stream.read(&mut chunk).await.expect("read");
-            assert_ne!(read, 0, "the peer closed the connection early");
-            chunk.truncate(read);
-            self.buffer.extend_from_slice(&chunk);
-        }
-    }
-}
-
-fn string_bytes(value: &str) -> Vec<u8> {
-    let mut output = encode_var_i32(i32::try_from(value.len()).unwrap()).to_vec();
-    output.extend_from_slice(value.as_bytes());
-    output
-}
-
-/// A status server: reads the handshake and the request, answers with a list ping.
-async fn run_server(listener: TcpListener) {
-    let (stream, _) = listener.accept().await.expect("accept");
-    let mut link = Link::new(stream);
-
-    let handshake = link.receive().await;
-    assert_eq!(handshake.id, 0, "handshake first");
-    let request = link.receive().await;
-    assert_eq!(request.id, 0, "status request");
-    link.send(0, &string_bytes(ORIGINAL)).await;
-}
 
 #[tokio::test]
 async fn a_replacement_rule_rewrites_a_field_on_the_wire() {

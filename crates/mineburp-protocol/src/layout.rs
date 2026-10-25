@@ -13,7 +13,8 @@ use mineburp_core::{Direction, ProtocolState};
 use serde_json::Value;
 
 use crate::{
-    inspect::inspect_logical,
+    inspect::{inspect_logical, resolve_name},
+    protodef,
     reader::Reader,
     varint::{encode_var_i32, encode_var_i64},
 };
@@ -70,6 +71,14 @@ pub struct PacketLayout {
 }
 
 /// Walks a logical frame into editable spans.
+///
+/// Two walkers can answer. The hand-written one below knows a few dozen
+/// packets and names their fields the way replacement rules have always
+/// referred to them, so it is used whenever it accounts for the whole frame.
+/// Otherwise the bundled `minecraft-data` description for the protocol walks
+/// it — every packet of every described release — and its spans are used if
+/// they account for every byte. Only when neither does is the tail left as raw
+/// bytes after whatever the hand walker managed.
 #[must_use]
 pub fn layout_logical(
     state: ProtocolState,
@@ -77,22 +86,44 @@ pub fn layout_logical(
     logical: &[u8],
     protocol_version: Option<i32>,
 ) -> PacketLayout {
-    let insight = inspect_logical(state, direction, logical, protocol_version);
-    let name = insight.name.clone();
     let mut builder = Builder::new(logical);
 
     if matches!(state, ProtocolState::Opaque | ProtocolState::Closed) {
+        let name = inspect_logical(state, direction, logical, protocol_version).name;
         builder.bytes("payload");
         return builder.finish(name);
     }
 
-    if builder.var_int("packet id").is_none() {
+    let Some(packet_id) = builder.var_int("packet id") else {
         builder.bytes("frame");
-        return builder.finish(name);
-    }
+        return builder.finish(None);
+    };
+    let prefix = builder.reader.position();
+    let body = logical.get(prefix..).unwrap_or_default();
+    let name = resolve_name(state, direction, packet_id, body, protocol_version);
 
     if let Some(name) = name.as_deref() {
         walk(&mut builder, name, state, direction, protocol_version);
+    }
+    let hand_complete = !builder.stopped
+        && builder.remaining() == 0
+        && (builder.fields.len() > 1 || body.is_empty());
+    if !hand_complete
+        && let Some(definition) =
+            protodef::decode_packet(state, direction, packet_id, body, protocol_version)
+        && definition.is_complete()
+    {
+        let mut fields = Vec::with_capacity(definition.spans.len() + 1);
+        fields.push(builder.fields.swap_remove(0));
+        fields.extend(definition.spans.into_iter().map(|span| FieldSpan {
+            offset: span.offset + prefix,
+            ..span
+        }));
+        return PacketLayout {
+            name,
+            fields,
+            complete: true,
+        };
     }
     builder.bytes("body");
     builder.finish(name)

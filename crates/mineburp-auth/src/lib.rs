@@ -9,4 +9,6 @@ mod store;
 
 pub use client::{AuthClient, AuthConfig, AuthError, MinecraftProfile, MinecraftSession};
 pub use pkce::{AuthorizationRequest, PkceVerifier};
+#[cfg(feature = "os-keyring")]
+pub use store::OsCredentialStore;
 pub use store::{CredentialStore, CredentialStoreError, MemoryCredentialStore, StoredCredential};

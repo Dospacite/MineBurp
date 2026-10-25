@@ -1,5 +1,7 @@
 mod capture_project;
 mod commands;
+mod export;
+mod paths;
 mod state;
 
 #[cfg(feature = "desktop-runtime")]
@@ -19,45 +21,8 @@ const LIVE_FLUSH: Duration = Duration::from_millis(140);
 #[cfg(feature = "desktop-runtime")]
 pub fn run() {
     let app = tauri::Builder::default()
-        .setup(|app| {
-            let bundled_agent = app
-                .path()
-                .resource_dir()?
-                .join("resources/mineburp-agent.jar");
-            let development_agent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../agent/build/mineburp-agent.jar");
-            let agent_path = if bundled_agent.is_file() {
-                bundled_agent
-            } else {
-                development_agent
-            };
-            let agent_config_path = app
-                .path()
-                .app_config_dir()?
-                .join("client-assistance.properties");
-            let state = state::DesktopState::new(agent_path, agent_config_path)?;
-            // A scratch project is opened before capture starts so nothing that
-            // arrives in the first seconds has to live in memory or be dropped.
-            if let Err(error) = state.open_temporary_project() {
-                eprintln!("MineBurp could not open a temporary project: {error}");
-            }
-            let receiver = state.proxy.subscribe();
-            let capture_receiver = state.capture.subscribe();
-            let capture_project = capture_project::spawn_capture_project_writer(
-                state.project.clone(),
-                state.proxy.clone(),
-            );
-            let handle = app.handle().clone();
-            let capture_handle = handle.clone();
-            tauri::async_runtime::spawn(pump_proxy_events(handle, receiver));
-            tauri::async_runtime::spawn(pump_capture(
-                capture_handle,
-                capture_receiver,
-                capture_project,
-            ));
-            app.manage(state);
-            Ok(())
-        })
+        .plugin(tauri_plugin_dialog::init())
+        .setup(setup)
         .invoke_handler(tauri::generate_handler![
             commands::app_capabilities,
             commands::decrypt_mode_status,
@@ -67,10 +32,24 @@ pub fn run() {
             commands::capture_stats,
             commands::project_create,
             commands::project_open,
+            commands::project_save_as,
             commands::project_current,
             commands::project_checkpoint,
             commands::connections_query,
             commands::packets_query,
+            commands::packets_export,
+            commands::packets_export_pcapng,
+            commands::packets_delete,
+            commands::packets_query_cancel,
+            commands::capture_import,
+            commands::project_compact,
+            commands::traffic_stats,
+            commands::packet_annotations_get,
+            commands::packet_annotations_list,
+            commands::packet_annotation_set,
+            commands::saved_filters_list,
+            commands::saved_filter_save,
+            commands::saved_filter_delete,
             commands::filter_vocabulary,
             commands::filter_validate,
             commands::packet_detail,
@@ -79,12 +58,16 @@ pub fn run() {
             commands::packet_layout,
             commands::field_edit,
             commands::proxy_sessions,
-            commands::intercept_rules_set,
-            commands::intercept_rules_get,
+            commands::intercept_settings_get,
+            commands::intercept_settings_set,
+            commands::intercept_pending,
+            commands::intercept_resolve,
+            commands::intercept_forward_all,
+            commands::network_conditions_get,
+            commands::network_conditions_set,
             commands::replacement_rules_set,
             commands::replacement_rules_get,
             commands::replacement_preview,
-            commands::held_resolve,
             commands::repeater_send,
             commands::repeater_tabs,
             commands::repeater_tab_save,
@@ -115,6 +98,57 @@ pub fn run() {
     });
 }
 
+/// Builds the desktop state, opens the scratch project, and starts the event
+/// pumps.
+#[cfg(feature = "desktop-runtime")]
+fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let bundled_agent = app
+        .path()
+        .resource_dir()?
+        .join("resources/mineburp-agent.jar");
+    let development_agent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agent/build/mineburp-agent.jar");
+    let agent_path = if bundled_agent.is_file() {
+        bundled_agent
+    } else {
+        development_agent
+    };
+    let agent_config_path = app
+        .path()
+        .app_config_dir()?
+        .join("client-assistance.properties");
+    let state = state::DesktopState::new(agent_path, agent_config_path)?;
+    let handle = app.handle().clone();
+    let report = error_reporter(handle.clone());
+    // A scratch project is opened before capture starts so nothing that
+    // arrives in the first seconds has to live in memory or be dropped.
+    let sessions_dir = app.path().app_data_dir()?.join("sessions");
+    state::remove_abandoned_sessions(&sessions_dir);
+    if let Err(error) = state.open_temporary_project(&sessions_dir) {
+        report(
+            "project",
+            format!("MineBurp could not open a temporary project: {error}"),
+        );
+    }
+    let receiver = state.proxy.subscribe();
+    let capture_receiver = state.capture.subscribe();
+    let capture_project = capture_project::spawn_capture_project_writer(
+        state.project.clone(),
+        state.proxy.clone(),
+        report.clone(),
+    );
+    let capture_handle = handle.clone();
+    tauri::async_runtime::spawn(pump_proxy_events(handle, receiver));
+    tauri::async_runtime::spawn(pump_capture(
+        capture_handle,
+        capture_receiver,
+        capture_project,
+        report,
+    ));
+    app.manage(state);
+    Ok(())
+}
+
 /// Forwards proxy events, collapsing the high-volume per-packet event.
 ///
 /// The history reads packet rows from the project, so shipping one IPC message
@@ -129,7 +163,7 @@ async fn pump_proxy_events(
 
     let mut appended = 0_u64;
     let mut ticker = tokio::time::interval(LIVE_FLUSH);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             next = events.recv() => match next {
@@ -161,12 +195,13 @@ async fn pump_capture(
     handle: tauri::AppHandle,
     mut frames: tokio::sync::broadcast::Receiver<mineburp_capture::SideChannelFrame>,
     writer: tokio::sync::mpsc::Sender<mineburp_capture::SideChannelFrame>,
+    report: capture_project::ErrorReporter,
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
     let mut appended = 0_u64;
     let mut ticker = tokio::time::interval(LIVE_FLUSH);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             next = frames.recv() => match next {
@@ -178,7 +213,10 @@ async fn pump_capture(
                     Err(_) => break,
                 },
                 Err(RecvError::Lagged(missed)) => {
-                    eprintln!("MineBurp capture relay fell behind by {missed} frame(s)");
+                    report(
+                        "capture",
+                        format!("{missed} captured frame(s) were lost because saving fell behind"),
+                    );
                 }
                 Err(RecvError::Closed) => break,
             },
@@ -192,7 +230,111 @@ async fn pump_capture(
     }
 }
 
+/// A failure the operator should hear about, as the webview receives it.
+#[cfg(feature = "desktop-runtime")]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendError {
+    source: &'static str,
+    message: String,
+    /// How many identical reports this one stands for.
+    repeated: u64,
+}
+
+/// Emits `backend-error` events, collapsing a repeated failure.
+///
+/// A broken writer fails once per batch, several times a second; one event per
+/// failure would bury the UI. The same message is reported at most once per
+/// [`ERROR_COALESCE`], with a count of how many it stands for.
+#[cfg(feature = "desktop-runtime")]
+fn error_reporter(handle: tauri::AppHandle) -> capture_project::ErrorReporter {
+    use std::time::Instant;
+
+    const ERROR_COALESCE: Duration = Duration::from_secs(2);
+    let last: parking_lot::Mutex<Option<(String, Instant, u64)>> = parking_lot::Mutex::new(None);
+    std::sync::Arc::new(move |source, message: String| {
+        eprintln!("MineBurp {source} error: {message}");
+        let mut last = last.lock();
+        let now = Instant::now();
+        if let Some((previous, at, suppressed)) = last.as_mut()
+            && *previous == message
+            && now.duration_since(*at) < ERROR_COALESCE
+        {
+            *suppressed += 1;
+            return;
+        }
+        let repeated = last
+            .as_ref()
+            .filter(|(previous, _, _)| *previous == message)
+            .map_or(1, |(_, _, suppressed)| suppressed + 1);
+        *last = Some((message.clone(), now, 0));
+        let _ = handle.emit(
+            "backend-error",
+            BackendError {
+                source,
+                message,
+                repeated,
+            },
+        );
+    })
+}
+
 #[cfg(not(feature = "desktop-runtime"))]
 pub fn run() {
     panic!("MineBurp was built without the desktop-runtime feature");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    /// The command names in `generate_handler!`.
+    fn registered() -> BTreeSet<String> {
+        let source = include_str!("lib.rs");
+        let start = source.find("generate_handler![").expect("handler list");
+        let end = start + source[start..].find("])").expect("end of handler list");
+        source[start..end]
+            .split("commands::")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A command that is registered but has no permission is refused at
+    /// runtime, which no compile step would notice.
+    #[test]
+    fn every_command_has_a_permission_and_a_grant() {
+        let commands = registered();
+        let build = include_str!("../build.rs");
+        let list_start = build.find("const COMMANDS").expect("command list");
+        let list_end = list_start + build[list_start..].find("];").expect("end of command list");
+        let manifest: BTreeSet<String> = build[list_start..list_end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            manifest, commands,
+            "build.rs COMMANDS must match generate_handler!"
+        );
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("capability JSON");
+        let granted: BTreeSet<String> = capability["permissions"]
+            .as_array()
+            .expect("permissions")
+            .iter()
+            .filter_map(|value| value.as_str()?.strip_prefix("allow-"))
+            .map(|name| name.replace('-', "_"))
+            .collect();
+        assert_eq!(
+            granted, commands,
+            "capabilities/default.json must grant every command"
+        );
+    }
 }

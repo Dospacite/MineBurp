@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-saved-filter-save"
+description = "Enables the saved_filter_save command without any pre-configured scope."
+commands.allow = ["saved_filter_save"]
+
+[[permission]]
+identifier = "deny-saved-filter-save"
+description = "Denies the saved_filter_save command without any pre-configured scope."
+commands.deny = ["saved_filter_save"]

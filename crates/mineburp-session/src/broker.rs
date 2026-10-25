@@ -15,24 +15,60 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac as _};
 use rand::RngCore as _;
 use serde::Serialize;
+use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify, RwLock, mpsc, oneshot},
+    sync::{Mutex, Notify, RwLock, Semaphore, mpsc, oneshot},
     time::{Instant, timeout},
 };
 use uuid::Uuid;
 
 use crate::{SessionJoinProvider, SessionJoinRequest, TransparentRouteProvider, TransparentTarget};
 
-const PROTOCOL_VERSION: &str = "1";
-const JOIN_TIMEOUT: Duration = Duration::from_secs(12);
-const ROUTE_WAIT: Duration = Duration::from_secs(3);
+/// Wire protocol version. Version 2 replaced the plaintext capability in
+/// `HELLO` with a mutual HMAC challenge, so a version 1 agent is refused.
+const PROTOCOL_VERSION: &str = "2";
 const MAX_LINE_LENGTH: usize = 16 * 1024;
+const NONCE_LENGTH: usize = 32;
+/// Domain-separation labels: each side's proof is useless as the other's.
+const BROKER_PROOF_LABEL: &[u8] = b"mineburp-client-assistance-v2 broker";
+const AGENT_PROOF_LABEL: &[u8] = b"mineburp-client-assistance-v2 agent";
+/// Open loopback connections, authenticated or not. One Minecraft client holds
+/// one long-lived connection plus a short route request per server connect.
+const MAX_CONNECTIONS: usize = 64;
+/// Ready sessions a single agent may hold at once.
+const MAX_ROUTES_PER_AGENT: usize = 64;
+
+/// Deadlines for the broker. Tests shorten them; production uses `default`.
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// From accept until the agent has authenticated and named its purpose.
+    handshake: Duration,
+    /// How long a `READY` session stays claimable. Matches the agent's own
+    /// 60-second credential lifetime.
+    route_lifetime: Duration,
+    /// How long a join waits for the matching `READY` to arrive.
+    route_wait: Duration,
+    /// How long a join waits for the agent's `RESULT`.
+    join: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(5),
+            route_lifetime: Duration::from_mins(1),
+            route_wait: Duration::from_secs(3),
+            join: Duration::from_secs(12),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum BrokerError {
@@ -78,9 +114,11 @@ pub struct ClientAssistServer {
 #[derive(Debug)]
 struct BrokerState {
     routes: RwLock<HashMap<String, SessionRoute>>,
-    pending: Mutex<HashMap<Uuid, oneshot::Sender<Result<(), String>>>>,
+    pending: Mutex<HashMap<Uuid, PendingJoin>>,
     route_changed: Notify,
     connected_agents: AtomicUsize,
+    connections: Arc<Semaphore>,
+    timing: Timing,
     transparent_intercept_enabled: AtomicBool,
     transparent_route_provider: RwLock<Option<Arc<dyn TransparentRouteProvider>>>,
 }
@@ -90,6 +128,14 @@ struct SessionRoute {
     agent_id: Uuid,
     profile_id: String,
     sender: mpsc::Sender<BrokerCommand>,
+    expires_at: Instant,
+}
+
+/// A join waiting on one agent. Only that agent's `RESULT` may answer it.
+#[derive(Debug)]
+struct PendingJoin {
+    agent_id: Uuid,
+    sender: oneshot::Sender<Result<(), String>>,
 }
 
 #[derive(Debug)]
@@ -103,6 +149,10 @@ impl ClientAssistBroker {
     /// Binds a capability-protected loopback broker without requiring an async
     /// runtime. Call [`ClientAssistServer::run`] on the application runtime.
     pub fn bind() -> Result<(Self, ClientAssistServer), BrokerError> {
+        Self::bind_with_timing(Timing::default())
+    }
+
+    fn bind_with_timing(timing: Timing) -> Result<(Self, ClientAssistServer), BrokerError> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let endpoint = listener.local_addr()?;
@@ -123,6 +173,8 @@ impl ClientAssistBroker {
                 pending: Mutex::new(HashMap::new()),
                 route_changed: Notify::new(),
                 connected_agents: AtomicUsize::new(0),
+                connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+                timing,
                 transparent_intercept_enabled: AtomicBool::new(false),
                 transparent_route_provider: RwLock::new(None),
             }),
@@ -143,7 +195,16 @@ impl ClientAssistBroker {
         ClientAssistStatus {
             endpoint: self.endpoint.to_string(),
             connected_agents: self.state.connected_agents.load(Ordering::Relaxed),
-            ready_sessions: self.state.routes.read().await.len(),
+            ready_sessions: {
+                let now = Instant::now();
+                self.state
+                    .routes
+                    .read()
+                    .await
+                    .values()
+                    .filter(|route| route.expires_at > now)
+                    .count()
+            },
         }
     }
 
@@ -218,11 +279,16 @@ impl ClientAssistBroker {
     }
 
     async fn take_route(&self, client_hash: &str) -> Result<SessionRoute, String> {
-        let deadline = Instant::now() + ROUTE_WAIT;
+        let deadline = Instant::now() + self.state.timing.route_wait;
         loop {
             let notified = self.state.route_changed.notified();
-            if let Some(route) = self.state.routes.write().await.remove(client_hash) {
-                return Ok(route);
+            {
+                let mut routes = self.state.routes.write().await;
+                let now = Instant::now();
+                routes.retain(|_, route| route.expires_at > now);
+                if let Some(route) = routes.remove(client_hash) {
+                    return Ok(route);
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
@@ -255,11 +321,13 @@ impl SessionJoinProvider for ClientAssistBroker {
         let route = self.take_route(&request.client_server_hash).await?;
         let request_id = Uuid::new_v4();
         let (result_tx, result_rx) = oneshot::channel();
-        self.state
-            .pending
-            .lock()
-            .await
-            .insert(request_id, result_tx);
+        self.state.pending.lock().await.insert(
+            request_id,
+            PendingJoin {
+                agent_id: route.agent_id,
+                sender: result_tx,
+            },
+        );
         if route
             .sender
             .send(BrokerCommand {
@@ -276,7 +344,7 @@ impl SessionJoinProvider for ClientAssistBroker {
                 route.profile_id
             ));
         }
-        match timeout(JOIN_TIMEOUT, result_rx).await {
+        match timeout(self.state.timing.join, result_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("the client-assistance result channel closed".into()),
             Err(_) => {
@@ -296,16 +364,24 @@ impl ClientAssistServer {
             if !peer.ip().is_loopback() {
                 continue;
             }
+            // Excess connections are closed rather than queued, so a local
+            // process cannot exhaust tasks or memory by opening sockets.
+            let Ok(permit) = Arc::clone(&self.broker.state.connections).try_acquire_owned() else {
+                tracing::debug!("client-assistance connection limit reached");
+                continue;
+            };
             let broker = self.broker.clone();
             tokio::spawn(async move {
                 if let Err(error) = run_agent_connection(broker, stream).await {
                     tracing::debug!(%error, "client-assistance agent disconnected");
                 }
+                drop(permit);
             });
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_agent_connection(
     broker: ClientAssistBroker,
     stream: TcpStream,
@@ -313,23 +389,29 @@ async fn run_agent_connection(
     let agent_id = Uuid::new_v4();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let Some(hello) = read_protocol_line(&mut reader).await? else {
-        return Ok(());
+    // Everything up to the agent naming its purpose shares one deadline, so an
+    // unauthenticated socket cannot hold a connection slot open.
+    let handshake = timeout(
+        broker.state.timing.handshake,
+        authenticate_agent(&broker, &mut reader, &mut writer, agent_id),
+    )
+    .await;
+    let first_line = match handshake {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            let _ = writer.write_all(b"ERROR\ttimeout\n").await;
+            return Ok(());
+        }
     };
-    if hello.len() > MAX_LINE_LENGTH || !valid_hello(&hello, &broker.capability) {
-        writer.write_all(b"ERROR\tauthentication_failed\n").await?;
-        return Ok(());
-    }
-    writer
-        .write_all(format!("HELLO_OK\t{agent_id}\n").as_bytes())
-        .await?;
-    let Some(first_line) = read_protocol_line(&mut reader).await? else {
-        return Ok(());
-    };
-    if let Some(target) = parse_route_request(&first_line) {
-        let response = match broker.open_transparent_route(target).await {
-            Ok(port) => format!("ROUTE_OK\t{port}\n"),
-            Err(error) => format!("ROUTE_ERR\t{}\n", encode_field(&error)),
+    if first_line != "SESSION" {
+        let response = match parse_route_request(&first_line) {
+            Some(target) => match broker.open_transparent_route(target).await {
+                Ok(port) => format!("ROUTE_OK\t{port}\n"),
+                Err(error) => format!("ROUTE_ERR\t{}\n", encode_field(&error)),
+            },
+            None => "ERROR\tbad_request\n".to_owned(),
         };
         writer.write_all(response.as_bytes()).await?;
         writer.flush().await?;
@@ -356,15 +438,7 @@ async fn run_agent_connection(
     });
 
     let read_result = async {
-        let mut next_line = Some(first_line);
-        loop {
-            let line = match next_line.take() {
-                Some(line) => line,
-                None => match read_protocol_line(&mut reader).await? {
-                    Some(line) => line,
-                    None => break,
-                },
-            };
+        while let Some(line) = read_protocol_line(&mut reader).await? {
             let fields = line.split('\t').collect::<Vec<_>>();
             match fields.as_slice() {
                 ["READY", client_hash, profile_id] => {
@@ -374,24 +448,24 @@ async fn run_agent_connection(
                     let Some(profile_id) = decode_field(profile_id) else {
                         continue;
                     };
-                    broker.state.routes.write().await.insert(
-                        client_hash,
-                        SessionRoute {
-                            agent_id,
-                            profile_id,
-                            sender: command_tx.clone(),
-                        },
-                    );
-                    broker.state.route_changed.notify_waiters();
+                    let route = SessionRoute {
+                        agent_id,
+                        profile_id,
+                        sender: command_tx.clone(),
+                        expires_at: Instant::now() + broker.state.timing.route_lifetime,
+                    };
+                    if register_route(&broker, client_hash, route).await {
+                        broker.state.route_changed.notify_waiters();
+                    }
                 }
                 ["RESULT", request_id, "OK"] => {
-                    deliver_result(&broker, request_id, Ok(())).await;
+                    deliver_result(&broker, agent_id, request_id, Ok(())).await;
                 }
                 ["RESULT", request_id, "ERR", message] => {
                     let message = decode_field(message).unwrap_or_else(|| {
                         "the Minecraft session service rejected the join".into()
                     });
-                    deliver_result(&broker, request_id, Err(message)).await;
+                    deliver_result(&broker, agent_id, request_id, Err(message)).await;
                 }
                 _ => {}
             }
@@ -406,6 +480,13 @@ async fn run_agent_connection(
         .write()
         .await
         .retain(|_, route| route.agent_id != agent_id);
+    // Joins this agent can no longer answer fail now instead of timing out.
+    broker
+        .state
+        .pending
+        .lock()
+        .await
+        .retain(|_, join| join.agent_id != agent_id);
     broker
         .state
         .connected_agents
@@ -444,22 +525,148 @@ where
     })
 }
 
-fn valid_hello(line: &str, capability: &str) -> bool {
-    let fields = line.split('\t').collect::<Vec<_>>();
-    let ["HELLO", version, supplied] = fields.as_slice() else {
-        return false;
+/// Runs the broker half of the mutual challenge and returns the agent's first
+/// command (`SESSION` or `ROUTE ...`). `None` means the connection ended or the
+/// agent was refused; the refusal reason has already been written.
+///
+/// ```text
+/// agent  → HELLO      2  <agent nonce>
+/// broker → CHALLENGE  <broker nonce>  <broker proof>
+/// agent  → AUTH       <agent proof>
+/// broker → HELLO_OK   <agent id>
+/// agent  → SESSION | ROUTE <host> <port>
+/// ```
+///
+/// Each proof is HMAC-SHA256 keyed by the capability over a role label and
+/// both nonces. The capability itself never crosses the socket, the agent
+/// checks the broker's proof before revealing anything, and the broker's fresh
+/// nonce makes a recorded `AUTH` useless on any other connection.
+async fn authenticate_agent<R, W>(
+    broker: &ClientAssistBroker,
+    reader: &mut R,
+    writer: &mut W,
+    agent_id: Uuid,
+) -> io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(hello) = read_protocol_line(reader).await? else {
+        return Ok(None);
     };
-    *version == PROTOCOL_VERSION
-        && supplied.len() == capability.len()
-        && supplied.as_bytes().ct_eq(capability.as_bytes()).unwrap_u8() == 1
+    let fields = hello.split('\t').collect::<Vec<_>>();
+    let agent_nonce = match fields.as_slice() {
+        ["HELLO", version, nonce] if *version == PROTOCOL_VERSION => decode_nonce(nonce),
+        ["HELLO", ..] => {
+            writer
+                .write_all(format!("ERROR\tunsupported_protocol\t{PROTOCOL_VERSION}\n").as_bytes())
+                .await?;
+            return Ok(None);
+        }
+        _ => None,
+    };
+    let Some(agent_nonce) = agent_nonce else {
+        writer.write_all(b"ERROR\tbad_request\n").await?;
+        return Ok(None);
+    };
+    let mut broker_nonce = [0_u8; NONCE_LENGTH];
+    rand::rng().fill_bytes(&mut broker_nonce);
+    let key = broker.capability.as_bytes();
+    let broker_proof = handshake_proof(key, BROKER_PROOF_LABEL, &agent_nonce, &broker_nonce);
+    writer
+        .write_all(
+            format!(
+                "CHALLENGE\t{}\t{}\n",
+                URL_SAFE_NO_PAD.encode(broker_nonce),
+                URL_SAFE_NO_PAD.encode(broker_proof)
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let Some(auth) = read_protocol_line(reader).await? else {
+        return Ok(None);
+    };
+    let expected = handshake_proof(key, AGENT_PROOF_LABEL, &agent_nonce, &broker_nonce);
+    let accepted = match auth.split('\t').collect::<Vec<_>>().as_slice() {
+        ["AUTH", proof] => URL_SAFE_NO_PAD
+            .decode(proof)
+            .is_ok_and(|proof| proof.len() == expected.len() && bool::from(proof.ct_eq(&expected))),
+        _ => false,
+    };
+    if !accepted {
+        writer.write_all(b"ERROR\tauthentication_failed\n").await?;
+        return Ok(None);
+    }
+    writer
+        .write_all(format!("HELLO_OK\t{agent_id}\n").as_bytes())
+        .await?;
+    read_protocol_line(reader).await
 }
 
-async fn deliver_result(broker: &ClientAssistBroker, request_id: &str, result: Result<(), String>) {
+fn decode_nonce(value: &str) -> Option<[u8; NONCE_LENGTH]> {
+    URL_SAFE_NO_PAD.decode(value).ok()?.try_into().ok()
+}
+
+fn handshake_proof(
+    key: &[u8],
+    label: &[u8],
+    agent_nonce: &[u8; NONCE_LENGTH],
+    broker_nonce: &[u8; NONCE_LENGTH],
+) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(label);
+    mac.update(&[0]);
+    mac.update(agent_nonce);
+    mac.update(broker_nonce);
+    mac.finalize().into_bytes().into()
+}
+
+/// Records a `READY` for its agent. A hash another agent still holds is left
+/// alone, and one agent cannot hold more than [`MAX_ROUTES_PER_AGENT`].
+async fn register_route(
+    broker: &ClientAssistBroker,
+    client_hash: String,
+    route: SessionRoute,
+) -> bool {
+    let mut routes = broker.state.routes.write().await;
+    let now = Instant::now();
+    routes.retain(|_, existing| existing.expires_at > now);
+    if routes
+        .get(&client_hash)
+        .is_some_and(|existing| existing.agent_id != route.agent_id)
+    {
+        tracing::debug!("refused a READY for a session another agent holds");
+        return false;
+    }
+    let held = routes
+        .iter()
+        .filter(|(hash, existing)| existing.agent_id == route.agent_id && **hash != client_hash)
+        .count();
+    if held >= MAX_ROUTES_PER_AGENT {
+        tracing::debug!("refused a READY over the per-agent session limit");
+        return false;
+    }
+    routes.insert(client_hash, route);
+    true
+}
+
+async fn deliver_result(
+    broker: &ClientAssistBroker,
+    agent_id: Uuid,
+    request_id: &str,
+    result: Result<(), String>,
+) {
     let Ok(request_id) = Uuid::parse_str(request_id) else {
         return;
     };
-    if let Some(sender) = broker.state.pending.lock().await.remove(&request_id) {
-        let _ = sender.send(result);
+    let mut pending = broker.state.pending.lock().await;
+    // Only the agent the join was sent to may answer it.
+    if pending
+        .get(&request_id)
+        .is_some_and(|join| join.agent_id == agent_id)
+        && let Some(join) = pending.remove(&request_id)
+    {
+        let _ = join.sender.send(result);
     }
 }
 
@@ -487,15 +694,118 @@ fn parse_route_request(line: &str) -> Option<TransparentTarget> {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::{
+        io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines},
+        net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    };
 
     use super::*;
 
+    type AgentLines = Lines<BufReader<OwnedReadHalf>>;
+
+    fn fast_timing() -> Timing {
+        Timing {
+            handshake: Duration::from_millis(200),
+            route_lifetime: Duration::from_mins(1),
+            route_wait: Duration::from_millis(300),
+            join: Duration::from_secs(2),
+        }
+    }
+
+    async fn next_line(lines: &mut AgentLines) -> Option<String> {
+        timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("the broker answered in time")
+            .unwrap()
+    }
+
+    /// The agent half of the handshake, written independently of the broker's
+    /// own code so a symmetric mistake cannot pass. Returns the broker's reply
+    /// to `AUTH` together with the open connection.
+    async fn handshake(
+        broker: &ClientAssistBroker,
+        key: &[u8],
+        agent_nonce: [u8; NONCE_LENGTH],
+    ) -> (AgentLines, OwnedWriteHalf, String, String) {
+        let stream = TcpStream::connect(broker.endpoint()).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(format!("HELLO\t2\t{}\n", URL_SAFE_NO_PAD.encode(agent_nonce)).as_bytes())
+            .await
+            .unwrap();
+        let challenge = next_line(&mut lines).await.unwrap();
+        let fields = challenge.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields[0], "CHALLENGE");
+        let broker_nonce = decode_nonce(fields[1]).unwrap();
+        let broker_proof = URL_SAFE_NO_PAD.decode(fields[2]).unwrap();
+        // The broker proves the capability before the agent reveals anything.
+        assert_eq!(
+            broker_proof,
+            handshake_proof(
+                broker.capability.as_bytes(),
+                BROKER_PROOF_LABEL,
+                &agent_nonce,
+                &broker_nonce
+            )
+        );
+        let auth = format!(
+            "AUTH\t{}\n",
+            URL_SAFE_NO_PAD.encode(handshake_proof(
+                key,
+                AGENT_PROOF_LABEL,
+                &agent_nonce,
+                &broker_nonce
+            ))
+        );
+        writer.write_all(auth.as_bytes()).await.unwrap();
+        let reply = next_line(&mut lines).await.unwrap_or_default();
+        (lines, writer, reply, auth)
+    }
+
+    async fn session_agent(broker: &ClientAssistBroker) -> (AgentLines, OwnedWriteHalf) {
+        let mut nonce = [0_u8; NONCE_LENGTH];
+        rand::rng().fill_bytes(&mut nonce);
+        let (lines, mut writer, reply, _) =
+            handshake(broker, broker.capability.as_bytes(), nonce).await;
+        assert!(reply.starts_with("HELLO_OK\t"), "{reply}");
+        writer.write_all(b"SESSION\n").await.unwrap();
+        (lines, writer)
+    }
+
+    async fn ready(writer: &mut OwnedWriteHalf, client_hash: &str) {
+        writer
+            .write_all(
+                format!(
+                    "READY\t{}\t{}\n",
+                    encode_field(client_hash),
+                    encode_field("profile-id")
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn join(
+        broker: &ClientAssistBroker,
+        client_hash: &str,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        let provider = broker.clone();
+        let request = SessionJoinRequest {
+            client_server_hash: client_hash.into(),
+            upstream_server_hash: "upstream hash".into(),
+        };
+        tokio::spawn(async move { provider.join_server(&request).await })
+    }
+
     #[test]
-    fn hello_requires_the_exact_capability() {
-        assert!(valid_hello("HELLO\t1\tsecret", "secret"));
-        assert!(!valid_hello("HELLO\t1\twrong", "secret"));
-        assert!(!valid_hello("HELLO\t2\tsecret", "secret"));
+    fn proofs_are_bound_to_role_key_and_both_nonces() {
+        let (a, b) = ([1_u8; NONCE_LENGTH], [2_u8; NONCE_LENGTH]);
+        let agent = handshake_proof(b"key", AGENT_PROOF_LABEL, &a, &b);
+        assert_ne!(agent, handshake_proof(b"key", BROKER_PROOF_LABEL, &a, &b));
+        assert_ne!(agent, handshake_proof(b"other", AGENT_PROOF_LABEL, &a, &b));
+        assert_ne!(agent, handshake_proof(b"key", AGENT_PROOF_LABEL, &b, &a));
     }
 
     #[test]
@@ -519,6 +829,7 @@ mod tests {
         let second_text = fs::read_to_string(&path).unwrap();
         assert_ne!(first_text, second_text);
         assert!(second_text.contains(&format!("port={}", second.endpoint().port())));
+        assert!(second_text.contains(&format!("protocol={PROTOCOL_VERSION}")));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -534,47 +845,11 @@ mod tests {
     async fn routes_a_one_use_join_request_to_the_matching_agent() {
         let (broker, server) = ClientAssistBroker::bind().unwrap();
         let server_task = tokio::spawn(server.run());
-        let stream = TcpStream::connect(broker.endpoint()).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        writer
-            .write_all(format!("HELLO\t1\t{}\n", broker.capability).as_bytes())
-            .await
-            .unwrap();
-        assert!(
-            lines
-                .next_line()
-                .await
-                .unwrap()
-                .unwrap()
-                .starts_with("HELLO_OK\t")
-        );
-        writer
-            .write_all(
-                format!(
-                    "READY\t{}\t{}\n",
-                    encode_field("client hash"),
-                    encode_field("profile-id")
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
+        let (mut lines, mut writer) = session_agent(&broker).await;
+        ready(&mut writer, "client hash").await;
 
-        let provider = broker.clone();
-        let join_task = tokio::spawn(async move {
-            provider
-                .join_server(&SessionJoinRequest {
-                    client_server_hash: "client hash".into(),
-                    upstream_server_hash: "upstream hash".into(),
-                })
-                .await
-        });
-        let join_line = timeout(Duration::from_secs(2), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let join_task = join(&broker, "client hash");
+        let join_line = next_line(&mut lines).await.unwrap();
         let fields = join_line.split('\t').collect::<Vec<_>>();
         assert_eq!(fields[0], "JOIN");
         assert_eq!(decode_field(fields[2]).as_deref(), Some("client hash"));
@@ -586,6 +861,153 @@ mod tests {
         assert!(join_task.await.unwrap().is_ok());
         assert_eq!(broker.status().await.ready_sessions, 0);
 
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn refuses_an_agent_that_does_not_know_the_capability() {
+        let (broker, server) = ClientAssistBroker::bind().unwrap();
+        let server_task = tokio::spawn(server.run());
+        let (mut lines, _writer, reply, _) =
+            handshake(&broker, b"not the capability", [7; NONCE_LENGTH]).await;
+        assert_eq!(reply, "ERROR\tauthentication_failed");
+        assert_eq!(next_line(&mut lines).await, None);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_recorded_auth_is_useless_on_another_connection() {
+        let (broker, server) = ClientAssistBroker::bind().unwrap();
+        let server_task = tokio::spawn(server.run());
+        let nonce = [9_u8; NONCE_LENGTH];
+        let (_lines, _writer, reply, recorded_auth) =
+            handshake(&broker, broker.capability.as_bytes(), nonce).await;
+        assert!(reply.starts_with("HELLO_OK\t"));
+
+        // Same agent nonce, recorded AUTH: the broker's fresh nonce differs.
+        let stream = TcpStream::connect(broker.endpoint()).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer
+            .write_all(format!("HELLO\t2\t{}\n", URL_SAFE_NO_PAD.encode(nonce)).as_bytes())
+            .await
+            .unwrap();
+        assert!(
+            next_line(&mut lines)
+                .await
+                .unwrap()
+                .starts_with("CHALLENGE\t")
+        );
+        writer.write_all(recorded_auth.as_bytes()).await.unwrap();
+        assert_eq!(
+            next_line(&mut lines).await.as_deref(),
+            Some("ERROR\tauthentication_failed")
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_version_one_agent_is_told_which_protocol_to_speak() {
+        let (broker, server) = ClientAssistBroker::bind().unwrap();
+        let server_task = tokio::spawn(server.run());
+        let stream = TcpStream::connect(broker.endpoint()).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        // The old plaintext form, carrying the real capability.
+        writer
+            .write_all(format!("HELLO\t1\t{}\n", broker.capability).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            next_line(&mut lines).await.as_deref(),
+            Some("ERROR\tunsupported_protocol\t2")
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_after_the_handshake_deadline() {
+        let (broker, server) = ClientAssistBroker::bind_with_timing(fast_timing()).unwrap();
+        let server_task = tokio::spawn(server.run());
+        let stream = TcpStream::connect(broker.endpoint()).await.unwrap();
+        let (reader, _writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        assert_eq!(
+            next_line(&mut lines).await.as_deref(),
+            Some("ERROR\ttimeout")
+        );
+        assert_eq!(next_line(&mut lines).await, None);
+
+        // An authenticated agent that never names its purpose is closed too.
+        let mut nonce = [0_u8; NONCE_LENGTH];
+        rand::rng().fill_bytes(&mut nonce);
+        let (mut lines, _writer, reply, _) =
+            handshake(&broker, broker.capability.as_bytes(), nonce).await;
+        assert!(reply.starts_with("HELLO_OK\t"));
+        assert_eq!(
+            next_line(&mut lines).await.as_deref(),
+            Some("ERROR\ttimeout")
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_sessions_expire() {
+        let timing = Timing {
+            route_lifetime: Duration::from_millis(100),
+            ..fast_timing()
+        };
+        let (broker, server) = ClientAssistBroker::bind_with_timing(timing).unwrap();
+        let server_task = tokio::spawn(server.run());
+        let (_lines, mut writer) = session_agent(&broker).await;
+        ready(&mut writer, "stale hash").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(broker.status().await.ready_sessions, 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(broker.status().await.ready_sessions, 0);
+        let error = join(&broker, "stale hash").await.unwrap().unwrap_err();
+        assert!(error.contains("no client-assisted session"), "{error}");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn another_agent_can_neither_take_over_nor_answer_a_session() {
+        let (broker, server) = ClientAssistBroker::bind_with_timing(fast_timing()).unwrap();
+        let server_task = tokio::spawn(server.run());
+        let (mut owner_lines, mut owner) = session_agent(&broker).await;
+        let (mut other_lines, mut other) = session_agent(&broker).await;
+        ready(&mut owner, "shared hash").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ready(&mut other, "shared hash").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let join_task = join(&broker, "shared hash");
+        let join_line = next_line(&mut owner_lines).await.unwrap();
+        let request_id = join_line.split('\t').nth(1).unwrap().to_owned();
+        // The other agent saw nothing and its answer is ignored.
+        other
+            .write_all(format!("RESULT\t{request_id}\tOK\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!join_task.is_finished());
+        owner
+            .write_all(
+                format!(
+                    "RESULT\t{request_id}\tERR\t{}\n",
+                    encode_field("owner says no")
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(join_task.await.unwrap(), Err("owner says no".into()));
+        assert!(
+            timeout(Duration::from_millis(100), other_lines.next_line())
+                .await
+                .is_err(),
+            "the other agent must not receive the join"
+        );
         server_task.abort();
     }
 

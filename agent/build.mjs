@@ -51,7 +51,7 @@ mkdirSync(staging, { recursive: true });
 const sources = collect(join(root, "src", "main", "java"), ".java");
 const separator = process.platform === "win32" ? ";" : ":";
 const classpath = artifacts.map((artifact) => join(dependencies, artifact.name)).join(separator);
-execFileSync("javac", ["--release", "8", "-cp", classpath, "-d", classes, ...sources], {
+execFileSync("javac", ["--release", "8", "-Xlint:-options", "-cp", classpath, "-d", classes, ...sources], {
   stdio: "inherit",
 });
 for (const artifact of artifacts) {
@@ -66,6 +66,36 @@ for (const signature of collect(staging).filter((path) =>
   rmSync(signature, { force: true });
 }
 cpSync(classes, staging, { recursive: true });
+
+// Move the bundled ASM into the agent's own package. The agent sits on the
+// system class path of a game whose mod loader ships its own ASM; an unshaded
+// copy could shadow or be shadowed by it.
+const relocator = join(build, "relocator");
+rmSync(relocator, { recursive: true, force: true });
+mkdirSync(relocator, { recursive: true });
+execFileSync(
+  "javac",
+  ["-cp", classpath, "-d", relocator, join(root, "build-tools", "Relocate.java")],
+  { stdio: "inherit" },
+);
+execFileSync(
+  "java",
+  [
+    "-cp",
+    [relocator, classpath].join(separator),
+    "Relocate",
+    staging,
+    "org/objectweb/asm/",
+    "tools/mineburp/shaded/asm/",
+  ],
+  { stdio: "inherit" },
+);
+const leftovers = collect(join(staging, "org"), ".class");
+if (leftovers.length > 0) {
+  throw new Error(`ASM was not fully relocated: ${relative(staging, leftovers[0])}`);
+}
+rmSync(join(staging, "org"), { recursive: true, force: true });
+
 execFileSync("jar", ["cfm", output, join(root, "manifest.mf"), "-C", staging, "."], {
   stdio: "inherit",
 });

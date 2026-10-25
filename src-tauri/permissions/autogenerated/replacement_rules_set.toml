@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-replacement-rules-set"
+description = "Enables the replacement_rules_set command without any pre-configured scope."
+commands.allow = ["replacement_rules_set"]
+
+[[permission]]
+identifier = "deny-replacement-rules-set"
+description = "Denies the replacement_rules_set command without any pre-configured scope."
+commands.deny = ["replacement_rules_set"]

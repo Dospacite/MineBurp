@@ -1,22 +1,16 @@
-export type View = "traffic" | "repeater" | "replace" | "schemas" | "instances";
+export type View =
+  | "traffic"
+  | "intercept"
+  | "repeater"
+  | "replace"
+  | "schemas"
+  | "instances"
+  | "compare"
+  | "stats";
 export type Direction = "client_to_server" | "server_to_client";
 export type TrafficSource = "minecraft" | "side_channel";
-export type Disposition =
-  | "forwarded"
-  | "dropped"
-  | "edited"
-  | "delayed"
-  | "replayed"
-  | "observed"
-  | "failed";
-export type ProtocolState =
-  | "handshake"
-  | "status"
-  | "login"
-  | "configuration"
-  | "play"
-  | "opaque"
-  | "closed";
+export type Disposition = "forwarded" | "dropped" | "edited" | "delayed" | "replayed" | "observed" | "failed";
+export type ProtocolState = "handshake" | "status" | "login" | "configuration" | "play" | "opaque" | "closed";
 
 export interface ProjectInfo {
   path: string;
@@ -36,11 +30,24 @@ export interface Target {
   port: number;
 }
 
+/** Mirrors `ConnectionStatus` in `mineburp-core`. */
+export type ConnectionStatus =
+  | "listening"
+  | "connecting"
+  | "active"
+  | "transferred"
+  | "closing"
+  | "closed"
+  | "failed";
+
+/** Mirrors `LoaderKind` in `mineburp-launcher`. */
+export type LoaderKind = "vanilla" | "fabric" | "quilt" | "forge" | "neo_forge" | "unknown";
+
 export interface ConnectionSnapshot {
   id: string;
   target: Target;
   listener_address: string;
-  status: string;
+  status: ConnectionStatus;
   state: ProtocolState;
   protocol_version: number | null;
   minecraft_version: string | null;
@@ -163,19 +170,6 @@ export interface ByteWindow {
   base64: string;
 }
 
-export interface PacketDetail {
-  summary: PacketSummary;
-  logical_bytes: number[];
-  decoded: unknown | null;
-  decode_error: string | null;
-  wire: WireMetadata;
-}
-
-export interface HeldPacket {
-  id: string;
-  packet: PacketDetail;
-}
-
 export interface RepeaterTab {
   id: string;
   name: string;
@@ -216,7 +210,7 @@ export interface InstanceDescriptor {
   name: string;
   path: string;
   minecraft_version: string | null;
-  loader: string;
+  loader: LoaderKind;
   icon_path: string | null;
   supports_agent_configuration: boolean;
   client_assist_configured: boolean;
@@ -289,7 +283,7 @@ export interface PacketFilter {
   excludeNames: string[];
   minSize: number | null;
   maxSize: number | null;
-  /** Free-form expression in the same language intercept rules use. */
+  /** Free-form expression in the same language replacement rules use. */
   expression: string;
   /**
    * A search through the stored payload bytes.
@@ -303,6 +297,8 @@ export interface PacketFilter {
   contentScope: ContentSearchScope;
   contentCaseSensitive: boolean;
   contentNegate: boolean;
+  /** Only bookmarked packets; false means bookmarks do not narrow the history. */
+  bookmarked: boolean;
 }
 
 /** How a payload search reads the term it was given. */
@@ -336,6 +332,7 @@ export const EMPTY_FILTER: PacketFilter = {
   contentScope: "contains",
   contentCaseSensitive: false,
   contentNegate: false,
+  bookmarked: false,
 };
 
 export interface PacketHistoryQuery extends Partial<PacketFilter> {
@@ -360,5 +357,190 @@ export interface FilterVocabulary {
 export type ProxyEvent =
   | { type: "connection"; payload: ConnectionSnapshot }
   | { type: "packet"; payload: PacketSummary }
-  | { type: "held"; payload: HeldPacket }
-  | { type: "error"; payload: { connection_id: string; message: string } };
+  | { type: "error"; payload: { connection_id: string; message: string } }
+  | { type: "intercept_queue"; payload: { pending: number } };
+
+/** What Intercept holds. Handshake and login frames are never held. */
+export interface InterceptSettings {
+  enabled: boolean;
+  client_to_server: boolean;
+  server_to_client: boolean;
+  /** Filter expression selecting packets to hold; empty holds every packet. */
+  expression: string;
+  forward_keep_alive: boolean;
+  /** Forward a held frame unchanged after this many milliseconds; null holds until decided. */
+  auto_forward_after_ms: number | null;
+}
+
+/** A frame held by Intercept, waiting for Forward or Drop. */
+export interface InterceptedPacket {
+  id: number;
+  summary: PacketSummary;
+  target: string;
+  held_at_micros: number;
+  /** When the frame is forwarded automatically; null when it waits for a decision. */
+  deadline_micros: number | null;
+  bytes_base64: string;
+}
+
+/** Shaping for one direction. Mirrors `LinkConditions` in `mineburp-proxy`. */
+export interface LinkConditions {
+  delay_ms: number;
+  jitter_ms: number;
+  /** Null is unlimited. */
+  bandwidth_bytes_per_second: number | null;
+}
+
+/** Shaping applied to every proxied connection. Mirrors `NetworkConditions`. */
+export interface NetworkConditions {
+  client_to_server: LinkConditions;
+  server_to_client: LinkConditions;
+}
+
+/** Counters from the passive capture backend. Mirrors `CaptureStats` in `mineburp-capture`. */
+export interface CaptureStats {
+  /** False when no capture is running, including one whose dumpcap died. */
+  running: boolean;
+  frames_seen: number;
+  bytes_seen: number;
+  frames_emitted: number;
+  bytes_emitted: number;
+  frames_dropped: number;
+  /** Frames waiting for their flow to be attributed to a process. */
+  frames_held: number;
+  retransmissions: number;
+  reordered: number;
+  /** Sequence holes that never filled and were skipped. */
+  gaps: number;
+  errors: number;
+  last_error: string | null;
+}
+
+/** A failure the backend reported outside any command, e.g. a capture write. */
+export interface BackendError {
+  source: string;
+  message: string;
+  /** How many identical reports this one stands for. */
+  repeated: number;
+}
+
+/** A packet's bookmark, colour, and note. Mirrors `PacketAnnotation` in `mineburp-project`. */
+export interface PacketAnnotation {
+  packetId: number;
+  bookmarked: boolean;
+  /** `#rrggbb` or a lowercase colour name. */
+  color: string | null;
+  note: string | null;
+  updatedAtMicros: number;
+}
+
+/** A named history filter stored in the project. */
+export interface SavedFilter {
+  id: string;
+  name: string;
+  /** The filter as the history query command takes it. */
+  filter: Record<string, unknown>;
+  createdAtMicros: number;
+  updatedAtMicros: number;
+}
+
+export interface TrafficBucket {
+  startMicros: number;
+  clientToServerPackets: number;
+  clientToServerBytes: number;
+  serverToClientPackets: number;
+  serverToClientBytes: number;
+}
+
+export interface NameStat {
+  name: string | null;
+  packets: number;
+  bytes: number;
+}
+
+export interface ConnectionStat {
+  connectionId: string;
+  packets: number;
+  bytes: number;
+}
+
+export interface SizeBucket {
+  min: number;
+  /** Inclusive upper bound; null for the open-ended last bucket. */
+  max: number | null;
+  packets: number;
+}
+
+/** Counts, a timeline, rankings, and a size histogram for one filter. */
+export interface TrafficStats {
+  totalPackets: number;
+  totalBytes: number;
+  clientToServerPackets: number;
+  clientToServerBytes: number;
+  serverToClientPackets: number;
+  serverToClientBytes: number;
+  firstTimestampMicros: number | null;
+  lastTimestampMicros: number | null;
+  bucketMicros: number;
+  buckets: TrafficBucket[];
+  topByCount: NameStat[];
+  topByBytes: NameStat[];
+  topConnections: ConnectionStat[];
+  sizeHistogram: SizeBucket[];
+}
+
+export interface StatsOptions {
+  bucketMicros?: number | null;
+  maxBuckets?: number;
+  top?: number;
+}
+
+export interface PcapExportSummary {
+  packets: number;
+  connections: number;
+}
+
+export interface ImportOptions {
+  serverPorts?: number[];
+  /** The most rows one import writes. */
+  maxFrames?: number;
+  /** Split TCP streams into Minecraft packets (default); off keeps raw chunks. */
+  splitPackets?: boolean;
+  /** Protocol assumed for connections whose handshake is not in the capture. */
+  protocolVersion?: number | null;
+}
+
+export interface ImportSummary {
+  recordsRead: number;
+  /** Rows written: packets plus raw rows. */
+  framesImported: number;
+  bytesImported: number;
+  duplicatesRemoved: number;
+  segmentsReordered: number;
+  gaps: number;
+  packetsDecoded: number;
+  rawRows: number;
+  connections: number;
+  encryptedConnections: number;
+  midstreamConnections: number;
+  unsynchronisedStreams: number;
+  desyncs: number;
+  resyncs: number;
+  frameErrors: number;
+  exportedPackets: number;
+  truncated: boolean;
+  error: string | null;
+}
+
+export interface DeleteSummary {
+  packets: number;
+  connections: number;
+}
+
+export interface CompactSummary {
+  bytesBefore: number;
+  bytesAfter: number;
+}
+
+/** How the history's time column reads a timestamp. */
+export type TimeMode = "absolute" | "relative" | "delta";

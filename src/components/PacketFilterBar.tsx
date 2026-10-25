@@ -1,4 +1,4 @@
-import { Filter, Search, X } from "lucide-react";
+import { Bookmark, Filter, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
@@ -11,12 +11,15 @@ import type {
   TrafficSource,
 } from "../domain/types";
 import { EMPTY_FILTER } from "../domain/types";
+import { t } from "../i18n";
 import { desktop } from "../lib/desktop";
+import { ExpressionInput } from "./ExpressionInput";
 import { Modal } from "./Modal";
+import { SavedFilters } from "./SavedFilters";
 
-const SOURCES: Array<{ value: TrafficSource; label: string }> = [
-  { value: "minecraft", label: "Decrypt proxy" },
-  { value: "side_channel", label: "Passive capture" },
+const SOURCES: Array<{ value: TrafficSource; labelKey: Parameters<typeof t>[0] }> = [
+  { value: "minecraft", labelKey: "filter.source.minecraft" },
+  { value: "side_channel", labelKey: "filter.source.side_channel" },
 ];
 
 const DIRECTIONS: Array<{ value: Direction; label: string }> = [
@@ -24,20 +27,12 @@ const DIRECTIONS: Array<{ value: Direction; label: string }> = [
   { value: "server_to_client", label: "S → C" },
 ];
 
-const STATES: ProtocolState[] = [
-  "handshake",
-  "status",
-  "login",
-  "configuration",
-  "play",
-  "opaque",
-  "closed",
-];
+const STATES: ProtocolState[] = ["handshake", "status", "login", "configuration", "play", "opaque", "closed"];
 
-const CONTENT_MODES: Array<{ value: ContentSearchMode; label: string }> = [
-  { value: "text", label: "Text" },
-  { value: "hex", label: "Hex" },
-  { value: "regex", label: "Regex" },
+const CONTENT_MODES: Array<{ value: ContentSearchMode; labelKey: Parameters<typeof t>[0] }> = [
+  { value: "text", labelKey: "filter.content.mode.text" },
+  { value: "hex", labelKey: "filter.content.mode.hex" },
+  { value: "regex", labelKey: "filter.content.mode.regex" },
 ];
 
 /** One term per line; the hex placeholder doubles as the range syntax. */
@@ -47,11 +42,31 @@ const CONTENT_PLACEHOLDER: Record<ContentSearchMode, string> = {
   regex: "player_?name\nUUID",
 };
 
-const CONTENT_SCOPES: Array<{ value: ContentSearchScope; label: string; title: string }> = [
-  { value: "contains", label: "Contains", title: "The term appears anywhere in the payload" },
-  { value: "equals", label: "Is exactly", title: "The payload is the term and nothing else" },
-  { value: "prefix", label: "Starts with", title: "The payload begins with the term" },
-  { value: "suffix", label: "Ends with", title: "The payload ends with the term" },
+const CONTENT_SCOPES: Array<{
+  value: ContentSearchScope;
+  labelKey: Parameters<typeof t>[0];
+  titleKey: Parameters<typeof t>[0];
+}> = [
+  {
+    value: "contains",
+    labelKey: "filter.content.scope.contains",
+    titleKey: "filter.content.scope.contains.title",
+  },
+  {
+    value: "equals",
+    labelKey: "filter.content.scope.equals",
+    titleKey: "filter.content.scope.equals.title",
+  },
+  {
+    value: "prefix",
+    labelKey: "filter.content.scope.prefix",
+    titleKey: "filter.content.scope.prefix.title",
+  },
+  {
+    value: "suffix",
+    labelKey: "filter.content.scope.suffix",
+    titleKey: "filter.content.scope.suffix.title",
+  },
 ];
 
 const DISPOSITIONS: Disposition[] = [
@@ -77,17 +92,34 @@ export function PacketFilterBar({
   onChange,
   loaded,
   onError,
+  onNotice,
 }: {
   filter: PacketFilter;
   onChange: (filter: PacketFilter) => void;
   /** Rows currently loaded, shown beside the summary. */
   loaded: number;
   onError: (error: string) => void;
+  onNotice?: (notice: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [expressionText, setExpressionText] = useState(filter.expression);
   const [expressionError, setExpressionError] = useState<string | null>(null);
+  /**
+   * The payload terms being typed. A payload search decompresses and scans
+   * every candidate row, so it runs when applied rather than per keystroke.
+   */
+  const [contentDraft, setContentDraft] = useState(filter.content);
   const validation = useRef(0);
+
+  // Follow changes made elsewhere — Clear all, or a filter applied from a menu.
+  useEffect(() => setContentDraft(filter.content), [filter.content]);
+  useEffect(
+    () =>
+      setExpressionText((current) => (current.trim() === filter.expression ? current : filter.expression)),
+    [filter.expression],
+  );
+  const contentPending = contentDraft !== filter.content;
+  const applyContent = () => onChange({ ...filter, content: contentDraft });
 
   // The expression is only committed once it parses, so a half-typed predicate
   // never blanks the table.
@@ -122,95 +154,127 @@ export function PacketFilterBar({
   function clearAll() {
     setExpressionText("");
     setExpressionError(null);
+    setContentDraft("");
     onChange({ ...EMPTY_FILTER });
   }
 
   return (
-    <section className={`packet-filter ${active ? "active" : ""}`} aria-label="Packet filter">
+    <section className={`packet-filter ${active ? "active" : ""}`} aria-label={t("filter.toggle")}>
       <div className="filter-summary">
-        <button className="filter-toggle" onClick={() => setOpen(true)} aria-haspopup="dialog">
+        <button type="button" className="filter-toggle" onClick={() => setOpen(true)} aria-haspopup="dialog">
           <Filter size={13} aria-hidden="true" />
-          <span>{summary ?? "All packets"}</span>
+          <span>{summary ?? t("filter.all-packets")}</span>
         </button>
         <label className="history-search filter-quick-search">
           <Search size={14} aria-hidden="true" />
           <input
             value={filter.search}
             onChange={(event) => onChange({ ...filter, search: event.target.value })}
-            placeholder="Search"
-            aria-label="Search packet history"
+            placeholder={t("filter.search.placeholder")}
+            aria-label={t("filter.search.aria")}
           />
         </label>
-        <span className="filter-count">{loaded.toLocaleString()} loaded</span>
+        <button
+          type="button"
+          className={`filter-chip ${filter.bookmarked ? "on" : ""}`}
+          aria-pressed={filter.bookmarked}
+          title={t("filter.bookmarked.title")}
+          onClick={() => onChange({ ...filter, bookmarked: !filter.bookmarked })}
+        >
+          <Bookmark size={12} aria-hidden="true" /> {t("filter.bookmarked")}
+        </button>
+        <span className="filter-count">{t("filter.loaded", { count: loaded.toLocaleString() })}</span>
+        {desktop.isAvailable() && (
+          <SavedFilters filter={filter} onApply={onChange} onError={onError} onNotice={onNotice} />
+        )}
         {active && (
-          <button className="link-button" onClick={clearAll}>
-            <X size={12} aria-hidden="true" /> Clear
+          <button type="button" className="link-button" onClick={clearAll}>
+            <X size={12} aria-hidden="true" /> {t("filter.clear")}
           </button>
         )}
       </div>
 
       {open && (
         <Modal
-          title="Filter"
+          title={t("filter.title")}
           onClose={() => setOpen(false)}
           actions={
             <>
-              <button className="button" onClick={clearAll} disabled={!active}>
-                Clear all
+              <button type="button" className="button" onClick={clearAll} disabled={!active}>
+                {t("filter.clear-all")}
               </button>
-              <button className="button primary" onClick={() => setOpen(false)}>
-                Done
+              <button type="button" className="button primary" onClick={() => setOpen(false)}>
+                {t("filter.done")}
               </button>
             </>
           }
         >
           <div className="filter-panel">
             <CheckGroup
-              title="Traffic source"
-              options={SOURCES.map((entry) => ({ ...entry, checked: filter.sources.includes(entry.value) }))}
+              title={t("filter.group.source")}
+              options={SOURCES.map((entry) => ({
+                ...entry,
+                label: t(entry.labelKey),
+                checked: filter.sources.includes(entry.value),
+              }))}
               onToggle={(value) => onChange({ ...filter, sources: toggle(filter.sources, value) })}
-              onAll={(all) => onChange({ ...filter, sources: all ? SOURCES.map((entry) => entry.value) : [] })}
+              onAll={(all) =>
+                onChange({ ...filter, sources: all ? SOURCES.map((entry) => entry.value) : [] })
+              }
             />
             <CheckGroup
-              title="Direction"
-              options={DIRECTIONS.map((entry) => ({ ...entry, checked: filter.directions.includes(entry.value) }))}
+              title={t("filter.group.direction")}
+              options={DIRECTIONS.map((entry) => ({
+                ...entry,
+                checked: filter.directions.includes(entry.value),
+              }))}
               onToggle={(value) => onChange({ ...filter, directions: toggle(filter.directions, value) })}
-              onAll={(all) => onChange({ ...filter, directions: all ? DIRECTIONS.map((entry) => entry.value) : [] })}
+              onAll={(all) =>
+                onChange({ ...filter, directions: all ? DIRECTIONS.map((entry) => entry.value) : [] })
+              }
             />
             <CheckGroup
-              title="Protocol phase"
-              options={STATES.map((value) => ({ value, label: value, checked: filter.states.includes(value) }))}
+              title={t("filter.group.phase")}
+              options={STATES.map((value) => ({
+                value,
+                label: value,
+                checked: filter.states.includes(value),
+              }))}
               onToggle={(value) => onChange({ ...filter, states: toggle(filter.states, value) })}
               onAll={(all) => onChange({ ...filter, states: all ? [...STATES] : [] })}
             />
             <CheckGroup
-              title="Result"
-              options={DISPOSITIONS.map((value) => ({ value, label: value, checked: filter.dispositions.includes(value) }))}
+              title={t("filter.group.result")}
+              options={DISPOSITIONS.map((value) => ({
+                value,
+                label: value,
+                checked: filter.dispositions.includes(value),
+              }))}
               onToggle={(value) => onChange({ ...filter, dispositions: toggle(filter.dispositions, value) })}
               onAll={(all) => onChange({ ...filter, dispositions: all ? [...DISPOSITIONS] : [] })}
             />
 
             <fieldset className="filter-group">
-              <legend>Search term</legend>
+              <legend>{t("filter.group.search-term")}</legend>
               <input
                 value={filter.search}
                 onChange={(event) => onChange({ ...filter, search: event.target.value })}
-                placeholder="name, channel, loader, or packet ID"
-                aria-label="Filter by search term"
+                placeholder={t("filter.search-term.placeholder")}
+                aria-label={t("filter.search-term.aria")}
               />
               <div className="filter-switches">
                 <Switch
-                  label="Regex"
+                  label={t("filter.regex")}
                   checked={filter.searchRegex}
                   onChange={(checked) => onChange({ ...filter, searchRegex: checked })}
                 />
                 <Switch
-                  label="Case sensitive"
+                  label={t("filter.case-sensitive")}
                   checked={filter.searchCaseSensitive}
                   onChange={(checked) => onChange({ ...filter, searchCaseSensitive: checked })}
                 />
                 <Switch
-                  label="Negative"
+                  label={t("filter.negative")}
                   checked={filter.searchNegate}
                   onChange={(checked) => onChange({ ...filter, searchNegate: checked })}
                 />
@@ -218,47 +282,63 @@ export function PacketFilterBar({
             </fieldset>
 
             <fieldset className="filter-group filter-content">
-              <legend>Packet content</legend>
-              <div className="segmented content-modes" aria-label="Payload search mode">
+              <legend>{t("filter.group.content")}</legend>
+              <div className="segmented content-modes" aria-label={t("filter.content.mode.aria")}>
                 {CONTENT_MODES.map((mode) => (
                   <button
+                    type="button"
                     key={mode.value}
                     className={filter.contentMode === mode.value ? "active" : ""}
                     onClick={() => onChange({ ...filter, contentMode: mode.value })}
                   >
-                    {mode.label}
+                    {t(mode.labelKey)}
                   </button>
                 ))}
               </div>
-              <div className="segmented content-scopes" aria-label="How much of the payload must match">
+              <div className="segmented content-scopes" aria-label={t("filter.content.scope.aria")}>
                 {CONTENT_SCOPES.map((scope) => (
                   <button
+                    type="button"
                     key={scope.value}
                     className={filter.contentScope === scope.value ? "active" : ""}
-                    title={scope.title}
+                    title={t(scope.titleKey)}
                     onClick={() => onChange({ ...filter, contentScope: scope.value })}
                   >
-                    {scope.label}
+                    {t(scope.labelKey)}
                   </button>
                 ))}
               </div>
               <textarea
                 className="content-terms"
                 rows={3}
-                value={filter.content}
-                onChange={(event) => onChange({ ...filter, content: event.target.value })}
+                value={contentDraft}
+                onChange={(event) => setContentDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    applyContent();
+                  }
+                }}
                 placeholder={CONTENT_PLACEHOLDER[filter.contentMode]}
-                aria-label="Search packet payload bytes, one term per line"
+                aria-label={t("filter.content.terms.aria")}
                 spellCheck={false}
               />
+              <div className="filter-apply">
+                <button type="button" className="button" disabled={!contentPending} onClick={applyContent}>
+                  {t("filter.content.apply")}
+                </button>
+                <span className="filter-hint">
+                  {contentPending ? t("filter.content.pending") : t("filter.content.apply.hint")}
+                </span>
+              </div>
               <div className="filter-switches">
                 <Switch
-                  label="Case sensitive"
+                  label={t("filter.case-sensitive")}
                   checked={filter.contentCaseSensitive}
                   onChange={(checked) => onChange({ ...filter, contentCaseSensitive: checked })}
                 />
                 <Switch
-                  label="Negative"
+                  label={t("filter.negative")}
                   checked={filter.contentNegate}
                   onChange={(checked) => onChange({ ...filter, contentNegate: checked })}
                 />
@@ -266,30 +346,30 @@ export function PacketFilterBar({
             </fieldset>
 
             <fieldset className="filter-group">
-              <legend>Packet name</legend>
+              <legend>{t("filter.group.packet-name")}</legend>
               <label className="filter-field">
-                Show only
-                <input
-                  value={filter.includeNames.join(", ")}
-                  onChange={(event) => onChange({ ...filter, includeNames: splitList(event.target.value) })}
+                {t("filter.show-only")}
+                <NameListInput
+                  names={filter.includeNames}
+                  onChange={(includeNames) => onChange({ ...filter, includeNames })}
                   placeholder="chat, custom_payload"
                 />
               </label>
               <label className="filter-field">
-                Hide
-                <input
-                  value={filter.excludeNames.join(", ")}
-                  onChange={(event) => onChange({ ...filter, excludeNames: splitList(event.target.value) })}
+                {t("filter.hide")}
+                <NameListInput
+                  names={filter.excludeNames}
+                  onChange={(excludeNames) => onChange({ ...filter, excludeNames })}
                   placeholder="keep_alive, chunk"
                 />
               </label>
             </fieldset>
 
             <fieldset className="filter-group">
-              <legend>Payload size</legend>
+              <legend>{t("filter.group.size")}</legend>
               <div className="filter-range">
                 <label className="filter-field">
-                  Min
+                  {t("filter.size.min")}
                   <input
                     type="number"
                     min={0}
@@ -299,31 +379,32 @@ export function PacketFilterBar({
                   />
                 </label>
                 <label className="filter-field">
-                  Max
+                  {t("filter.size.max")}
                   <input
                     type="number"
                     min={0}
                     value={filter.maxSize ?? ""}
                     onChange={(event) => onChange({ ...filter, maxSize: parseSize(event.target.value) })}
-                    placeholder="any"
+                    placeholder={t("filter.size.max.any")}
                   />
                 </label>
-                <span className="filter-hint">bytes</span>
+                <span className="filter-hint">{t("filter.size.unit")}</span>
               </div>
             </fieldset>
 
             <fieldset className="filter-group filter-expression">
-              <legend>Expression</legend>
-              <input
+              <legend>{t("filter.group.expression")}</legend>
+              <ExpressionInput
                 value={expressionText}
-                onChange={(event) => setExpressionText(event.target.value)}
+                onChange={setExpressionText}
                 placeholder="state == play && size > 256 && name ~ chat"
-                aria-label="Filter expression"
-                aria-invalid={expressionError !== null}
-                spellCheck={false}
+                ariaLabel={t("filter.expression.aria")}
+                invalid={expressionError !== null}
               />
               {expressionError && (
-                <p className="filter-error" role="alert">{expressionError}</p>
+                <p className="filter-error" role="alert">
+                  {expressionError}
+                </p>
               )}
               <ExpressionExamples
                 onPick={(text) => {
@@ -358,19 +439,17 @@ function CheckGroup<T extends string>({
       <div className="filter-checks">
         {options.map((option) => (
           <label key={option.value} className={option.checked ? "checked" : ""}>
-            <input
-              type="checkbox"
-              checked={option.checked}
-              onChange={() => onToggle(option.value)}
-            />
+            <input type="checkbox" checked={option.checked} onChange={() => onToggle(option.value)} />
             {option.label}
           </label>
         ))}
       </div>
       <div className="filter-group-actions">
-        <button className="link-button" onClick={() => onAll(true)}>All</button>
-        <button className="link-button" onClick={() => onAll(false)} disabled={none}>
-          Clear
+        <button type="button" className="link-button" onClick={() => onAll(true)}>
+          {t("form.all")}
+        </button>
+        <button type="button" className="link-button" onClick={() => onAll(false)} disabled={none}>
+          {t("filter.clear")}
         </button>
       </div>
     </fieldset>
@@ -423,7 +502,7 @@ function ExpressionExamples({
   return (
     <div className="filter-examples">
       {examples.map((example) => (
-        <button key={example} className="filter-example" onClick={() => onPick(example)}>
+        <button type="button" key={example} className="filter-example" onClick={() => onPick(example)}>
           {example}
         </button>
       ))}
@@ -431,7 +510,42 @@ function ExpressionExamples({
   );
 }
 
-function splitList(value: string): string[] {
+/**
+ * A comma-separated list that keeps exactly what was typed.
+ *
+ * The list used to be re-rendered from the parsed names on every keystroke,
+ * so a trailing comma vanished the moment it was typed and a second name could
+ * only be pasted.
+ */
+function NameListInput({
+  names,
+  onChange,
+  placeholder,
+}: {
+  names: string[];
+  onChange: (names: string[]) => void;
+  placeholder: string;
+}) {
+  const [draft, setDraft] = useState(names.join(", "));
+  const joined = names.join("\u0000");
+  // Follow outside changes only when they mean something different from the draft.
+  useEffect(() => {
+    setDraft((current) => (splitList(current).join("\u0000") === joined ? current : names.join(", ")));
+  }, [joined]);
+  return (
+    <input
+      value={draft}
+      onChange={(event) => {
+        setDraft(event.target.value);
+        const next = splitList(event.target.value);
+        if (next.join("\u0000") !== joined) onChange(next);
+      }}
+      placeholder={placeholder}
+    />
+  );
+}
+
+export function splitList(value: string): string[] {
   return value
     .split(",")
     .map((entry) => entry.trim())
@@ -445,46 +559,59 @@ function parseSize(value: string): number | null {
 }
 
 /** How the summary reads a payload search: [plain, negated] per scope. */
-const RELATION: Record<ContentSearchScope, [string, string]> = {
-  contains: ["with", "without"],
-  equals: ["is", "is not"],
-  prefix: ["starts with", "not starting with"],
-  suffix: ["ends with", "not ending with"],
+const RELATION: Record<ContentSearchScope, [Parameters<typeof t>[0], Parameters<typeof t>[0]]> = {
+  contains: ["filter.summary.payload-with", "filter.summary.without"],
+  equals: ["filter.summary.is", "filter.summary.is-not"],
+  prefix: ["filter.summary.starts-with", "filter.summary.not-starting-with"],
+  suffix: ["filter.summary.ends-with", "filter.summary.not-ending-with"],
 };
 
 /** A short description of what the filter narrows, or null when it narrows nothing. */
-function describe(filter: PacketFilter): string | null {
+export function describe(filter: PacketFilter): string | null {
   const parts: string[] = [];
-  if (filter.sources.length > 0) parts.push(filter.sources.length === 1 ? label(filter.sources[0]) : `${filter.sources.length} sources`);
-  if (filter.directions.length === 1) parts.push(filter.directions[0] === "client_to_server" ? "C → S" : "S → C");
-  if (filter.states.length > 0) parts.push(filter.states.length === 1 ? filter.states[0] : `${filter.states.length} phases`);
+  const source = filter.sources.length === 1 ? filter.sources[0] : undefined;
+  if (filter.sources.length > 0)
+    parts.push(source ? label(source) : t("filter.summary.sources", { count: filter.sources.length }));
+  const direction = filter.directions.length === 1 ? filter.directions[0] : undefined;
+  if (direction) parts.push(direction === "client_to_server" ? "C → S" : "S → C");
+  const state = filter.states.length === 1 ? filter.states[0] : undefined;
+  if (filter.states.length > 0)
+    parts.push(state ?? t("filter.summary.phases", { count: filter.states.length }));
   if (filter.dispositions.length > 0) {
-    parts.push(filter.dispositions.length === 1 ? filter.dispositions[0] : `${filter.dispositions.length} results`);
+    const disposition = filter.dispositions.length === 1 ? filter.dispositions[0] : undefined;
+    parts.push(disposition ?? t("filter.summary.results", { count: filter.dispositions.length }));
   }
   if (filter.search.trim()) {
     const flags = [
-      filter.searchRegex ? "regex" : null,
-      filter.searchCaseSensitive ? "case" : null,
+      filter.searchRegex ? t("filter.regex") : null,
+      filter.searchCaseSensitive ? t("filter.summary.case-flag") : null,
     ].filter(Boolean);
     const suffix = flags.length > 0 ? ` (${flags.join(", ")})` : "";
-    parts.push(`${filter.searchNegate ? "not " : ""}“${filter.search.trim()}”${suffix}`);
+    parts.push(`${filter.searchNegate ? t("filter.summary.not") : ""}“${filter.search.trim()}”${suffix}`);
   }
-  if (filter.includeNames.length > 0) parts.push(`only ${filter.includeNames.length} name(s)`);
-  if (filter.excludeNames.length > 0) parts.push(`hiding ${filter.excludeNames.length} name(s)`);
+  if (filter.includeNames.length > 0)
+    parts.push(t("filter.summary.only-names", { count: filter.includeNames.length }));
+  if (filter.excludeNames.length > 0)
+    parts.push(t("filter.summary.hiding-names", { count: filter.excludeNames.length }));
   if (filter.minSize !== null || filter.maxSize !== null) {
     parts.push(`${filter.minSize ?? 0}–${filter.maxSize ?? "∞"} B`);
   }
-  const terms = filter.content.split("\n").map((term) => term.trim()).filter(Boolean);
+  const terms = filter.content
+    .split("\n")
+    .map((term) => term.trim())
+    .filter(Boolean);
   if (terms.length > 0) {
     const mode = filter.contentMode === "text" ? "" : ` ${filter.contentMode}`;
     const relation = RELATION[filter.contentScope][filter.contentNegate ? 1 : 0];
-    const subject = terms.length === 1 ? `“${terms[0]}”` : `any of ${terms.length}`;
-    parts.push(`payload${mode} ${relation} ${subject}`);
+    const subject =
+      terms.length === 1 ? `“${terms[0]}”` : t("filter.summary.any-of", { count: terms.length });
+    parts.push(`${t("filter.summary.payload")}${mode} ${t(relation)} ${subject}`);
   }
   if (filter.expression.trim()) parts.push(filter.expression.trim());
+  if (filter.bookmarked) parts.push(t("filter.summary.bookmarked"));
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function label(source: TrafficSource): string {
-  return source === "minecraft" ? "Decrypt proxy" : "Passive capture";
+  return t(source === "minecraft" ? "filter.source.minecraft" : "filter.source.side_channel");
 }

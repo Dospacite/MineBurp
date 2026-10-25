@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-filter-validate"
+description = "Enables the filter_validate command without any pre-configured scope."
+commands.allow = ["filter_validate"]
+
+[[permission]]
+identifier = "deny-filter-validate"
+description = "Denies the filter_validate command without any pre-configured scope."
+commands.deny = ["filter_validate"]

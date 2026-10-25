@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use mineburp_session::minecraft_server_hash;
@@ -21,6 +21,10 @@ const MINECRAFT_LOGIN_ENDPOINT: &str =
     "https://api.minecraftservices.com/authentication/login_with_xbox";
 const MINECRAFT_PROFILE_ENDPOINT: &str = "https://api.minecraftservices.com/minecraft/profile";
 const MINECRAFT_JOIN_ENDPOINT: &str = "https://sessionserver.mojang.com/session/minecraft/join";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Error bodies are quoted in `AuthError`, which ends up in logs and the UI.
+const MAX_ERROR_BODY: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
@@ -34,7 +38,10 @@ pub struct MinecraftProfile {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+/// A signed-in Minecraft account. Deliberately neither `Serialize` nor
+/// `Deserialize`: its tokens must never reach the webview, a log, or a file by
+/// way of a generic serializer. Present it through a view that omits them.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MinecraftSession {
     pub profile: MinecraftProfile,
     pub access_token: String,
@@ -75,10 +82,14 @@ pub struct AuthClient {
 impl AuthClient {
     #[must_use]
     pub fn new(config: AuthConfig) -> Self {
-        Self {
-            http: Client::new(),
-            config,
-        }
+        // Every step of the sign-in chain is a single small request; a
+        // stalled identity service must fail rather than hang the sign-in.
+        let http = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self { http, config }
     }
 
     /// Builds a Microsoft OAuth authorization URL and a fresh PKCE verifier.
@@ -198,7 +209,7 @@ impl AuthClient {
 
     async fn complete_chain(
         &self,
-        microsoft: MicrosoftToken,
+        mut microsoft: MicrosoftToken,
     ) -> Result<MinecraftSession, AuthError> {
         let xbox: XboxToken = decode_response(
             self.http
@@ -237,7 +248,7 @@ impl AuthClient {
             .first()
             .map(|claim| claim.uhs.as_str())
             .ok_or(AuthError::Missing("Xbox user hash"))?;
-        let minecraft: MinecraftAccessToken = decode_response(
+        let mut minecraft: MinecraftAccessToken = decode_response(
             self.http
                 .post(MINECRAFT_LOGIN_ENDPOINT)
                 .json(&json!({
@@ -255,26 +266,49 @@ impl AuthClient {
                 .await?,
         )
         .await?;
+        // The token types wipe themselves on drop, so their strings are moved
+        // out rather than copied; what is left behind to be zeroed is empty.
         Ok(MinecraftSession {
             profile,
-            access_token: minecraft.access_token,
-            refresh_token: microsoft.refresh_token,
+            access_token: std::mem::take(&mut minecraft.access_token),
+            refresh_token: std::mem::take(&mut microsoft.refresh_token),
             expires_at_epoch_seconds: now_seconds().saturating_add(minecraft.expires_in),
         })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct MicrosoftToken {
     access_token: String,
     refresh_token: String,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for MicrosoftToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MicrosoftToken")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "PascalCase")]
 struct XboxToken {
     token: String,
+    #[zeroize(skip)]
     display_claims: DisplayClaims,
+}
+
+impl std::fmt::Debug for XboxToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("XboxToken")
+            .field("token", &"[REDACTED]")
+            .field("display_claims", &self.display_claims)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,10 +321,20 @@ struct UserClaim {
     uhs: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct MinecraftAccessToken {
     access_token: String,
     expires_in: u64,
+}
+
+impl std::fmt::Debug for MinecraftAccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MinecraftAccessToken")
+            .field("access_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 async fn decode_response<T: for<'de> Deserialize<'de>>(
@@ -305,7 +349,15 @@ async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let mut body = response.text().await.unwrap_or_default();
+    if body.len() > MAX_ERROR_BODY {
+        let mut end = MAX_ERROR_BODY;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push('…');
+    }
     Err(AuthError::Rejected(format!("{status}: {body}")))
 }
 
@@ -319,6 +371,51 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use mineburp_session::minecraft_server_hash;
+
+    use super::*;
+
+    const SECRET: &str = "secret-token-value";
+
+    #[test]
+    fn debug_output_never_contains_a_token() {
+        let microsoft: MicrosoftToken = serde_json::from_value(json!({
+            "access_token": SECRET,
+            "refresh_token": SECRET,
+        }))
+        .unwrap();
+        let xbox: XboxToken = serde_json::from_value(json!({
+            "Token": SECRET,
+            "DisplayClaims": { "xui": [{ "uhs": "user-hash" }] },
+        }))
+        .unwrap();
+        let minecraft: MinecraftAccessToken = serde_json::from_value(json!({
+            "access_token": SECRET,
+            "expires_in": 3600,
+        }))
+        .unwrap();
+        let session = MinecraftSession {
+            profile: MinecraftProfile {
+                id: "profile-id".into(),
+                name: "Player".into(),
+            },
+            access_token: SECRET.into(),
+            refresh_token: SECRET.into(),
+            expires_at_epoch_seconds: 0,
+        };
+        for rendered in [
+            format!("{microsoft:?}"),
+            format!("{xbox:?}"),
+            format!("{minecraft:?}"),
+            format!("{session:?}"),
+            format!("{session:#?}"),
+        ] {
+            assert!(!rendered.contains(SECRET), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        }
+        // What is safe to show still is.
+        assert!(format!("{xbox:?}").contains("user-hash"));
+        assert!(format!("{session:?}").contains("Player"));
+    }
 
     #[test]
     fn formats_signed_minecraft_hash() {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-intercept-settings-set"
+description = "Enables the intercept_settings_set command without any pre-configured scope."
+commands.allow = ["intercept_settings_set"]
+
+[[permission]]
+identifier = "deny-intercept-settings-set"
+description = "Denies the intercept_settings_set command without any pre-configured scope."
+commands.deny = ["intercept_settings_set"]
