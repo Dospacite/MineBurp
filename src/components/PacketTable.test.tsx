@@ -31,8 +31,8 @@ describe("PacketTable", () => {
   it("renders rows and highlights selected", () => {
     const packets = [
       {
-        id: 1,
-        sequence: 1,
+        id: 7,
+        sequence: 0,
         direction: "client_to_server",
         state: "play",
         name: "chat",
@@ -41,8 +41,8 @@ describe("PacketTable", () => {
         disposition: "forwarded",
       },
       {
-        id: 2,
-        sequence: 2,
+        id: 8,
+        sequence: 0,
         direction: "server_to_client",
         state: "play",
         name: null,
@@ -52,8 +52,18 @@ describe("PacketTable", () => {
       },
     ] as never;
     const onSelect = vi.fn();
-    render(<PacketTable packets={packets} selectedId={1} onSelect={onSelect} />);
+    render(<PacketTable packets={packets} selectedId={7} onSelect={onSelect} />);
     expect(screen.getByText("chat")).toBeInTheDocument();
     expect(screen.getByText("0xa")).toBeInTheDocument();
+  });
+
+  it("numbers rows by their unique id, not the per-connection sequence", () => {
+    const packets = [
+      { id: 7, sequence: 0, direction: "client_to_server", state: "play", name: "a", packet_id: 1, size: 1 },
+      { id: 8, sequence: 0, direction: "client_to_server", state: "play", name: "b", packet_id: 2, size: 1 },
+    ] as never;
+    render(<PacketTable packets={packets} selectedId={null} onSelect={vi.fn()} />);
+    expect(screen.getByText("7")).toBeInTheDocument();
+    expect(screen.getByText("8")).toBeInTheDocument();
   });
 });

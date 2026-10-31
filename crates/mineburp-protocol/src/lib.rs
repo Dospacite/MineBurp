@@ -8,6 +8,7 @@ mod handshake;
 mod inspect;
 mod layout;
 mod nbt;
+mod nbt_text;
 mod present;
 mod protodef;
 mod reader;
@@ -24,8 +25,11 @@ pub use encryption::{EncryptionPacketError, EncryptionRequest, EncryptionRespons
 pub use handshake::{Handshake, HandshakeError, decode_handshake, encode_handshake};
 pub use inspect::{
     Identification, PacketInsight, StreamPacket, identify_packet, inspect_logical, inspect_packet,
+    plugin_channel,
 };
-pub use layout::{FieldKind, FieldSpan, PacketLayout, encode_field, layout_logical};
+pub use layout::{
+    FieldKind, FieldSpan, PacketLayout, encode_field, encode_field_over, layout_logical,
+};
 pub use nbt::{NbtError, component_to_text, read_nbt};
 pub use protodef::{
     DefinitionDecode, decode_packet as decode_with_definition, definition_protocols, has_definition,
@@ -41,3 +45,5 @@ pub use schema::{
     SchemaPackManifest, TypeDefinition, decode_schema,
 };
 pub use varint::{decode_var_i32, decode_var_i64, encode_var_i32, encode_var_i64};
+
+pub mod decoder;

@@ -36,7 +36,7 @@ use mineburp_core::{
 };
 use mineburp_protocol::{
     FrameCodec, PacketRegistry, decode_common_packet, decode_handshake, decode_var_i32,
-    decode_with_definition, has_definition, identify_packet,
+    decode_with_definition, has_definition, identify_packet, plugin_channel,
 };
 use uuid::Uuid;
 
@@ -1062,10 +1062,22 @@ impl Connection {
     ) -> PacketDetail {
         let protocol = self.snapshot.protocol_version;
         let common = decode_common_packet(state, direction, id, body, protocol);
-        if self.snapshot.loader.is_none() {
-            self.snapshot.loader.clone_from(&common.loader);
-        }
+        let mut channel = common.channel;
+        let mut loader = common.loader;
         let name = name.or_else(|| identify_packet(state, direction, id, body, protocol));
+        // Modern custom payloads carry no common-decoder branch because their
+        // packet id is version-specific; read their channel from the preamble so
+        // imported captures are searchable by channel like live ones.
+        if channel.is_none()
+            && matches!(name.as_deref(), Some("custom_payload" | "plugin_message"))
+            && let Some((found, found_loader)) = plugin_channel(body)
+        {
+            channel = Some(found);
+            loader = loader.or(found_loader);
+        }
+        if self.snapshot.loader.is_none() {
+            self.snapshot.loader.clone_from(&loader);
+        }
         PacketDetail {
             summary: self.summary(
                 direction,
@@ -1075,8 +1087,8 @@ impl Connection {
                 name,
                 logical.len(),
                 disposition,
-                common.channel,
-                common.loader,
+                channel,
+                loader,
             ),
             logical_bytes: logical,
             decoded: None,

@@ -375,6 +375,24 @@ fn is_state_transition(
     transition_name(state, direction, packet_id, protocol).is_some()
 }
 
+/// A held frame after which buffered bytes need a different decoder.
+///
+/// Encryption Response starts the cipher in both directions. Set Compression
+/// changes the frame codec for every packet that follows it. Decoding bytes
+/// behind either packet before the operator forwards it irreversibly puts a
+/// wrongly decoded frame into the backlog.
+fn changes_stream_encoding(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: Option<i32>,
+) -> bool {
+    matches!(
+        (state, direction, packet_id),
+        (ProtocolState::Login, Direction::ClientToServer, Some(1))
+            | (ProtocolState::Login, Direction::ServerToClient, Some(3))
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyService {
     registry: Arc<PacketRegistry>,
@@ -408,27 +426,9 @@ impl ProxyService {
             events: events.clone(),
             pending: Mutex::new(Vec::new()),
             dirty: Mutex::new(HashMap::new()),
+            flusher_started: AtomicBool::new(false),
         });
-        // Drains the persistence queue while traffic is quiet. The weak
-        // reference lets the ticker end once the last service handle drops
-        // instead of pinning the service alive forever. Without a runtime —
-        // a synchronous embedder — there is no ticker, and the queue then
-        // only drains when a batch fills.
-        let ticker_queue = Arc::downgrade(&queue);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                loop {
-                    ticker.tick().await;
-                    let Some(queue) = ticker_queue.upgrade() else {
-                        break;
-                    };
-                    queue.flush().await;
-                }
-            });
-        }
-        Self {
+        let service = Self {
             registry: Arc::new(PacketRegistry::bundled()),
             project,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -441,7 +441,40 @@ impl ProxyService {
             interceptor: Arc::new(Interceptor::default()),
             network: Arc::new(RwLock::new(NetworkConditions::default())),
             route_window: Arc::new(Mutex::new((Instant::now(), 0))),
+        };
+        let _ = service.start_persistence_flusher();
+        service
+    }
+
+    /// Starts the timer that commits batches which have not reached
+    /// [`INSERT_BATCH_LIMIT`].
+    ///
+    /// Construction can happen outside a Tokio runtime, notably in Tauri's
+    /// synchronous setup callback. Such callers must invoke this once from
+    /// their async runtime. Repeated calls are harmless.
+    #[must_use]
+    pub fn start_persistence_flusher(&self) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        if self.queue.flusher_started.swap(true, Ordering::AcqRel) {
+            return true;
         }
+        // The weak reference lets the ticker end once the last service handle
+        // drops instead of pinning the service alive forever.
+        let ticker_queue = Arc::downgrade(&self.queue);
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(queue) = ticker_queue.upgrade() else {
+                    break;
+                };
+                queue.flush().await;
+            }
+        });
+        true
     }
 
     /// The delay, jitter and bandwidth applied to every proxied connection.
@@ -580,13 +613,17 @@ impl ProxyService {
         let _guard = HeldGuard { service: self, id };
         self.announce_intercept_queue();
 
-        // A frame that changes the protocol state must not be overtaken: what
-        // follows it is read in the state it moves to.
+        // Frames that change protocol state or stream encoding must not be
+        // prefetched. What follows needs the new state, cipher, or codec.
         let allow_bypass = !is_state_transition(
             detail.summary.state,
             direction,
             detail.summary.packet_id,
             detail.summary.protocol_version,
+        ) && !changes_stream_encoding(
+            detail.summary.state,
+            direction,
+            detail.summary.packet_id,
         );
         if allow_bypass {
             self.drain_held_backlog(handle, direction, io).await?;
@@ -673,6 +710,13 @@ impl ProxyService {
             state,
             encrypted,
         );
+        if self.should_block(&detail.summary) {
+            detail.summary.disposition = Disposition::Dropped;
+            detail.summary.sequence = handle.next_sequence();
+            self.record_packet(detail).await;
+            self.queue.mark_dirty(handle);
+            return Ok(());
+        }
         detail.summary.sequence = handle.next_sequence();
         self.record_packet(detail).await;
         let mut codec = FrameCodec::default();
@@ -1047,6 +1091,100 @@ impl ProxyService {
         }
     }
 
+    /// Applies the proxy's bookkeeping rewrites to the frame about to be sent:
+    /// the handshake's target address and both halves of the key exchange.
+    ///
+    /// `outbound` is the frame after rules and Intercept, so edited fields
+    /// (including `should_authenticate`) survive and only the proxy's key,
+    /// verify token, and address are substituted. Returns the shared secret
+    /// when this frame completes the key exchange.
+    async fn bridge_outbound(
+        &self,
+        handle: &SessionHandle,
+        direction: Direction,
+        state: ProtocolState,
+        arrived: &PacketFrame,
+        outbound: &mut PacketFrame,
+        preserve_address: bool,
+    ) -> Result<Option<[u8; 16]>, ProxyError> {
+        if state == ProtocolState::Handshake
+            && direction == Direction::ClientToServer
+            && outbound.id == 0
+            && !preserve_address
+            && let Ok(mut handshake) = decode_handshake(&outbound.body)
+        {
+            let original = decode_handshake(&arrived.body).ok();
+            let (host, markers) = split_address(&handshake.server_address);
+            let host_unchanged = original
+                .as_ref()
+                .is_none_or(|original| split_address(&original.server_address).0 == host);
+            let markers = markers.to_owned();
+            let port_unchanged = original
+                .as_ref()
+                .is_none_or(|original| original.server_port == handshake.server_port);
+            // An edited host or port is the operator's choice; only what the
+            // client chose is replaced with the real target.
+            let target = handle.snapshot.read().target.clone();
+            if host_unchanged {
+                handshake.server_address = format!("{}{markers}", target.host);
+            }
+            if port_unchanged {
+                handshake.server_port = target.port;
+            }
+            outbound.body = encode_handshake(&handshake)?;
+        }
+
+        if state == ProtocolState::Login
+            && direction == Direction::ServerToClient
+            && outbound.id == 1
+            && self.session_join_provider.read().is_some()
+        {
+            let protocol_version = handle.snapshot.read().protocol_version.unwrap_or_default();
+            let request = EncryptionRequest::decode_for(&outbound.body, protocol_version)
+                .map_err(EncryptionBridgeError::from)?;
+            // RSA key generation is tens of milliseconds of CPU; it must not
+            // stall a runtime worker every other session shares.
+            let key = tokio::task::spawn_blocking(EncryptionBridge::generate_key)
+                .await
+                .map_err(|_| ProxyError::SessionStopped)??;
+            outbound.body =
+                handle
+                    .encryption_bridge
+                    .intercept_request(request, key, protocol_version)?;
+        }
+
+        if state == ProtocolState::Login
+            && direction == Direction::ClientToServer
+            && outbound.id == 1
+            && handle.encryption_bridge.is_negotiating()
+        {
+            let provider = { self.session_join_provider.read().clone() };
+            if let Some(provider) = provider {
+                let protocol_version = handle.snapshot.read().protocol_version.unwrap_or_default();
+                let mut negotiation = handle
+                    .encryption_bridge
+                    .intercept_response(&outbound.body, protocol_version)?;
+                // The client was sent this flag. When it is false the client
+                // does not join, so there is no join to correlate, and the
+                // server decides for itself whether to accept the login.
+                if negotiation.should_authenticate {
+                    provider
+                        .join_server(&SessionJoinRequest {
+                            client_server_hash: std::mem::take(&mut negotiation.client_server_hash),
+                            upstream_server_hash: std::mem::take(
+                                &mut negotiation.upstream_server_hash,
+                            ),
+                        })
+                        .await
+                        .map_err(ProxyError::Authentication)?;
+                }
+                outbound.body = std::mem::take(&mut negotiation.server_response);
+                return Ok(Some(negotiation.shared_secret));
+            }
+        }
+        Ok(None)
+    }
+
     /// Handles one decoded frame and reports whether this link's cipher was
     /// activated by it, which the reader loop needs in order to decrypt bytes it
     /// had already buffered.
@@ -1062,84 +1200,6 @@ impl ProxyService {
     ) -> Result<bool, ProxyError> {
         let state = handle.snapshot.read().state;
         let mut outbound = frame.clone();
-        let mut activate_encryption = None;
-        if state == ProtocolState::Handshake
-            && direction == Direction::ClientToServer
-            && frame.id == 0
-            && let Ok(mut handshake) = decode_handshake(&frame.body)
-        {
-            if !preserve_address {
-                let marker_suffix = handshake
-                    .server_address
-                    .find('\0')
-                    .map(|index| handshake.server_address[index..].to_owned())
-                    .unwrap_or_default();
-                handshake.server_address =
-                    format!("{}{}", handle.snapshot.read().target.host, marker_suffix);
-                handshake.server_port = handle.snapshot.read().target.port;
-                outbound.body = encode_handshake(&handshake)?;
-            }
-            update_snapshot(handle, |snapshot| {
-                snapshot.protocol_version = Some(handshake.protocol_version);
-                snapshot.minecraft_version = self
-                    .registry
-                    .version(handshake.protocol_version)
-                    .map(|version| version.canonical.clone());
-                snapshot.state = if handshake.next_state == 1 {
-                    ProtocolState::Status
-                } else {
-                    ProtocolState::Login
-                };
-                snapshot.loader = loader_from_address(&handshake.server_address);
-            });
-        }
-
-        if state == ProtocolState::Login
-            && direction == Direction::ServerToClient
-            && frame.id == 1
-            && self.session_join_provider.read().is_some()
-        {
-            let protocol_version = handle.snapshot.read().protocol_version.unwrap_or_default();
-            let request = EncryptionRequest::decode_for(&frame.body, protocol_version)
-                .map_err(EncryptionBridgeError::from)?;
-            // RSA key generation is tens of milliseconds of CPU; it must not
-            // stall a runtime worker every other session shares.
-            let key = tokio::task::spawn_blocking(EncryptionBridge::generate_key)
-                .await
-                .map_err(|_| ProxyError::SessionStopped)??;
-            outbound.body =
-                handle
-                    .encryption_bridge
-                    .intercept_request(request, key, protocol_version)?;
-        }
-        if state == ProtocolState::Login
-            && direction == Direction::ClientToServer
-            && frame.id == 1
-            && handle.encryption_bridge.is_negotiating()
-        {
-            let provider = { self.session_join_provider.read().clone() };
-            if let Some(provider) = provider {
-                let protocol_version = handle.snapshot.read().protocol_version.unwrap_or_default();
-                let mut negotiation = handle
-                    .encryption_bridge
-                    .intercept_response(&frame.body, protocol_version)?;
-                // A server that encrypts without authenticating (1.20.5+) told
-                // the client not to join, so no join is coming to correlate.
-                if negotiation.should_authenticate {
-                    provider
-                        .join_server(&SessionJoinRequest {
-                            client_server_hash: std::mem::take(&mut negotiation.client_server_hash),
-                            upstream_server_hash: std::mem::take(
-                                &mut negotiation.upstream_server_hash,
-                            ),
-                        })
-                        .await
-                        .map_err(ProxyError::Authentication)?;
-                }
-                outbound.body = std::mem::take(&mut negotiation.server_response);
-                activate_encryption = Some(negotiation.shared_secret);
-            }
-        }
 
         let current_state = handle.snapshot.read().state;
         let input_encrypted = inbound_cipher(handle, direction).is_active();
@@ -1153,6 +1213,13 @@ impl ProxyService {
             state,
             input_encrypted,
         );
+        if self.should_block(&detail.summary) {
+            detail.summary.disposition = Disposition::Dropped;
+            detail.summary.sequence = handle.next_sequence();
+            self.record_packet(detail).await;
+            self.queue.mark_dirty(handle);
+            return Ok(false);
+        }
         // A rule that rewrites a packet has already decided what goes on the
         // wire, and the recorded row is what was actually sent.
         if let Some(bytes) = self.rewrite(&detail, state, direction) {
@@ -1175,7 +1242,7 @@ impl ProxyService {
         }
         // Intercept sees the frame as the rules left it, and what it forwards
         // is what gets recorded.
-        if activate_encryption.is_none() && self.interceptor.should_hold(&detail.summary) {
+        if self.interceptor.should_hold(&detail.summary) {
             match self.await_intercept(handle, direction, &detail, io).await? {
                 InterceptDecision::Forward => {}
                 InterceptDecision::Replace(bytes) => {
@@ -1199,6 +1266,18 @@ impl ProxyService {
                 }
             }
         }
+        // The proxy's own rewrites run on what will actually be sent, after
+        // rules and Intercept, so an edit can never undo them.
+        let activate_encryption = self
+            .bridge_outbound(
+                handle,
+                direction,
+                state,
+                &frame,
+                &mut outbound,
+                preserve_address,
+            )
+            .await?;
         detail.summary.sequence = handle.next_sequence();
         self.record_packet(detail).await;
 
@@ -1219,6 +1298,25 @@ impl ProxyService {
             update_snapshot(handle, |snapshot| {
                 snapshot.encrypted_client = true;
                 snapshot.encrypted_server = true;
+            });
+        }
+        if state == ProtocolState::Handshake
+            && direction == Direction::ClientToServer
+            && outbound.id == 0
+            && let Ok(handshake) = decode_handshake(&outbound.body)
+        {
+            update_snapshot(handle, |snapshot| {
+                snapshot.protocol_version = Some(handshake.protocol_version);
+                snapshot.minecraft_version = self
+                    .registry
+                    .version(handshake.protocol_version)
+                    .map(|version| version.canonical.clone());
+                snapshot.state = if handshake.next_state == 1 {
+                    ProtocolState::Status
+                } else {
+                    ProtocolState::Login
+                };
+                snapshot.loader = loader_from_address(&handshake.server_address);
             });
         }
         io.writer.send(encoded, encrypt).await?;
@@ -1276,6 +1374,17 @@ impl ProxyService {
     /// A rule that fails — an unknown field, a bad pattern — is reported and
     /// skipped rather than dropping the connection: an operator's typo in a
     /// rule must not disconnect the game they are testing.
+    fn should_block(&self, summary: &PacketSummary) -> bool {
+        self.replacements.read().iter().any(|rule| {
+            rule.source.enabled
+                && rule.source.action == mineburp_core::ReplacementAction::Drop
+                && rule
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(summary))
+        })
+    }
+
     fn rewrite(
         &self,
         detail: &PacketDetail,
@@ -1293,6 +1402,7 @@ impl ProxyService {
             .iter()
             .filter(|rule| {
                 rule.source.enabled
+                    && rule.source.action == mineburp_core::ReplacementAction::Rewrite
                     && !rule.source.edits.is_empty()
                     && rule
                         .filter
@@ -1344,8 +1454,8 @@ impl ProxyService {
             &frame.body,
             snapshot.protocol_version,
         );
-        let channel = common.channel;
-        let loader = common.loader.or_else(|| snapshot.loader.clone());
+        let mut channel = common.channel;
+        let mut loader = common.loader.or_else(|| snapshot.loader.clone());
         // Names every row it can, not just the ids that are stable across
         // versions: play packets are identified from the shape of their body,
         // which is the only thing that survives Mojang renumbering them.
@@ -1356,6 +1466,16 @@ impl ProxyService {
             &frame.body,
             snapshot.protocol_version,
         );
+        // Modern custom payloads are `channel` + opaque data with no common
+        // decoder branch (their id moves every release), so the channel would
+        // otherwise be missing from the row and invisible to channel filters.
+        if channel.is_none()
+            && matches!(name.as_deref(), Some("custom_payload" | "plugin_message"))
+            && let Some((found, found_loader)) = mineburp_protocol::plugin_channel(&frame.body)
+        {
+            channel = Some(found);
+            loader = loader.or(found_loader);
+        }
         // Matching a schema is a cheap predicate and gives the row its name.
         // Running the schema *decode* here is not: it walked every field of
         // every captured packet, including ones nobody opens. The decode now
@@ -1516,6 +1636,7 @@ struct PersistenceQueue {
     pending: Mutex<Vec<PacketDetail>>,
     /// Sessions whose snapshot changed since the last flush.
     dirty: Mutex<HashMap<ConnectionId, DirtySnapshot>>,
+    flusher_started: AtomicBool,
 }
 
 /// A session's live snapshot and the flag saying it needs saving.
@@ -1771,10 +1892,24 @@ fn enter_configuration(handle: &SessionHandle) {
     });
 }
 
+/// Splits a handshake address into the host and the loader markers that
+/// follow its first NUL (`\0FML2\0`, `\0FORGE`, ...), which stay attached.
+fn split_address(address: &str) -> (&str, &str) {
+    address
+        .find('\0')
+        .map_or((address, ""), |index| address.split_at(index))
+}
+
 fn loader_from_address(address: &str) -> Option<String> {
-    if address.contains("\0FML3\0") {
+    let (_, markers) = split_address(address);
+    if markers.contains("\0FML3\0") {
         Some("neoforge".into())
-    } else if address.contains("\0FML2\0") || address.contains("\0FML\0") {
+    } else if markers.contains("\0FML2\0")
+        || markers.contains("\0FML\0")
+        // Forge for 1.20.2+ appends `\0FORGE`, optionally followed by its
+        // network version.
+        || markers.split('\0').any(|marker| marker.starts_with("FORGE"))
+    {
         Some("forge".into())
     } else {
         None
@@ -1792,6 +1927,8 @@ fn now_micros() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use mineburp_project::ProjectOptions;
+
     use super::*;
 
     fn handle(protocol_version: i32) -> SessionHandle {
@@ -1832,6 +1969,72 @@ mod tests {
 
     fn state_of(handle: &SessionHandle) -> ProtocolState {
         handle.snapshot.read().state
+    }
+
+    #[test]
+    fn a_synchronous_embedder_can_start_the_quiet_batch_flusher() {
+        // Tauri constructs desktop state from a synchronous setup callback.
+        // Reproduce that ordering instead of using `#[tokio::test]`, which
+        // would let the constructor start the flusher by itself.
+        let service = ProxyService::new();
+        assert!(!service.queue.flusher_started.load(Ordering::Acquire));
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ProjectStore::create(
+            directory.path().join("quiet.mineburp"),
+            "Quiet",
+            ProjectOptions::default(),
+        )
+        .expect("create project");
+        let connection = handle(767).snapshot.read().clone();
+        store
+            .save_connection(&connection)
+            .expect("save connection before its packet");
+        service.set_project(Some(store.clone()));
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                assert!(service.start_persistence_flusher());
+                assert!(
+                    service.start_persistence_flusher(),
+                    "starting twice is safe"
+                );
+                service
+                    .record_packet(PacketDetail {
+                        summary: PacketSummary {
+                            id: 0,
+                            sequence: 1,
+                            connection_id: connection.id,
+                            timestamp_micros: 1,
+                            source: TrafficSource::Minecraft,
+                            direction: Direction::ClientToServer,
+                            state: ProtocolState::Play,
+                            protocol_version: Some(767),
+                            packet_id: Some(0),
+                            name: Some("quiet_probe".into()),
+                            channel: None,
+                            loader: None,
+                            size: 1,
+                            disposition: Disposition::Forwarded,
+                            flow: None,
+                        },
+                        logical_bytes: Bytes::from_static(&[0]),
+                        decoded: None,
+                        decode_error: None,
+                        wire: WireMetadata::default(),
+                    })
+                    .await;
+                tokio::time::sleep(FLUSH_INTERVAL * 3).await;
+            });
+
+        let packets = store
+            .query_packets(Some(connection.id), 0, 10)
+            .expect("query persisted packet");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].name.as_deref(), Some("quiet_probe"));
     }
 
     #[test]
@@ -1966,6 +2169,7 @@ mod tests {
         let service = ProxyService::new();
         service
             .set_replacement_rules(vec![ReplacementRule {
+                action: mineburp_core::ReplacementAction::Rewrite,
                 id: Uuid::nil(),
                 name: "everything".into(),
                 enabled: true,
@@ -2004,6 +2208,56 @@ mod tests {
                 .rewrite(&detail, ProtocolState::Play, Direction::ServerToClient)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn modern_custom_payload_rows_carry_the_channel() {
+        let service = ProxyService::new();
+        let session = handle(771);
+        let mut body = vec![18];
+        body.extend_from_slice(b"mineburp:inventory");
+        body.extend_from_slice(&[2, 0, 0, 0, 1]);
+        let packet = PacketFrame {
+            id: 0x15,
+            body: Bytes::from(body),
+            compressed: false,
+            wire_length: 0,
+        };
+        let detail = service.make_detail(
+            &session,
+            Direction::ClientToServer,
+            &packet,
+            Disposition::Forwarded,
+            ProtocolState::Play,
+            false,
+        );
+        assert_eq!(detail.summary.name.as_deref(), Some("custom_payload"));
+        assert_eq!(
+            detail.summary.channel.as_deref(),
+            Some("mineburp:inventory")
+        );
+    }
+
+    #[test]
+    fn loader_markers_are_recognised() {
+        assert_eq!(
+            split_address("play.example\0FORGE"),
+            ("play.example", "\0FORGE")
+        );
+        assert_eq!(split_address("play.example"), ("play.example", ""));
+        assert_eq!(
+            loader_from_address("play.example\0FORGE").as_deref(),
+            Some("forge")
+        );
+        assert_eq!(
+            loader_from_address("localhost\0FML2\0").as_deref(),
+            Some("forge")
+        );
+        assert_eq!(
+            loader_from_address("localhost\0FML3\0").as_deref(),
+            Some("neoforge")
+        );
+        assert_eq!(loader_from_address("forge.example.net"), None);
     }
 
     #[tokio::test]

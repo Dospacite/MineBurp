@@ -242,6 +242,61 @@ async fn direct_sessions_rewrite_the_handshake_to_the_target() {
     assert_eq!(forwarded.server_port, port);
 }
 
+/// An Intercept edit is applied before the target rewrite, so editing one
+/// handshake field keeps the rest pointed at the target, while an edited host
+/// is the operator's and is forwarded as written.
+#[tokio::test]
+async fn edited_handshakes_keep_the_target_rewrite() {
+    for (edited_host, expected_host) in [
+        (
+            format!("{CLIENT_ADDRESS}\0FORGE"),
+            "127.0.0.1\0FORGE".to_owned(),
+        ),
+        (
+            "chosen.example\0FORGE".to_owned(),
+            "chosen.example\0FORGE".to_owned(),
+        ),
+    ] {
+        let proxy = ProxyService::new();
+        proxy
+            .set_intercept_settings(InterceptSettings {
+                enabled: true,
+                client_to_server: true,
+                server_to_client: false,
+                expression: "name == handshake".into(),
+                ..InterceptSettings::default()
+            })
+            .expect("intercept settings");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let mut client = session(&proxy, &listener).await;
+        client.send(0, &handshake(1)).await;
+        wait_until(|| !proxy.intercepted().is_empty(), "the held handshake").await;
+        let held = proxy.intercepted()[0].clone();
+        let mut logical = vec![0_u8];
+        logical.extend_from_slice(
+            &encode_handshake(&Handshake {
+                protocol_version: PROTOCOL_VERSION,
+                server_address: edited_host,
+                server_port: 25_565,
+                next_state: 1,
+            })
+            .expect("edited handshake"),
+        );
+        proxy
+            .resolve_intercept(held.id, InterceptDecision::Replace(Bytes::from(logical)))
+            .expect("forward the edit");
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut server = Link::new(stream);
+        let forwarded = decode_handshake(&server.receive().await.body).expect("handshake");
+        assert_eq!(forwarded.server_address, expected_host);
+        assert_eq!(
+            forwarded.server_port, port,
+            "the unedited port follows the target"
+        );
+    }
+}
+
 #[tokio::test]
 async fn repeater_refuses_to_inject_during_login() {
     let proxy = ProxyService::new();
@@ -264,4 +319,67 @@ async fn repeater_refuses_to_inject_during_login() {
         .repeater_send(id, Direction::ClientToServer, Bytes::from_static(&[0, 1]))
         .await;
     assert!(matches!(result, Err(ProxyError::ConnectionNotReady(_))));
+}
+
+#[tokio::test]
+async fn automatic_blockers_also_apply_to_liveness_bypassing_a_hold() {
+    use mineburp_core::{Disposition, ReplacementAction, ReplacementRule};
+    use mineburp_proxy::ProxyEvent;
+    let proxy = ProxyService::new();
+    let mut events = proxy.subscribe();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = session(&proxy, &listener).await;
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut server = Link::new(stream);
+    enter_play(&mut client, &mut server).await;
+    proxy
+        .set_replacement_rules(vec![ReplacementRule {
+            action: ReplacementAction::Drop,
+            id: uuid::Uuid::new_v4(),
+            name: "Block keep-alive".into(),
+            enabled: true,
+            expression: "state == play && direction == server_to_client && name == keep_alive"
+                .into(),
+            edits: vec![],
+        }])
+        .unwrap();
+    proxy
+        .set_intercept_settings(InterceptSettings {
+            enabled: true,
+            client_to_server: false,
+            server_to_client: true,
+            ..InterceptSettings::default()
+        })
+        .unwrap();
+    let chat = play_id(Direction::ServerToClient, "system_chat");
+    let keep_alive = play_id(Direction::ServerToClient, "keep_alive");
+    server.send(chat, &string_bytes("held")).await;
+    wait_until(|| !proxy.intercepted().is_empty(), "the held chat").await;
+    server.send(keep_alive, &42_i64.to_be_bytes()).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let ProxyEvent::Packet(summary) = events.recv().await.unwrap() {
+                if summary.disposition == Disposition::Dropped {
+                    assert_eq!(summary.packet_id, Some(keep_alive));
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        proxy.intercepted().len(),
+        1,
+        "the original chat is still held"
+    );
+    let held = proxy.intercepted()[0].id;
+    proxy
+        .resolve_intercept(held, InterceptDecision::Forward)
+        .unwrap();
+    assert_eq!(
+        client.receive().await.id,
+        chat,
+        "the dropped keep-alive must not arrive first"
+    );
 }

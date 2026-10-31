@@ -9,7 +9,7 @@ use std::{
 use mineburp_auth::{AuthClient, MinecraftSession, PkceVerifier};
 use mineburp_capture::{SideCapture, SystemCapture};
 use mineburp_launcher::{LauncherConfig, LauncherService};
-use mineburp_project::{ProjectError, ProjectOptions, ProjectStore};
+use mineburp_project::{ProjectError, ProjectInfo, ProjectOptions, ProjectStore};
 use mineburp_proxy::ProxyService;
 use mineburp_session::{BrokerError, ClientAssistBroker, SessionJoinProvider, SessionJoinRequest};
 use parking_lot::RwLock;
@@ -123,6 +123,30 @@ impl DesktopState {
         if let Some(path) = discarded {
             remove_project_files(&path);
         }
+    }
+
+    /// Loads a project's schema packs and rules into the proxy and makes it
+    /// current. Shared by the project commands and the MCP server.
+    pub async fn install_project(&self, store: ProjectStore) -> Result<ProjectInfo, String> {
+        let info = store.info().clone();
+        let asset_store = store.clone();
+        let (packs, replacements) = tauri::async_runtime::spawn_blocking(move || {
+            Ok::<_, ProjectError>((
+                asset_store.load_schema_packs()?,
+                asset_store.load_replacement_rules()?,
+            ))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        self.proxy
+            .set_schema_packs(packs)
+            .map_err(|error| error.to_string())?;
+        self.proxy
+            .set_replacement_rules(replacements)
+            .map_err(|error| error.to_string())?;
+        self.adopt_project(store);
+        Ok(info)
     }
 
     /// Closes and removes the scratch project, if the session is still on one.

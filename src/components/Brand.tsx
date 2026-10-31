@@ -4,7 +4,7 @@ export function Brand() {
       <span className="brand-mark" aria-hidden="true">
         MB
       </span>
-      <span>MineBurp</span>
+      <span className="brand-name">MineBurp</span>
     </div>
   );
 }

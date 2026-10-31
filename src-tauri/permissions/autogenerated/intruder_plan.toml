@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-intruder-plan"
+description = "Enables the intruder_plan command without any pre-configured scope."
+commands.allow = ["intruder_plan"]
+
+[[permission]]
+identifier = "deny-intruder-plan"
+description = "Denies the intruder_plan command without any pre-configured scope."
+commands.deny = ["intruder_plan"]

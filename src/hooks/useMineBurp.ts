@@ -240,6 +240,24 @@ export function useMineBurp() {
     // Both writers coalesce their own appends in the backend, so this fires a
     // handful of times a second rather than once per packet.
     const stopAppends = subscription(desktop.onPacketsAppended(() => setAppendSignal((value) => value + 1)));
+    // An MCP client acted on the app: pull what it may have changed. Intercept
+    // settings must be refetched before the next UI patch builds on them, or
+    // that patch would quietly revert the agent's change.
+    const stopMcpChanges = subscription(
+      desktop.onMcpChange((topic) => {
+        if (topic === "intercept") {
+          void desktop
+            .interceptSettings()
+            .then((next) => {
+              interceptRef.current = next;
+              setInterceptSettingsState(next);
+            })
+            .catch((reason) => setError(message(reason)));
+        }
+        if (topic === "packets" || topic === "annotations") setAppendSignal((value) => value + 1);
+        void refresh();
+      }),
+    );
     // Already coalesced by the backend; logged rather than toasted so a
     // failing writer cannot keep covering the window.
     const stopBackendErrors = subscription(
@@ -249,6 +267,7 @@ export function useMineBurp() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
       stopProxyEvents();
+      stopMcpChanges();
       stopAppends();
       stopBackendErrors();
     };

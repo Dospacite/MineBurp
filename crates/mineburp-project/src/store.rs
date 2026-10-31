@@ -27,7 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize as _;
 
-const PROJECT_SCHEMA_VERSION: i32 = 5;
+const PROJECT_SCHEMA_VERSION: i32 = 6;
 
 /// How long one read query may run before it is interrupted.
 ///
@@ -209,6 +209,10 @@ pub struct PacketQuery {
     pub after_id: Option<i64>,
     /// Only bookmarked (`Some(true)`) or only unbookmarked (`Some(false)`) rows.
     pub bookmarked: Option<bool>,
+    /// Orders the whole result by id ascending and returns it that way, so
+    /// the first page is the start of the history and `after_id` pages
+    /// forward. Without it rows come newest first and `before_id` pages back.
+    pub oldest_first: bool,
 }
 
 /// A slice of one packet's payload plus everything needed to describe it.
@@ -719,7 +723,8 @@ impl ProjectStore {
         // A tail read (`after_id` alone) takes the oldest rows past the cursor:
         // the newest ones would leave a hole whenever more than a page arrived
         // between two reads.
-        let ascending = query.after_id.is_some() && query.before_id.is_none();
+        let ascending =
+            query.oldest_first || (query.after_id.is_some() && query.before_id.is_none());
         let order = if ascending { "ASC" } else { "DESC" };
         let sql = format!(
             "SELECT {SUMMARY_COLUMNS} FROM packets{} ORDER BY id {order} LIMIT ? OFFSET ?",
@@ -735,7 +740,7 @@ impl ProjectStore {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(ProjectError::from)
         })?;
-        if ascending {
+        if ascending && !query.oldest_first {
             rows.reverse();
         }
         Ok(rows)
@@ -800,15 +805,29 @@ impl ProjectStore {
         let target = path
             .to_str()
             .ok_or_else(|| ProjectError::Corrupt("project path is not valid UTF-8".into()))?;
+        // Reopened writer connections omit SQLITE_OPEN_CREATE, which SQLite
+        // also applies to ATTACH. Reserve an empty destination explicitly so
+        // Save as works after reopening, with atomic creation and private mode.
+        let mut create = std::fs::OpenOptions::new();
+        create.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            create.mode(0o600);
+        }
+        drop(create.open(&path)?);
         {
             let connection = self.connection.lock();
             let version: i32 =
                 connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
             // An empty key attaches the copy as plaintext SQLite.
-            connection.execute(
+            if let Err(error) = connection.execute(
                 "ATTACH DATABASE ?1 AS saved KEY ?2",
                 params![target, options.passphrase.as_deref().unwrap_or("")],
-            )?;
+            ) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error.into());
+            }
             let exported = connection
                 .query_row("SELECT sqlcipher_export('saved')", [], |_| Ok(()))
                 .and_then(|()| {
@@ -880,6 +899,26 @@ impl ProjectStore {
 
     pub fn save_repeater_tab(&self, tab: &RepeaterTab) -> Result<(), ProjectError> {
         self.ensure_writable()?;
+        if let Some(history) = &tab.edit_history {
+            let total = history.original.len()
+                + history.past.iter().map(String::len).sum::<usize>()
+                + history.future.iter().map(String::len).sum::<usize>()
+                + history
+                    .revisions
+                    .iter()
+                    .map(|r| r.hex.len() + r.name.len())
+                    .sum::<usize>();
+            if history.past.len() > 100
+                || history.future.len() > 100
+                || history.revisions.len() > 20
+                || total > 8 * 1024 * 1024
+                || history.revisions.iter().any(|r| r.name.len() > 320)
+            {
+                return Err(ProjectError::Corrupt(
+                    "Repeater edit history exceeds its limit".into(),
+                ));
+            }
+        }
         let payload =
             serde_json::to_string(tab).map_err(|error| ProjectError::Corrupt(error.to_string()))?;
         self.connection.lock().execute(
@@ -1394,6 +1433,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
            updated_at_micros INTEGER NOT NULL
          );",
     ),
+    (6, "CREATE TABLE IF NOT EXISTS workbench_documents(
+        key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at_micros INTEGER NOT NULL
+    );"),
 ];
 
 /// Accumulates `WHERE` fragments alongside their bound values.
@@ -2776,6 +2818,7 @@ mod tests {
         )
         .unwrap();
         let rule = ReplacementRule {
+            action: mineburp_core::ReplacementAction::Rewrite,
             id: Uuid::new_v4(),
             name: "Blank the brand".into(),
             enabled: true,
@@ -2854,11 +2897,13 @@ mod tests {
         assert_eq!(matching[0].name.as_deref(), Some("keep_alive"));
 
         let tab = RepeaterTab {
+            edit_history: None,
             id: Uuid::new_v4(),
             name: "Probe".into(),
             connection_id: id,
             direction: Direction::ClientToServer,
             state: ProtocolState::Play,
+            protocol_version: Some(767),
             logical_bytes: Bytes::from_static(&[1, 2]),
             decoded: None,
         };
@@ -2982,6 +3027,32 @@ mod tests {
             .unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].sequence, 11);
+
+        // Oldest first orders the whole history, not one page: the first page
+        // is the start of it and `after_id` pages forward from there.
+        let first = store
+            .query_packets_filtered(&PacketQuery {
+                limit: 3,
+                oldest_first: true,
+                ..PacketQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[1], ids[2]]
+        );
+        let next = store
+            .query_packets_filtered(&PacketQuery {
+                after_id: Some(first[2].id),
+                limit: 3,
+                oldest_first: true,
+                ..PacketQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            next.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![ids[3], ids[4], ids[5]]
+        );
     }
 
     #[test]

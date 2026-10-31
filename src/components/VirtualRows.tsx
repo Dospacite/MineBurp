@@ -15,8 +15,12 @@ const OVERSCAN = 12;
 
 export interface VirtualRowsHandle {
   scrollToTop: () => void;
-  /** Brings a row into view and reports the element to focus. */
-  revealRow: (index: number) => HTMLElement | null;
+  /**
+   * Brings a row into view and reports the element to focus. `center` puts
+   * it in the middle of the viewport, for a jump to a row far from the last
+   * one; the default scrolls as little as possible.
+   */
+  revealRow: (index: number, align?: "nearest" | "center") => HTMLElement | null;
 }
 
 /**
@@ -70,6 +74,7 @@ export function VirtualRows<T>({
   handleRef?: (handle: VirtualRowsHandle | null) => void;
 }) {
   const viewport = useRef<HTMLDivElement | null>(null);
+  const headerBox = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [height, setHeight] = useState(0);
   const frame = useRef(0);
@@ -91,12 +96,14 @@ export function VirtualRows<T>({
       scrollToTop: () => {
         if (viewport.current) viewport.current.scrollTop = 0;
       },
-      revealRow: (index) => {
+      revealRow: (index, align = "nearest") => {
         const element = viewport.current;
         if (!element) return null;
         const top = index * rowHeight;
         const bottom = top + rowHeight;
-        if (top < element.scrollTop) {
+        if (align === "center") {
+          element.scrollTop = Math.max(0, top - (element.clientHeight - rowHeight) / 2);
+        } else if (top < element.scrollTop) {
           element.scrollTop = top;
         } else if (bottom > element.scrollTop + element.clientHeight) {
           element.scrollTop = bottom - element.clientHeight;
@@ -111,6 +118,9 @@ export function VirtualRows<T>({
   }, [handleRef, rowHeight]);
 
   const onScroll = useCallback(() => {
+    // Rows wider than a narrow pane scroll sideways; the header follows at once
+    // so the columns never drift apart, even between animation frames.
+    if (headerBox.current && viewport.current) headerBox.current.scrollLeft = viewport.current.scrollLeft;
     if (frame.current) return;
     frame.current = requestAnimationFrame(() => {
       frame.current = 0;
@@ -155,7 +165,11 @@ export function VirtualRows<T>({
       aria-rowcount={items.length + (header ? 1 : 0)}
       style={style}
     >
-      {header}
+      {header && (
+        <div className="virtual-header" ref={headerBox}>
+          {header}
+        </div>
+      )}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: the viewport holds the grid's tab stop only while the active row is scrolled out of the window. */}
       <div
         className="virtual-viewport"

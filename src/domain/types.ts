@@ -6,7 +6,10 @@ export type View =
   | "schemas"
   | "instances"
   | "compare"
-  | "stats";
+  | "stats"
+  | "intruder"
+  | "sequencer"
+  | "channels";
 export type Direction = "client_to_server" | "server_to_client";
 export type TrafficSource = "minecraft" | "side_channel";
 export type Disposition = "forwarded" | "dropped" | "edited" | "delayed" | "replayed" | "observed" | "failed";
@@ -123,6 +126,8 @@ export type FieldKind =
   | "bool"
   | "u8"
   | "i8"
+  /** The low seven bits of a byte whose top bit flags "another element follows". */
+  | "flagged_u7"
   | "i16"
   | "u16"
   | "i32"
@@ -130,7 +135,13 @@ export type FieldKind =
   | "f32"
   | "f64"
   | "bytes"
-  | "prefixed_bytes";
+  | "prefixed_bytes"
+  /** NBT shown and edited as JSON; empty text is an absent value. */
+  | "nbt"
+  /** Pre-1.20.2 NBT with a root name, as JSON with an optional `"name":` prefix. */
+  | "named_nbt"
+  /** NBT behind a VarInt byte length, edited as JSON; the length follows the edit. */
+  | "prefixed_nbt";
 
 /** One decoded value together with the bytes it occupies in the frame. */
 export interface FieldSpan {
@@ -157,8 +168,9 @@ export interface PacketView {
   summary: PacketSummary;
   wire: WireMetadata;
   insight: PacketInsight;
-  stored_decoded: unknown | null;
-  stored_decode_error: string | null;
+  /** A matching schema pack's decode; the built-in decode is in `insight`. */
+  schema_decoded: unknown | null;
+  schema_decode_error: string | null;
   total_bytes: number;
   bytes_offset: number;
   bytes_base64: string;
@@ -170,12 +182,22 @@ export interface ByteWindow {
   base64: string;
 }
 
+export interface RepeaterEditHistory {
+  original_available?: boolean;
+  original: string;
+  past: string[];
+  future: string[];
+  revisions: Array<{ name: string; hex: string }>;
+}
 export interface RepeaterTab {
+  edit_history?: RepeaterEditHistory | null;
   id: string;
   name: string;
   connection_id: string;
   direction: Direction;
   state: ProtocolState;
+  /** Absent on tabs saved before the version was recorded. */
+  protocol_version?: number | null;
   logical_bytes: number[];
   decoded: unknown | null;
 }
@@ -197,6 +219,7 @@ export type PacketEditKind = PacketEdit["kind"];
  * An empty expression matches every packet.
  */
 export interface ReplacementRule {
+  action?: "rewrite" | "drop";
   id: string;
   name: string;
   enabled: boolean;
@@ -343,6 +366,11 @@ export interface PacketHistoryQuery extends Partial<PacketFilter> {
   beforeId?: number | null;
   /** Keyset cursor: rows newer than this id. */
   afterId?: number | null;
+  /**
+   * Orders the whole matching history by id ascending: the first page is the
+   * start of it and `afterId` pages forward. Otherwise rows come newest first.
+   */
+  oldestFirst?: boolean;
 }
 
 export interface FilterVocabulary {
@@ -360,7 +388,7 @@ export type ProxyEvent =
   | { type: "error"; payload: { connection_id: string; message: string } }
   | { type: "intercept_queue"; payload: { pending: number } };
 
-/** What Intercept holds. Handshake and login frames are never held. */
+/** What Intercept holds across each decoded protocol phase. */
 export interface InterceptSettings {
   enabled: boolean;
   client_to_server: boolean;
@@ -544,3 +572,40 @@ export interface CompactSummary {
 
 /** How the history's time column reads a timestamp. */
 export type TimeMode = "absolute" | "relative" | "delta";
+
+export type AttackMode = "sniper" | "battering_ram" | "pitchfork" | "cluster_bomb";
+export interface SequenceAnalysis {
+  samples: number;
+  unique: number;
+  duplicates: number;
+  min_length: number;
+  max_length: number;
+  adjacent_equal: number;
+  serial_correlation: number | null;
+  positions: Array<{
+    offset: number;
+    samples: number;
+    distinct: number;
+    entropy_bits: number;
+    most_common_fraction: number;
+  }>;
+}
+
+export interface ChannelStat {
+  channel: string;
+  direction: Direction;
+  state: ProtocolState;
+  protocolVersion: number | null;
+  packets: number;
+  bytes: number;
+  connections: number;
+  firstTimestampMicros: number;
+  lastTimestampMicros: number;
+  samplePacketId: number;
+}
+
+export type PayloadGenerator =
+  | { kind: "numbers"; start: string; end: string; step: string }
+  | { kind: "boundaries"; bits: number; signed: boolean }
+  | { kind: "lengths"; start: number; end: number; step: number; unit: string }
+  | { kind: "values"; values: string[] };

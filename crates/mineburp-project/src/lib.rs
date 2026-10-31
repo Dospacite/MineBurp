@@ -11,3 +11,6 @@ pub use store::{
     ContentMode, ContentQuery, ContentScope, DEFAULT_QUERY_BUDGET, PacketQuery, PacketWindow,
     ProjectError, ProjectInfo, ProjectOptions, ProjectStore, SearchTerm,
 };
+
+mod workbench;
+pub use workbench::ChannelStat;

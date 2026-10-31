@@ -198,6 +198,7 @@ export function InterceptView({
   // Ctrl/Cmd+Enter forwards from anywhere; Ctrl/Cmd+Backspace drops outside text fields.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (document.querySelector('[role="dialog"]')) return;
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       if (event.key === "Enter") {
         event.preventDefault();

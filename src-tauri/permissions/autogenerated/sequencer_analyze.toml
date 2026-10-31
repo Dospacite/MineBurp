@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sequencer-analyze"
+description = "Enables the sequencer_analyze command without any pre-configured scope."
+commands.allow = ["sequencer_analyze"]
+
+[[permission]]
+identifier = "deny-sequencer-analyze"
+description = "Denies the sequencer_analyze command without any pre-configured scope."
+commands.deny = ["sequencer_analyze"]

@@ -14,7 +14,9 @@ use mineburp_protocol::{
     EncryptionRequest, EncryptionResponse, FrameCodec, Handshake, MinecraftCipher, PacketFrame,
     encode_handshake, encode_var_i32,
 };
-use mineburp_proxy::{ProxyEvent, ProxyService, SessionOptions};
+use mineburp_proxy::{
+    InterceptDecision, InterceptSettings, ProxyEvent, ProxyService, SessionOptions,
+};
 use mineburp_session::{SessionJoinProvider, SessionJoinRequest};
 use rsa::{
     Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
@@ -194,19 +196,48 @@ impl SessionJoinProvider for NeverJoins {
 
 #[tokio::test]
 async fn online_mode_login_completes_through_the_proxy() {
-    login_through_the_proxy(true, Arc::new(AlwaysJoins)).await;
+    login_through_the_proxy(true, Arc::new(AlwaysJoins), LoginHold::None).await;
 }
 
 /// A 1.20.5+ server can encrypt without authenticating; the vanilla client
 /// then skips its join, so the proxy must not wait for one.
 #[tokio::test]
 async fn a_server_that_skips_authentication_gets_no_join() {
-    login_through_the_proxy(false, Arc::new(NeverJoins)).await;
+    login_through_the_proxy(false, Arc::new(NeverJoins), LoginHold::None).await;
+}
+
+#[tokio::test]
+async fn the_encryption_response_can_be_held_before_ciphers_start() {
+    login_through_the_proxy(true, Arc::new(AlwaysJoins), LoginHold::EncryptionResponse).await;
+}
+
+/// Editing the server's Encryption Request in Intercept must not undo the
+/// proxy's key swap, and the edited `should_authenticate` is what the client
+/// sees and what decides whether the proxy joins.
+#[tokio::test]
+async fn an_edited_encryption_request_keeps_the_bridge_and_the_edit() {
+    login_through_the_proxy(true, Arc::new(NeverJoins), LoginHold::SkipAuthentication).await;
+}
+
+#[tokio::test]
+async fn set_compression_can_be_held_before_a_compressed_frame() {
+    login_through_the_proxy(true, Arc::new(AlwaysJoins), LoginHold::SetCompression).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginHold {
+    None,
+    EncryptionResponse,
+    SetCompression,
+    /// Holds the Encryption Request and forwards it with
+    /// `should_authenticate = false`.
+    SkipAuthentication,
 }
 
 async fn login_through_the_proxy(
     should_authenticate: bool,
     provider: Arc<dyn SessionJoinProvider>,
+    hold: LoginHold,
 ) {
     let private_key = RsaPrivateKey::new(&mut OsRng, 1024).expect("server key");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -216,6 +247,23 @@ async fn login_through_the_proxy(
     let proxy = ProxyService::new();
     let mut events = proxy.subscribe();
     proxy.set_session_join_provider(Some(provider));
+    if hold != LoginHold::None {
+        let expression = match hold {
+            LoginHold::None => unreachable!(),
+            LoginHold::EncryptionResponse => "name == encryption_response",
+            LoginHold::SetCompression => "name == set_compression",
+            LoginHold::SkipAuthentication => "name == encryption_request",
+        };
+        proxy
+            .set_intercept_settings(InterceptSettings {
+                enabled: true,
+                client_to_server: true,
+                server_to_client: true,
+                expression: expression.into(),
+                ..InterceptSettings::default()
+            })
+            .expect("intercept settings");
+    }
     let snapshot = proxy
         .start_session(SessionOptions::new(Target {
             host: "127.0.0.1".into(),
@@ -245,12 +293,36 @@ async fn login_through_the_proxy(
     login_start.extend_from_slice(&[0_u8; 16]);
     client.send(0, &login_start).await;
 
+    let client_should_authenticate = if hold == LoginHold::SkipAuthentication {
+        let held_request = wait_for_held(&proxy, "the encryption request").await;
+        let frame =
+            PacketFrame::from_logical_bytes(held_request.logical_bytes.clone()).expect("frame");
+        let mut edited =
+            EncryptionRequest::decode_for(&frame.body, PROTOCOL_VERSION).expect("held request");
+        assert!(
+            edited.should_authenticate,
+            "the server asked to authenticate"
+        );
+        edited.should_authenticate = false;
+        let mut logical = encode_var_i32(1).to_vec();
+        logical.extend_from_slice(&edited.encode_for(PROTOCOL_VERSION).expect("encode"));
+        proxy
+            .resolve_intercept(
+                held_request.id,
+                InterceptDecision::Replace(Bytes::from(logical)),
+            )
+            .expect("forward the edited request");
+        false
+    } else {
+        should_authenticate
+    };
+
     let request_frame = client.receive().await;
     assert_eq!(request_frame.id, 1, "encryption request");
     let request = EncryptionRequest::decode(&request_frame.body).expect("request");
     assert_eq!(
-        request.should_authenticate, should_authenticate,
-        "the client sees the server's authentication choice"
+        request.should_authenticate, client_should_authenticate,
+        "the client sees the authentication choice it was sent"
     );
     let proxy_key = RsaPublicKey::from_public_key_der(&request.public_key_der)
         .expect("the proxy must present its own key");
@@ -273,7 +345,26 @@ async fn login_through_the_proxy(
             &response.encode(PROTOCOL_VERSION).expect("encode response"),
         )
         .await;
+    if hold == LoginHold::EncryptionResponse {
+        let held = wait_for_held(&proxy, "the encryption response").await;
+        assert_eq!(held.summary.state, mineburp_core::ProtocolState::Login);
+        assert_eq!(held.summary.name.as_deref(), Some("encryption_response"));
+        proxy
+            .resolve_intercept(held.id, InterceptDecision::Forward)
+            .expect("forward encryption response");
+    }
     client.enable_encryption();
+
+    if hold == LoginHold::SetCompression {
+        let held = wait_for_held(&proxy, "set compression").await;
+        assert_eq!(held.summary.name.as_deref(), Some("set_compression"));
+        // The server already wrote its compressed successor. Give the proxy a
+        // chance to prefetch it while Set Compression is still held.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        proxy
+            .resolve_intercept(held.id, InterceptDecision::Forward)
+            .expect("forward set compression");
+    }
 
     let compression = client.receive().await;
     assert_eq!(compression.id, 3, "set compression reaches the client");
@@ -317,4 +408,17 @@ async fn login_through_the_proxy(
         Some(COMPRESSION_THRESHOLD),
         "the proxy tracked the negotiated compression threshold"
     );
+}
+
+async fn wait_for_held(proxy: &ProxyService, what: &str) -> mineburp_proxy::InterceptedPacket {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(held) = proxy.intercepted().first() {
+                break held.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} must be held"))
 }

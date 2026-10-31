@@ -164,8 +164,18 @@ pub struct ReplacementRule {
     pub name: String,
     pub enabled: bool,
     pub expression: String,
+    #[serde(default)]
+    pub action: ReplacementAction,
     /// Applied in order; each edit sees the output of the one before it.
     pub edits: Vec<PacketEdit>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementAction {
+    #[default]
+    Rewrite,
+    Drop,
 }
 
 /// One rewrite applied to a logical frame.
@@ -227,9 +237,34 @@ pub struct RepeaterTab {
     pub connection_id: ConnectionId,
     pub direction: Direction,
     pub state: ProtocolState,
+    /// The protocol the frame was written for. Without it a reopened tab is
+    /// decoded against whatever its connection reports, or no table at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<i32>,
     #[serde(with = "bytes_serde")]
     pub logical_bytes: Bytes,
     pub decoded: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_history: Option<RepeaterEditHistory>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RepeaterEditHistory {
+    #[serde(default = "original_available")]
+    pub original_available: bool,
+    pub original: String,
+    pub past: Vec<String>,
+    pub future: Vec<String>,
+    pub revisions: Vec<RepeaterRevision>,
+}
+fn original_available() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepeaterRevision {
+    pub name: String,
+    pub hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

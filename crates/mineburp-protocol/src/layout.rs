@@ -33,6 +33,10 @@ pub enum FieldKind {
     Bool,
     U8,
     I8,
+    /// The low seven bits of a byte whose top bit says another array element
+    /// follows (`topBitSetTerminatedArray`, e.g. an equipment slot). Editing
+    /// sets the seven bits and keeps the flag the byte had.
+    FlaggedU7,
     I16,
     U16,
     I32,
@@ -44,6 +48,15 @@ pub enum FieldKind {
     /// Hex bytes written back with a `VarInt` length prefix, so editing one
     /// rewrites its own prefix rather than leaving a lie in front of it.
     PrefixedBytes,
+    /// Network NBT (no root name), shown and edited as JSON text. Empty text
+    /// is an absent optional value (`TAG_End`).
+    Nbt,
+    /// Pre-1.20.2 NBT with a named root, edited as JSON; a non-empty root
+    /// name is shown as a `"name": value` prefix.
+    NamedNbt,
+    /// Network NBT behind a `VarInt` byte length, edited as JSON. The span
+    /// covers the length too, so an edit that resizes the NBT rewrites it.
+    PrefixedNbt,
 }
 
 /// One value inside a frame, with the bytes it occupies.
@@ -86,6 +99,37 @@ pub fn layout_logical(
     logical: &[u8],
     protocol_version: Option<i32>,
 ) -> PacketLayout {
+    let mut layout = walk_logical(state, direction, logical, protocol_version);
+    for field in &mut layout.fields {
+        exact_in_javascript(field);
+    }
+    layout
+}
+
+/// The largest integer a JavaScript number holds exactly (2^53 - 1).
+const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+
+/// Sends a 64-bit value JavaScript would round (a timestamp, a salt, a seed)
+/// as its decimal text instead, so the Repeater shows and keeps the real
+/// value. [`encode_field_over`] reads either form.
+fn exact_in_javascript(field: &mut FieldSpan) {
+    if !matches!(field.kind, FieldKind::I64 | FieldKind::VarLong) {
+        return;
+    }
+    if let Value::Number(number) = &field.value
+        && let Some(value) = number.as_i64()
+        && value.unsigned_abs() > MAX_SAFE_INTEGER.unsigned_abs()
+    {
+        field.value = Value::String(value.to_string());
+    }
+}
+
+fn walk_logical(
+    state: ProtocolState,
+    direction: Direction,
+    logical: &[u8],
+    protocol_version: Option<i32>,
+) -> PacketLayout {
     let mut builder = Builder::new(logical);
 
     if matches!(state, ProtocolState::Opaque | ProtocolState::Closed) {
@@ -108,32 +152,103 @@ pub fn layout_logical(
     let hand_complete = !builder.stopped
         && builder.remaining() == 0
         && (builder.fields.len() > 1 || body.is_empty());
-    if !hand_complete
-        && let Some(definition) =
-            protodef::decode_packet(state, direction, packet_id, body, protocol_version)
+    if hand_complete {
+        return builder.finish(name);
+    }
+    let definition = protodef::decode_packet(state, direction, packet_id, body, protocol_version);
+    if let Some(definition) = &definition
         && definition.is_complete()
     {
-        let mut fields = Vec::with_capacity(definition.spans.len() + 1);
-        fields.push(builder.fields.swap_remove(0));
-        fields.extend(definition.spans.into_iter().map(|span| FieldSpan {
-            offset: span.offset + prefix,
-            ..span
-        }));
-        return PacketLayout {
+        return definition_layout(
             name,
-            fields,
-            complete: true,
-        };
+            builder.fields.swap_remove(0),
+            &definition.spans,
+            prefix,
+            true,
+        );
     }
-    builder.bytes("body");
+    // Neither walker reached the end. Keep whichever accounted for more of
+    // the frame and show only the rest as hex, so an edit that breaks the
+    // tail (a count, a type tag) does not turn every field into one blob.
+    let hand_end = builder.reader.position();
+    if let Some(definition) = definition {
+        let spans = contiguous(&definition.spans);
+        let end = spans.last().map_or(0, |span| span.offset + span.length) + prefix;
+        if end > hand_end {
+            let mut layout =
+                definition_layout(name, builder.fields.swap_remove(0), spans, prefix, false);
+            if end < logical.len() {
+                layout.fields.push(FieldSpan {
+                    name: "rest".into(),
+                    kind: FieldKind::Bytes,
+                    offset: end,
+                    length: logical.len() - end,
+                    value: Value::String(to_hex(&logical[end..])),
+                });
+            }
+            return layout;
+        }
+    }
+    let rest_name = if builder.fields.len() > 1 {
+        "rest"
+    } else {
+        "body"
+    };
+    builder.bytes(rest_name);
     builder.finish(name)
+}
+
+/// The leading run of spans that tile the body without gaps or overlaps.
+fn contiguous(spans: &[FieldSpan]) -> &[FieldSpan] {
+    let mut cursor = 0;
+    let count = spans
+        .iter()
+        .take_while(|span| {
+            let next = span.offset == cursor;
+            cursor = span.offset + span.length;
+            next
+        })
+        .count();
+    &spans[..count]
+}
+
+fn definition_layout(
+    name: Option<String>,
+    packet_id: FieldSpan,
+    spans: &[FieldSpan],
+    prefix: usize,
+    complete: bool,
+) -> PacketLayout {
+    let mut fields = Vec::with_capacity(spans.len() + 2);
+    fields.push(packet_id);
+    fields.extend(spans.iter().map(|span| FieldSpan {
+        offset: span.offset + prefix,
+        ..span.clone()
+    }));
+    PacketLayout {
+        name,
+        fields,
+        complete,
+    }
 }
 
 /// Encodes one field value back into bytes.
 ///
 /// The Repeater sends the edited value here rather than encoding it itself, so
-/// the wire format lives in exactly one place.
+/// the wire format lives in exactly one place. Without the bytes being
+/// replaced, NBT types are inferred; see [`encode_field_over`].
 pub fn encode_field(kind: FieldKind, value: &Value) -> Result<Vec<u8>, String> {
+    encode_field_over(kind, value, None)
+}
+
+/// Encodes a field value that replaces `original`, the bytes the field
+/// occupies now. NBT edited as JSON keeps the tag types those bytes had, so
+/// `1` under a byte stays a byte.
+pub fn encode_field_over(
+    kind: FieldKind,
+    value: &Value,
+    original: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     let integer = |bits: u32, signed: bool| -> Result<i64, String> {
         let number = match value {
             Value::Number(number) => number.as_i64().ok_or("value is not a whole number")?,
@@ -176,6 +291,14 @@ pub fn encode_field(kind: FieldKind, value: &Value) -> Result<Vec<u8>, String> {
             _ => return Err("value is not a boolean".into()),
         })],
         FieldKind::U8 => vec![u8::try_from(integer(8, false)?).map_err(|_| "out of range")?],
+        FieldKind::FlaggedU7 => {
+            let low = u8::try_from(integer(7, false)?).map_err(|_| "out of range")?;
+            vec![
+                low | original
+                    .and_then(|bytes| bytes.first())
+                    .map_or(0, |byte| byte & 0x80),
+            ]
+        }
         FieldKind::I8 => vec![
             i8::try_from(integer(8, true)?)
                 .map_err(|_| "out of range")?
@@ -212,7 +335,47 @@ pub fn encode_field(kind: FieldKind, value: &Value) -> Result<Vec<u8>, String> {
             bytes.extend_from_slice(&payload);
             bytes
         }
+        FieldKind::Nbt | FieldKind::NamedNbt | FieldKind::PrefixedNbt => {
+            encode_nbt(kind, value, original)?
+        }
     })
+}
+
+/// The three NBT kinds: JSON text written back with the replaced bytes as
+/// the type template, behind a fresh length prefix for `PrefixedNbt`.
+fn encode_nbt(kind: FieldKind, value: &Value, original: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    if kind != FieldKind::PrefixedNbt {
+        return crate::nbt_text::from_text(nbt_text(value)?, kind == FieldKind::NamedNbt, original);
+    }
+    // The template is the NBT after the old length prefix.
+    let template = original.and_then(|bytes| {
+        let mut reader = Reader::new(bytes);
+        reader.var_i32()?;
+        Some(&bytes[reader.position()..])
+    });
+    let nbt = crate::nbt_text::from_text(nbt_text(value)?, false, template)?;
+    if nbt.len() > MAX_PREFIXED_NBT {
+        return Err(format!(
+            "NBT is {} bytes; the game reads at most {MAX_PREFIXED_NBT}",
+            nbt.len()
+        ));
+    }
+    let mut bytes =
+        encode_var_i32(i32::try_from(nbt.len()).map_err(|_| "NBT is too long")?).to_vec();
+    bytes.extend_from_slice(&nbt);
+    Ok(bytes)
+}
+
+/// Vanilla's limit for length-prefixed NBT (`ByteBufCodecs.lengthPrefixed`).
+const MAX_PREFIXED_NBT: usize = 65_536;
+/// NBT larger than this is laid out as hex rather than text.
+pub(crate) const MAX_NBT_TEXT_BYTES: usize = 256 * 1024;
+
+fn nbt_text(value: &Value) -> Result<&str, String> {
+    match value {
+        Value::String(text) => Ok(text),
+        _ => Err("NBT is edited as JSON text".into()),
+    }
 }
 
 fn parse_integer(text: &str) -> Result<i64, String> {
@@ -350,6 +513,13 @@ fn walk(
         }
         "string_payload" => {
             builder.string("value");
+        }
+        "custom_click_action" => {
+            // The payload is length-prefixed NBT; the bundled description
+            // calls the length an option flag, so an edit that resized the
+            // NBT would leave the old length in front of it.
+            builder.string("id");
+            builder.prefixed_nbt("payload");
         }
         "client_information" => {
             builder.string("locale");
@@ -643,10 +813,15 @@ impl<'a> Builder<'a> {
             return None;
         }
         let offset = self.reader.position();
-        let Some(value) = read(&mut self.reader) else {
+        // A failed read must not move the cursor: a rejected byte (a bool that
+        // is neither 0 nor 1) belongs to the raw tail, or the tail would start
+        // past it and the frame rebuilt from the spans would lose it.
+        let mut probe = self.reader.clone();
+        let Some(value) = read(&mut probe) else {
             self.stopped = true;
             return None;
         };
+        self.reader = probe;
         self.fields.push(FieldSpan {
             name: name.to_owned(),
             kind,
@@ -723,16 +898,45 @@ impl<'a> Builder<'a> {
             return;
         }
         let offset = self.reader.position();
-        let Some(bytes) = self.reader.byte_array().map(<[u8]>::to_vec) else {
+        let mut probe = self.reader.clone();
+        let Some(bytes) = probe.byte_array().map(<[u8]>::to_vec) else {
             self.stopped = true;
             return;
         };
+        self.reader = probe;
         self.fields.push(FieldSpan {
             name: name.to_owned(),
             kind: FieldKind::PrefixedBytes,
             offset,
             length: self.reader.position() - offset,
             value: Value::String(to_hex(&bytes)),
+        });
+    }
+
+    /// A `VarInt` byte length followed by exactly that much NBT. Anything
+    /// else stops the walk, so the definition gets a chance instead.
+    fn prefixed_nbt(&mut self, name: &str) {
+        if self.stopped {
+            return;
+        }
+        let offset = self.reader.position();
+        let mut probe = self.reader.clone();
+        let text = probe
+            .byte_array()
+            .filter(|nbt| nbt.len() <= MAX_NBT_TEXT_BYTES)
+            .and_then(|nbt| crate::nbt_text::to_text(nbt, false));
+        let Some(text) = text else {
+            self.stopped = true;
+            return;
+        };
+        let length = probe.position() - offset;
+        let _ = self.reader.take(length);
+        self.fields.push(FieldSpan {
+            name: name.to_owned(),
+            kind: FieldKind::PrefixedNbt,
+            offset,
+            length,
+            value: Value::String(text),
         });
     }
 
@@ -781,6 +985,107 @@ mod tests {
     fn push_string(output: &mut Vec<u8>, value: &str) {
         output.extend_from_slice(&encode_var_i32(i32::try_from(value.len()).unwrap()));
         output.extend_from_slice(value.as_bytes());
+    }
+
+    fn tiles(layout: &PacketLayout, logical: &[u8]) {
+        let mut cursor = 0;
+        for field in &layout.fields {
+            assert_eq!(field.offset, cursor, "gap before `{}`", field.name);
+            let original = &logical[field.offset..field.offset + field.length];
+            let encoded = encode_field_over(field.kind, &field.value, Some(original)).unwrap();
+            assert_eq!(
+                encoded, original,
+                "`{}` does not re-encode to its bytes",
+                field.name
+            );
+            cursor += field.length;
+        }
+        assert_eq!(cursor, logical.len(), "spans stop short of the frame's end");
+    }
+
+    #[test]
+    fn entity_metadata_keeps_its_terminator() {
+        // set_entity_data from a 1.21.10 capture: entity, one VarInt entry, 0xff.
+        let logical = [0x61, 0xc8, 0x9a, 0xac, 0x01, 0x1b, 0x00, 0x06, 0xff];
+        let layout = layout_logical(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &logical,
+            Some(774),
+        );
+        assert!(layout.complete);
+        tiles(&layout, &logical);
+        assert_eq!(layout.fields.last().unwrap().name, "metadata.end");
+    }
+
+    #[test]
+    fn equipment_slots_keep_their_continuation_flag() {
+        // Two entries: slot 0 with the "more follow" bit, then slot 5; both empty.
+        let logical = [0x64, 0x01, 0x80, 0x00, 0x05, 0x00];
+        let layout = layout_logical(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &logical,
+            Some(774),
+        );
+        assert!(layout.complete);
+        tiles(&layout, &logical);
+        let slot = layout
+            .fields
+            .iter()
+            .find(|field| field.offset == 2)
+            .unwrap();
+        assert_eq!(slot.kind, FieldKind::FlaggedU7);
+        assert_eq!(slot.value, json!(0));
+        // Editing the slot keeps the flag, so the array still has two entries.
+        let edited = encode_field_over(slot.kind, &json!("2"), Some(&logical[2..3])).unwrap();
+        assert_eq!(edited, vec![0x82]);
+        assert!(encode_field_over(slot.kind, &json!(128), Some(&[0x80])).is_err());
+    }
+
+    #[test]
+    fn a_rejected_byte_starts_the_raw_tail() {
+        // chat_message whose "signed" byte is neither 0 nor 1: the walk stops
+        // there, and that byte must be the first of the tail, not skipped.
+        let mut logical = encode_var_i32(0x08).to_vec();
+        push_string(&mut logical, "hi");
+        logical.extend_from_slice(&[0; 16]);
+        logical.extend_from_slice(&[0x3b, 0xaa, 0xbb]);
+        let layout = layout_logical(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            &logical,
+            Some(774),
+        );
+        assert!(!layout.complete);
+        tiles(&layout, &logical);
+    }
+
+    #[test]
+    fn wide_integers_reach_javascript_as_text() {
+        // chat_message: a salt past 2^53 would be rounded by a JS number.
+        let mut logical = encode_var_i32(0x08).to_vec();
+        push_string(&mut logical, "hi");
+        logical.extend_from_slice(&5_i64.to_be_bytes());
+        logical.extend_from_slice(&8_320_241_373_684_957_192_i64.to_be_bytes());
+        let layout = layout_logical(
+            ProtocolState::Play,
+            Direction::ClientToServer,
+            &logical,
+            Some(774),
+        );
+        let value = |name: &str| {
+            layout
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(value("timestamp"), json!(5));
+        assert_eq!(value("salt"), json!("8320241373684957192"));
+        tiles(&layout, &logical);
     }
 
     #[test]
@@ -876,6 +1181,90 @@ mod tests {
         assert_eq!(layout.fields.len(), 2);
         assert_eq!(layout.fields[0].name, "packet id");
         assert_eq!(layout.fields[1].value, "deadbeef");
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn splice(logical: &[u8], field: &FieldSpan, value: &str) -> Vec<u8> {
+        let original = &logical[field.offset..field.offset + field.length];
+        let encoded = encode_field_over(field.kind, &json!(value), Some(original)).unwrap();
+        let mut edited = logical[..field.offset].to_vec();
+        edited.extend_from_slice(&encoded);
+        edited.extend_from_slice(&logical[field.offset + field.length..]);
+        edited
+    }
+
+    /// A captured AuthMe form submission (1.21.11).
+    const CLICK_ACTION: &str = "081e617574686d653a7072656a6f696e2d72656769737465722f7375626d69741b0a080007636f6e6669726d000008000870617373776f7264000000";
+
+    #[test]
+    fn custom_click_action_nbt_rewrites_its_length() {
+        let logical = from_hex(CLICK_ACTION);
+        let layout = layout_logical(
+            ProtocolState::Configuration,
+            Direction::ClientToServer,
+            &logical,
+            Some(774),
+        );
+        assert!(layout.complete);
+        let payload = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "payload")
+            .unwrap();
+        assert_eq!(payload.kind, FieldKind::PrefixedNbt);
+        assert_eq!(payload.value, r#"{"confirm": "", "password": ""}"#);
+
+        let edited = splice(
+            &logical,
+            payload,
+            r#"{"confirm": "hunter22", "password": "hunter22"}"#,
+        );
+        let prefix = payload.offset;
+        assert_eq!(
+            usize::from(edited[prefix]),
+            edited.len() - prefix - 1,
+            "the length must cover the new NBT"
+        );
+        let round_trip = layout_logical(
+            ProtocolState::Configuration,
+            Direction::ClientToServer,
+            &edited,
+            Some(774),
+        );
+        assert!(round_trip.complete);
+        assert_eq!(
+            round_trip.fields.last().unwrap().value,
+            r#"{"confirm": "hunter22", "password": "hunter22"}"#
+        );
+    }
+
+    #[test]
+    fn a_broken_tail_keeps_the_fields_before_it() {
+        let logical = from_hex(CLICK_ACTION);
+        // Cut the NBT short: the id still decodes, the rest is shown as hex.
+        let cut = &logical[..logical.len() - 4];
+        let layout = layout_logical(
+            ProtocolState::Configuration,
+            Direction::ClientToServer,
+            cut,
+            Some(774),
+        );
+        assert!(!layout.complete);
+        let names: Vec<_> = layout
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names[..2], ["packet id", "id"]);
+        assert_eq!(layout.fields.last().unwrap().name, "rest");
+        let covered: usize = layout.fields.iter().map(|field| field.length).sum();
+        assert_eq!(covered, cut.len(), "every byte stays editable");
     }
 
     #[test]

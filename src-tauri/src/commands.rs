@@ -3,25 +3,24 @@
     reason = "Tauri command state is supplied by its by-value State extractor"
 )]
 
-use std::{io::Write as _, path::PathBuf};
+use std::path::PathBuf;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use mineburp_auth::{AuthClient, AuthConfig, MinecraftProfile, MinecraftSession};
 use mineburp_capture::{CaptureCapabilities, CaptureStats, ImportOptions, ImportSummary};
 use mineburp_core::{
-    ConnectionSnapshot, Direction, Disposition, FilterExpression, FilterField, PacketEdit,
-    PacketSummary, ProtocolState, RepeaterTab, ReplacementRule, TrafficSource,
+    ConnectionSnapshot, Direction, FilterExpression, FilterField, PacketEdit, PacketSummary,
+    ProtocolState, RepeaterTab, ReplacementRule,
 };
 use mineburp_launcher::{AgentSetupOutcome, InstanceDescriptor, LaunchOutcome, LaunchRequest};
 use mineburp_project::{
-    CompactSummary, ContentMode, ContentQuery, ContentScope, DeleteSummary, PacketAnnotation,
-    PacketQuery, ProjectInfo, ProjectOptions, ProjectStore, SavedFilter, SearchTerm, StatsOptions,
-    TrafficStats,
+    CompactSummary, DeleteSummary, PacketAnnotation, ProjectInfo, ProjectOptions, ProjectStore,
+    SavedFilter, StatsOptions, TrafficStats,
 };
 use mineburp_protocol::{
-    DecodeContext, FieldKind, PacketInsight, PacketLayout, PacketRegistry, ProtocolVersion,
-    SchemaPack, apply_edits, decode_schema, encode_field, inspect_logical, layout_logical,
+    FieldKind, PacketInsight, PacketLayout, PacketRegistry, ProtocolVersion, SchemaPack,
+    apply_edits, encode_field_over, inspect_logical, layout_logical,
 };
 use mineburp_proxy::{InterceptDecision, InterceptSettings, NetworkConditions};
 use serde::{Deserialize, Serialize};
@@ -29,12 +28,9 @@ use tauri::State;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{
-    capture_project::persist,
-    export::{PcapExportSummary, write_pcapng},
-    paths::{PathPurpose, validate_path},
-    state::{AuthenticatedAccount, DesktopState, PendingAuth},
-};
+use mineburp_mcp::ops::{self, PacketFilterInput, PathPurpose, PcapExportSummary, validate_path};
+
+use crate::state::{AuthenticatedAccount, DesktopState, PendingAuth};
 
 type CommandResult<T> = Result<T, String>;
 const AUTH_CALLBACK_URL: &str = "http://localhost:53682/callback";
@@ -210,26 +206,7 @@ pub async fn project_save_as(
 
 /// Loads a project's schema packs and rules into the proxy and makes it current.
 async fn install_project(state: &DesktopState, store: ProjectStore) -> CommandResult<ProjectView> {
-    let info = store.info().clone();
-    let asset_store = store.clone();
-    let (packs, replacements) = tauri::async_runtime::spawn_blocking(move || {
-        Ok::<_, mineburp_project::ProjectError>((
-            asset_store.load_schema_packs()?,
-            asset_store.load_replacement_rules()?,
-        ))
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-    state
-        .proxy
-        .set_schema_packs(packs)
-        .map_err(|error| error.to_string())?;
-    state
-        .proxy
-        .set_replacement_rules(replacements)
-        .map_err(|error| error.to_string())?;
-    state.adopt_project(store);
+    let info = state.install_project(store).await?;
     Ok(ProjectView::new(info, false))
 }
 
@@ -269,142 +246,6 @@ pub async fn project_checkpoint(state: State<'_, DesktopState>) -> CommandResult
         .map_err(|error| error.to_string())
 }
 
-/// The history filter as the webview describes it.
-///
-/// One serialisable object rather than a dozen command arguments: the filter
-/// grew past the point where positional parameters stayed readable, and the UI
-/// already keeps it as a single piece of state.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct PacketFilterInput {
-    connection_id: Option<Uuid>,
-    offset: usize,
-    limit: usize,
-    search: Option<String>,
-    search_regex: bool,
-    search_case_sensitive: bool,
-    search_negate: bool,
-    directions: Vec<Direction>,
-    states: Vec<ProtocolState>,
-    sources: Vec<TrafficSource>,
-    dispositions: Vec<Disposition>,
-    include_names: Vec<String>,
-    exclude_names: Vec<String>,
-    min_size: Option<usize>,
-    max_size: Option<usize>,
-    /// The operator's filter expression, in the same language replacement rules use.
-    expression: Option<String>,
-    /// A search through the payload bytes rather than the row's metadata.
-    content: Option<String>,
-    content_mode: ContentSearchMode,
-    content_scope: ContentSearchScope,
-    content_case_sensitive: bool,
-    content_negate: bool,
-    before_id: Option<i64>,
-    after_id: Option<i64>,
-    /// Only bookmarked rows (`true`) or only rows without a bookmark (`false`).
-    bookmarked: Option<bool>,
-}
-
-/// How the webview labels the payload-search modes.
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentSearchMode {
-    #[default]
-    Text,
-    Hex,
-    Regex,
-}
-
-impl From<ContentSearchMode> for ContentMode {
-    fn from(mode: ContentSearchMode) -> Self {
-        match mode {
-            ContentSearchMode::Text => Self::Text,
-            ContentSearchMode::Hex => Self::Hex,
-            ContentSearchMode::Regex => Self::Regex,
-        }
-    }
-}
-
-/// How much of the payload the term has to account for.
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentSearchScope {
-    #[default]
-    Contains,
-    Equals,
-    Prefix,
-    Suffix,
-}
-
-impl From<ContentSearchScope> for ContentScope {
-    fn from(scope: ContentSearchScope) -> Self {
-        match scope {
-            ContentSearchScope::Contains => Self::Contains,
-            ContentSearchScope::Equals => Self::Equals,
-            ContentSearchScope::Prefix => Self::Prefix,
-            ContentSearchScope::Suffix => Self::Suffix,
-        }
-    }
-}
-
-impl PacketFilterInput {
-    fn into_query(self) -> CommandResult<PacketQuery> {
-        let expression = self
-            .expression
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(FilterExpression::parse)
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        let search = self
-            .search
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty())
-            .map(|text| SearchTerm {
-                text,
-                regex: self.search_regex,
-                case_sensitive: self.search_case_sensitive,
-                negate: self.search_negate,
-            });
-        let content = self
-            .content
-            .map(|text| text.trim().to_owned())
-            .filter(|text| !text.is_empty())
-            .map(|text| ContentQuery {
-                text,
-                mode: self.content_mode.into(),
-                scope: self.content_scope.into(),
-                case_sensitive: self.content_case_sensitive,
-                negate: self.content_negate,
-            });
-        Ok(PacketQuery {
-            connection_id: self.connection_id,
-            offset: self.offset,
-            // Fetching an extra row lets the renderer show an exact "load
-            // older" affordance without asking SQLite for a total on every
-            // live refresh.
-            limit: self.limit.clamp(1, 500),
-            search,
-            directions: self.directions,
-            states: self.states,
-            sources: self.sources,
-            dispositions: self.dispositions,
-            include_names: self.include_names,
-            exclude_names: self.exclude_names,
-            min_size: self.min_size,
-            max_size: self.max_size,
-            expression,
-            content,
-            before_id: self.before_id,
-            after_id: self.after_id,
-            bookmarked: self.bookmarked,
-        })
-    }
-}
-
 #[tauri::command]
 pub async fn packets_query(
     state: State<'_, DesktopState>,
@@ -429,41 +270,12 @@ pub async fn packets_export(
     path: PathBuf,
     filter: PacketFilterInput,
 ) -> CommandResult<usize> {
-    const EXPORT_PAGE: usize = 500;
     let store = current_project(&state)?;
     let path = validate_path(&path, PathPurpose::ExportJson, &[&store.info().path])?;
-    let mut query = filter.into_query()?;
-    query.limit = EXPORT_PAGE;
-    query.offset = 0;
-    query.after_id = None;
-    tauri::async_runtime::spawn_blocking(move || -> CommandResult<usize> {
-        let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
-        let mut out = std::io::BufWriter::new(file);
-        let mut written = 0usize;
-        out.write_all(b"[").map_err(|error| error.to_string())?;
-        loop {
-            let page = store
-                .query_packets_filtered(&query)
-                .map_err(|error| error.to_string())?;
-            for packet in &page {
-                if written > 0 {
-                    out.write_all(b",").map_err(|error| error.to_string())?;
-                }
-                out.write_all(b"\n  ").map_err(|error| error.to_string())?;
-                serde_json::to_writer(&mut out, packet).map_err(|error| error.to_string())?;
-                written += 1;
-            }
-            match page.last() {
-                Some(last) if page.len() == EXPORT_PAGE => query.before_id = Some(last.id),
-                _ => break,
-            }
-        }
-        out.write_all(b"\n]\n").map_err(|error| error.to_string())?;
-        out.flush().map_err(|error| error.to_string())?;
-        Ok(written)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    let query = filter.into_query()?;
+    tauri::async_runtime::spawn_blocking(move || ops::export_json(&store, &query, &path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// The vocabulary the filter expression accepts, for the UI's help affordance.
@@ -522,6 +334,10 @@ pub fn filter_validate(expression: String) -> CommandResult<()> {
 /// [`packet_bytes`] only if the operator scrolls to it, which is what keeps a
 /// multi-megabyte packet openable at all.
 const DETAIL_WINDOW_BYTES: usize = 8 * 1024;
+/// The most of a stored packet that is decoded when it is opened. The decode
+/// has to see the whole frame — a chunk or an inventory cut at the display
+/// window decodes as a malformed packet — but only the window is sent back.
+const DECODE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WINDOW_BYTES: usize = 256 * 1024;
 
 /// A packet prepared for display: metadata, a decode, and a slice of bytes.
@@ -533,9 +349,11 @@ pub struct PacketView {
     summary: PacketSummary,
     wire: mineburp_core::WireMetadata,
     insight: PacketInsight,
-    /// The decode stored at capture time, when a schema pack matched.
-    stored_decoded: Option<serde_json::Value>,
-    stored_decode_error: Option<String>,
+    /// A matching schema pack's decode, run when the packet is opened. The
+    /// built-in decode stored with the row is not repeated here: `insight`
+    /// already carries it, and showing both listed every field twice.
+    schema_decoded: Option<serde_json::Value>,
+    schema_decode_error: Option<String>,
     total_bytes: usize,
     bytes_offset: usize,
     bytes_base64: String,
@@ -561,7 +379,7 @@ pub async fn packet_detail(
     let store = current_project(&state)?;
     let packs = state.proxy.schema_packs();
     tauri::async_runtime::spawn_blocking(move || {
-        let window = store.packet_window(id, 0, DETAIL_WINDOW_BYTES)?;
+        let window = store.packet_window(id, 0, DECODE_LIMIT_BYTES)?;
         Ok::<_, mineburp_project::ProjectError>(window.map(|window| {
             let insight = inspect_logical(
                 window.summary.state,
@@ -570,15 +388,16 @@ pub async fn packet_detail(
                 window.summary.protocol_version,
             );
             let (schema_decoded, schema_error) = decode_with_schema_packs(&packs, &window);
+            let shown = window.bytes.len().min(DETAIL_WINDOW_BYTES);
             PacketView {
                 summary: window.summary,
                 wire: window.wire,
                 insight,
-                stored_decoded: schema_decoded.or(window.stored_decoded),
-                stored_decode_error: schema_error.or(window.stored_decode_error),
+                schema_decoded,
+                schema_decode_error: schema_error,
                 total_bytes: window.total_bytes,
                 bytes_offset: window.offset,
-                bytes_base64: STANDARD.encode(&window.bytes),
+                bytes_base64: STANDARD.encode(&window.bytes[..shown]),
             }
         }))
     })
@@ -587,39 +406,11 @@ pub async fn packet_detail(
     .map_err(|error| error.to_string())
 }
 
-/// Applies a user-supplied schema pack to a packet, if one matches.
-///
-/// Capture only records *which* schema matched, by name; walking its fields is
-/// deferred to here so a loaded pack cannot slow down capture itself.
 fn decode_with_schema_packs(
     packs: &[SchemaPack],
     window: &mineburp_project::PacketWindow,
 ) -> (Option<serde_json::Value>, Option<String>) {
-    let summary = &window.summary;
-    let Some(packet_id) = summary.packet_id else {
-        return (None, None);
-    };
-    let Some(schema) = packs.iter().flat_map(|pack| &pack.schemas).find(|schema| {
-        schema.matches(
-            summary.state,
-            summary.direction,
-            packet_id,
-            summary.channel.as_deref(),
-            summary.protocol_version,
-        )
-    }) else {
-        return (None, None);
-    };
-    // The stored bytes carry the packet-id VarInt; schemas describe the body.
-    let body = mineburp_protocol::decode_var_i32(&window.bytes)
-        .ok()
-        .flatten()
-        .and_then(|(_, prefix)| window.bytes.get(prefix..))
-        .unwrap_or_default();
-    match decode_schema(schema, body, DecodeContext::default()) {
-        Ok(fields) => (Some(fields), None),
-        Err(error) => (None, Some(format!("schema `{}`: {error}", schema.name))),
-    }
+    ops::decode_with_schema_packs(packs, &window.summary, &window.bytes)
 }
 
 /// Pages through a stored packet's payload so the hex view can render a large
@@ -681,6 +472,34 @@ pub async fn packet_layout(
     .await
 }
 
+/// Walks a stored packet into field spans, reading the whole payload rather
+/// than the window `packet_detail` sends, so the inspector's structure view
+/// covers a packet larger than that window.
+#[tauri::command]
+pub async fn packet_layout_stored(
+    state: State<'_, DesktopState>,
+    id: i64,
+) -> CommandResult<Option<PacketLayout>> {
+    let store = current_project(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok::<_, mineburp_project::ProjectError>(
+            store
+                .packet_window(id, 0, DECODE_LIMIT_BYTES)?
+                .map(|window| {
+                    layout_logical(
+                        window.summary.state,
+                        window.summary.direction,
+                        &window.bytes,
+                        window.summary.protocol_version,
+                    )
+                }),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
 /// Re-encodes one decoded field and splices it back into the frame.
 ///
 /// The splice happens here rather than in the webview so that the wire encoding
@@ -711,7 +530,7 @@ fn splice_field(
         .checked_add(length)
         .filter(|end| *end <= bytes.len())
         .ok_or("field span is outside the frame")?;
-    let encoded = encode_field(kind, value)?;
+    let encoded = encode_field_over(kind, value, Some(&bytes[offset..end]))?;
     let mut edited = Vec::with_capacity(bytes.len() - length + encoded.len());
     edited.extend_from_slice(&bytes[..offset]);
     edited.extend_from_slice(&encoded);
@@ -1226,14 +1045,10 @@ pub async fn packets_export_pcapng(
 ) -> CommandResult<PcapExportSummary> {
     let store = current_project(&state)?;
     let path = validate_path(&path, PathPurpose::ExportPcap, &[&store.info().path])?;
-    let mut query = filter.into_query()?;
-    query.offset = 0;
-    tauri::async_runtime::spawn_blocking(move || {
-        let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
-        write_pcapng(&store, &query, std::io::BufWriter::new(file))
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    let query = filter.into_query()?;
+    tauri::async_runtime::spawn_blocking(move || ops::export_pcapng(&store, &query, &path))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Reads a pcap or pcapng file into the open project.
@@ -1250,54 +1065,12 @@ pub async fn capture_import(
     path: PathBuf,
     options: Option<ImportOptions>,
 ) -> CommandResult<ImportSummary> {
-    const BATCH: usize = 512;
     let store = current_project(&state)?;
-    if store.is_read_only() {
-        return Err("the open project is read-only".into());
-    }
     let path = validate_path(&path, PathPurpose::ImportCapture, &[])?;
     let options = options.unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || {
-        let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
-        let mut pending = Vec::with_capacity(BATCH);
-        // One connection row per connection per batch: the snapshot each row
-        // carries is cumulative, so only the latest matters.
-        let mut touched: std::collections::HashMap<Uuid, ConnectionSnapshot> =
-            std::collections::HashMap::new();
-        let flush = |pending: &mut Vec<_>,
-                     touched: &mut std::collections::HashMap<Uuid, ConnectionSnapshot>|
-         -> Result<(), String> {
-            let result =
-                persist(&store, touched.values(), pending).map_err(|error| error.to_string());
-            pending.clear();
-            touched.clear();
-            result
-        };
-        let mut summary =
-            mineburp_capture::import_capture(std::io::BufReader::new(file), &options, |row| {
-                touched.insert(row.connection.id, row.connection);
-                pending.push(row.detail);
-                if pending.len() >= BATCH {
-                    flush(&mut pending, &mut touched)?;
-                }
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
-        flush(&mut pending, &mut touched)?;
-        if summary.frames_imported == 0 && summary.error.is_none() {
-            summary.error = Some(if options.server_ports.is_empty() {
-                "the capture contains no TCP or UDP payloads".into()
-            } else {
-                format!(
-                    "no traffic on server port(s) {:?}; set the ports the server used",
-                    options.server_ports
-                )
-            });
-        }
-        Ok(summary)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || ops::import_capture_file(&store, &path, &options))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Deletes every packet matching `filter` (its `limit` is ignored).
@@ -1449,116 +1222,7 @@ fn current_project(state: &State<'_, DesktopState>) -> CommandResult<ProjectStor
 
 #[cfg(test)]
 mod tests {
-    use super::{PacketFilterInput, parse_auth_callback, take_matching};
-
-    fn filter_from(json: &str) -> PacketFilterInput {
-        serde_json::from_str(json).expect("the webview's filter shape must deserialize")
-    }
-
-    #[test]
-    fn an_empty_filter_object_is_a_complete_filter() {
-        let query = filter_from("{}").into_query().expect("empty filter");
-        assert!(query.search.is_none());
-        assert!(query.expression.is_none());
-        assert!(query.states.is_empty() && query.directions.is_empty());
-        // Every list defaulting to empty is what makes "no filter" mean "everything".
-        assert_eq!(query.limit, 1, "an unset limit is clamped into range");
-    }
-
-    #[test]
-    fn search_switches_and_enum_sets_survive_the_boundary() {
-        let query = filter_from(
-            r#"{
-                "search": "  keep_alive  ",
-                "searchRegex": true,
-                "searchCaseSensitive": true,
-                "searchNegate": true,
-                "states": ["play", "configuration"],
-                "dispositions": ["dropped"],
-                "excludeNames": ["chunk"],
-                "minSize": 16,
-                "limit": 250
-            }"#,
-        )
-        .into_query()
-        .expect("filter");
-        let search = query.search.expect("a search term");
-        assert_eq!(
-            search.text, "keep_alive",
-            "surrounding space is not part of the term"
-        );
-        assert!(search.regex && search.case_sensitive && search.negate);
-        assert_eq!(query.states.len(), 2);
-        assert_eq!(query.dispositions.len(), 1);
-        assert_eq!(query.exclude_names, vec!["chunk".to_owned()]);
-        assert_eq!(query.min_size, Some(16));
-        assert_eq!(query.limit, 250);
-    }
-
-    #[test]
-    fn a_blank_search_or_expression_is_dropped_rather_than_matched() {
-        let query = filter_from(r#"{"search": "   ", "expression": "  "}"#)
-            .into_query()
-            .expect("filter");
-        assert!(query.search.is_none());
-        assert!(query.expression.is_none());
-    }
-
-    #[test]
-    fn an_unparseable_expression_is_reported_to_the_operator() {
-        let error = filter_from(r#"{"expression": "state !! play"}"#)
-            .into_query()
-            .expect_err("an unknown operator must be rejected");
-        assert!(
-            error.contains("operator"),
-            "the message should name the problem, got `{error}`"
-        );
-    }
-
-    #[test]
-    fn a_payload_search_carries_its_mode_across_the_boundary() {
-        let query = filter_from(
-            r#"{"content": " de ad be ef ", "contentMode": "hex", "contentNegate": true}"#,
-        )
-        .into_query()
-        .expect("filter");
-        let content = query.content.expect("a content search");
-        assert_eq!(content.text, "de ad be ef");
-        assert!(content.negate);
-        assert!(matches!(content.mode, mineburp_project::ContentMode::Hex));
-        assert!(
-            matches!(content.scope, mineburp_project::ContentScope::Contains),
-            "an unstated scope stays the substring search it has always been"
-        );
-
-        let scoped =
-            filter_from(r#"{"content": "0c", "contentMode": "hex", "contentScope": "equals"}"#)
-                .into_query()
-                .expect("filter");
-        assert!(matches!(
-            scoped.content.expect("a content search").scope,
-            mineburp_project::ContentScope::Equals
-        ));
-    }
-
-    #[test]
-    fn a_blank_payload_search_is_dropped() {
-        let query = filter_from(r#"{"content": "  ", "contentMode": "regex"}"#)
-            .into_query()
-            .expect("filter");
-        assert!(
-            query.content.is_none(),
-            "a blank term must not scan payloads"
-        );
-    }
-
-    #[test]
-    fn a_valid_expression_reaches_the_query() {
-        let query = filter_from(r#"{"expression": "state == play && size > 256"}"#)
-            .into_query()
-            .expect("filter");
-        assert!(query.expression.is_some());
-    }
+    use super::{parse_auth_callback, take_matching};
 
     #[test]
     fn a_mismatched_callback_does_not_cancel_the_pending_sign_in() {
@@ -1570,14 +1234,6 @@ mod tests {
             "expected"
         );
         assert!(take_matching(&slot, |_| true).is_err(), "taken once");
-    }
-
-    #[test]
-    fn the_bookmark_filter_reaches_the_query() {
-        let query = filter_from(r#"{"bookmarked": true}"#)
-            .into_query()
-            .expect("filter");
-        assert_eq!(query.bookmarked, Some(true));
     }
 
     #[test]
@@ -1600,4 +1256,179 @@ mod tests {
 
         assert_eq!(error, "the OAuth callback URL did not target MineBurp");
     }
+}
+
+#[tauri::command]
+pub async fn intruder_plan(
+    mode: mineburp_core::research::AttackMode,
+    lengths: Vec<usize>,
+) -> CommandResult<Vec<Vec<Option<usize>>>> {
+    off_main(move || mineburp_core::research::attack_plan(mode, &lengths)).await
+}
+
+#[tauri::command]
+pub async fn sequencer_analyze(
+    samples: Vec<String>,
+) -> CommandResult<mineburp_core::research::SequenceAnalysis> {
+    off_main(move || mineburp_core::research::analyze_sequence(&samples)).await
+}
+
+#[tauri::command]
+pub async fn decoder_transform(
+    operation: mineburp_protocol::decoder::DecoderOperation,
+    input: String,
+) -> CommandResult<mineburp_protocol::decoder::DecoderResult> {
+    off_main(move || mineburp_protocol::decoder::transform(operation, &input)).await
+}
+
+fn project_for_path(
+    state: &State<'_, DesktopState>,
+    expected_path: &PathBuf,
+) -> CommandResult<ProjectStore> {
+    let store = current_project(state)?;
+    if &store.info().path != expected_path {
+        return Err("The project changed before this operation started".into());
+    }
+    Ok(store)
+}
+
+#[tauri::command]
+pub async fn workbench_document_get(
+    state: State<'_, DesktopState>,
+    expected_path: PathBuf,
+    key: String,
+) -> CommandResult<Option<serde_json::Value>> {
+    let store = project_for_path(&state, &expected_path)?;
+    off_main(move || store.workbench_document(&key).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+pub async fn workbench_document_save(
+    state: State<'_, DesktopState>,
+    expected_path: PathBuf,
+    key: String,
+    value: serde_json::Value,
+) -> CommandResult<()> {
+    let store = project_for_path(&state, &expected_path)?;
+    off_main(move || {
+        store
+            .save_workbench_document(&key, &value)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn channel_stats(
+    state: State<'_, DesktopState>,
+    filter: PacketFilterInput,
+) -> CommandResult<Vec<mineburp_project::ChannelStat>> {
+    let store = current_project(&state)?;
+    let query = filter.into_query()?;
+    off_main(move || store.channel_stats(&query).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+pub async fn packet_field_values(
+    state: State<'_, DesktopState>,
+    expected_path: PathBuf,
+    ids: Vec<i64>,
+    paths: Vec<String>,
+) -> CommandResult<std::collections::BTreeMap<i64, Vec<Option<serde_json::Value>>>> {
+    if ids.len() > 64 || paths.len() > 8 || paths.iter().any(|p| p.is_empty() || p.len() > 256) {
+        return Err("Use at most 64 packets and 8 field paths of 1–256 bytes".into());
+    }
+    let store = project_for_path(&state, &expected_path)?;
+    let packs = state.proxy.schema_packs();
+    off_main(move || {
+        let mut output = std::collections::BTreeMap::new();
+        for id in ids {
+            let Some(window) = store
+                .packet_window(id, 0, 1024 * 1024)
+                .map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            if window.bytes.len() != window.total_bytes {
+                output.insert(id, vec![None; paths.len()]);
+                continue;
+            }
+            let insight = inspect_logical(
+                window.summary.state,
+                window.summary.direction,
+                &window.bytes,
+                window.summary.protocol_version,
+            );
+            let (schema, _) = decode_with_schema_packs(&packs, &window);
+            let layout = layout_logical(
+                window.summary.state,
+                window.summary.direction,
+                &window.bytes,
+                window.summary.protocol_version,
+            );
+            let values = paths
+                .iter()
+                .map(|path| {
+                    let value = schema
+                        .as_ref()
+                        .and_then(|s| ops::fields::lookup(s, path))
+                        .or_else(|| {
+                            insight
+                                .fields
+                                .as_ref()
+                                .and_then(|f| ops::fields::lookup(f, path))
+                        })
+                        .cloned()
+                        .or_else(|| {
+                            layout
+                                .fields
+                                .iter()
+                                .find(|f| f.name == *path)
+                                .map(|f| f.value.clone())
+                        });
+                    value.map(|v| {
+                        if v.to_string().len() > 1024 {
+                            serde_json::Value::String("[value exceeds column limit]".into())
+                        } else {
+                            v
+                        }
+                    })
+                })
+                .collect();
+            output.insert(id, values);
+        }
+        Ok(output)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn payload_generate(
+    generator: mineburp_core::research::PayloadGenerator,
+) -> CommandResult<Vec<String>> {
+    off_main(move || mineburp_core::research::generate_payloads(generator)).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn replacement_rule_preview(
+    rule: ReplacementRule,
+    logical_base64: String,
+    protocol_state: ProtocolState,
+    direction: Direction,
+    protocol_version: Option<i32>,
+    summary: Option<PacketSummary>,
+) -> CommandResult<ops::rules::RulePreview> {
+    off_main(move || {
+        let bytes = STANDARD.decode(logical_base64).map_err(|e| e.to_string())?;
+        ops::rules::rule_preview(
+            &rule,
+            &bytes,
+            protocol_state,
+            direction,
+            protocol_version,
+            summary,
+        )
+    })
+    .await
 }

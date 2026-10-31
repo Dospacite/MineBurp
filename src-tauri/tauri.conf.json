@@ -18,8 +18,8 @@
         "title": "MineBurp",
         "width": 1440,
         "height": 900,
-        "minWidth": 980,
-        "minHeight": 680,
+        "minWidth": 800,
+        "minHeight": 560,
         "resizable": true
       }
     ]

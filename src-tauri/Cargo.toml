@@ -30,6 +30,7 @@ mineburp-auth = { path = "../crates/mineburp-auth" }
 mineburp-capture = { path = "../crates/mineburp-capture" }
 mineburp-core = { path = "../crates/mineburp-core" }
 mineburp-launcher = { path = "../crates/mineburp-launcher" }
+mineburp-mcp = { path = "../crates/mineburp-mcp" }
 mineburp-project = { path = "../crates/mineburp-project" }
 mineburp-protocol = { path = "../crates/mineburp-protocol" }
 mineburp-proxy = { path = "../crates/mineburp-proxy" }

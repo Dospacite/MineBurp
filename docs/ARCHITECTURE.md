@@ -40,6 +40,8 @@ Instrumentation must read with `ClassReader.EXPAND_FRAMES`: the advice adapter i
 
 Capture is a pipeline of three threads so that no stage can stall the one before it: one reads dumpcap's pipe, one attributes and reassembles, and one rebuilds the socket table from `/proc`. A connection's first frames — its handshake and login — arrive within one round trip of the socket being created, usually before any scan has seen it, so a frame whose flow is not in the table yet is *held*, not dropped, until a scan that started after the frame arrived has finished; only then is the flow declared unrelated, and that verdict is cached. An attributed flow stays attributed until its FIN or RST plus a grace period, because a closing socket leaves the table before its last segments are read. Each TCP direction is then put back in sequence order: retransmissions are released once, out-of-order segments wait for the hole before them, a hole that never fills is skipped after a timeout rather than holding the connection forever, and payloads are trimmed to the IP length so link padding is never stored. Frames carry the capture's own timestamps. dumpcap's exit status and stderr are kept, so a capture that dies says why.
 
+`mineburp-mcp` serves the Model Context Protocol. Its tools are written against a `Host` trait: the desktop app implements it over its live state (proxy, capture, launchers) and serves it on a private Unix socket, and `OfflineHost` implements it over a bare project file for the standalone `mineburp-mcp` binary, which otherwise just bridges stdio to the app's socket. The crate's `ops` module also owns the history operations both front ends need — the UI's filter shape and its translation to a `PacketQuery`, JSON and pcapng export, capture import, export path validation, and schema-pack decoding — so a filter saved in the UI means the same thing when an agent applies it. Tool output is compact text by design; see [MCP.md](MCP.md).
+
 `src-tauri` is deliberately thin. Commands translate serializable input, call one service, and translate errors. Long database operations use the blocking pool. Events carry proxy and capture updates to the UI.
 
 It also opens a *temporary project* at startup, before capture begins, in a `sessions` directory under the app's data directory that only the current user can enter — the file holds decrypted traffic, and the shared system temporary directory would let other local users read it. Each scratch file carries its process id; a later start removes files whose process is gone, so a crash does not leave captures behind. A project is the only place captured packets live, so without one the proxy's decrypted packets were assigned an id and discarded and passive capture had nowhere to go. Creating or opening a real project replaces the temporary one and deletes it; so does exiting. The temporary state is reported to the UI so it is never presented as saved work.
@@ -107,14 +109,20 @@ A search is also a *set*: the term is read one alternative per line and a row ma
 
 ## Rewriting traffic
 
-Replacement rules are transformations, not verdicts. Every matching rule applies,
-in order, each seeing the output of the one before it; a packet that no rule
-changes is forwarded untouched. Rules never pause traffic; holding a packet for
-a decision is Intercept's job (below).
+Replacement rules have an action: rewrite or drop, defaulting to rewrite for
+older projects. Enabled drop rules evaluate the incoming decoded summary before
+replacement edits and Intercept. Any matching blocker records the original frame
+as dropped and returns without sending it or advancing the protocol state. This
+also applies to liveness packets that bypass an existing Intercept hold. Blockers
+can act in every decoded phase. Repeater injection keeps its independent path.
+
+Matching rewrite rules apply in order, each edit seeing the output of the one
+before it. A packet that no rewrite changes is forwarded untouched. Rules never
+pause traffic; holding a packet for a decision is Intercept's job (below).
 
 Four invariants hold the feature together:
 
-- Rules never run on handshake or login frames. The proxy rewrites those itself — the handshake address, the key exchange, compression — and a rule there would undo that work or desynchronise the framing.
+- Rewrite edits never run on handshake or login frames. The proxy rewrites those itself — the handshake address, the key exchange, compression — and a rule there would undo that work or desynchronise the framing.
 
 - A rule that fails is reported and skipped, never fatal. An unknown field name or a bad pattern must not disconnect the game an operator is testing.
 - The recorded row is what went on the wire. A rewritten packet is re-derived from the frame that was actually sent and recorded as `edited`, so the history stays a record of the connection rather than of intent.
@@ -187,3 +195,18 @@ Imported streams are then split into Minecraft packets (`mineburp-capture::minec
 Everything is bounded: frames by vanilla's 8 MiB, buffered bytes across all connections by a budget that sheds the largest buffer first, tracked connections by count. MineBurp's own exports are recognised by their interface name and read from their per-packet comments, so an exported proxy session — decrypted, decompressed — comes back as the packets it was written from.
 
 The webview may only hand commands paths that fit the command — a project is a `.mineburp` file, an export a `.json` or `.pcapng` file, an import a capture file — and no export may resolve to the open project or its `SQLite` sidecars. Every command is listed in `src-tauri/build.rs`, which generates an `allow-<command>` permission for it, and the main window's capability grants exactly those; a test keeps the handler list, the manifest, and the capability identical.
+
+
+## Research tools and display decoding
+
+Project migration 6 adds bounded, versioned workbench documents for Intruder and
+Sequencer. Document writes capture the expected project path so a delayed write
+cannot reach another project. The UI serializes autosaves and flushes editors
+before changing project or closing; active research tasks do not resume on load.
+Repeater edit history is an optional typed field on existing saved tabs.
+
+The Decoder sidebar delegates bounded conversions to `mineburp-protocol::decoder`.
+Payload generation is transport-independent integer/string work in
+`mineburp-core::research`. Channel explorer reuses the project's compiled filters
+for full-capture SQL aggregation. Custom history columns decode only mounted rows
+through bounded batch commands; decoding never moves into capture-time work.

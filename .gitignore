@@ -17,3 +17,6 @@
 /logs/
 # Biome cache
 .biome/
+
+# Local agent workspace
+/.omp/

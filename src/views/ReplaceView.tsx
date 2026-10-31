@@ -15,6 +15,7 @@ import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
 import { base64ToBytes, desktop, formatHexInput, parseHex } from "../lib/desktop";
 import { newId } from "../lib/ids";
+import { registerProjectEditor } from "../lib/projectWrites";
 
 const STATES: ProtocolState[] = ["handshake", "status", "login", "configuration", "play"];
 
@@ -83,6 +84,27 @@ export function ReplaceView({
   /** Rules have arrived from the project; until then a save would overwrite them. */
   const [loaded, setLoaded] = useState(!desktop.isAvailable());
   const saveTimer = useRef(0);
+  const pendingRules = useRef<ReplacementRule[] | null>(null);
+  useEffect(
+    () =>
+      registerProjectEditor(async () => {
+        window.clearTimeout(saveTimer.current);
+        const pending = pendingRules.current;
+        if (pending) {
+          await desktop.saveReplacementRules(pending);
+          if (pendingRules.current === pending) pendingRules.current = null;
+        }
+      }),
+    [],
+  );
+  useEffect(
+    () => () => {
+      window.clearTimeout(saveTimer.current);
+      const pending = pendingRules.current;
+      if (pending) void desktop.saveReplacementRules(pending).catch((reason) => onError(message(reason)));
+    },
+    [onError],
+  );
   const previewRequest = useRef(0);
 
   useEffect(() => {
@@ -104,9 +126,15 @@ export function ReplaceView({
   const persist = useCallback(
     (next: ReplacementRule[]) => {
       if (!desktop.isAvailable()) return;
+      pendingRules.current = next;
       window.clearTimeout(saveTimer.current);
       saveTimer.current = window.setTimeout(() => {
-        void desktop.saveReplacementRules(next).catch((reason) => onError(message(reason)));
+        void desktop
+          .saveReplacementRules(next)
+          .then(() => {
+            if (pendingRules.current === next) pendingRules.current = null;
+          })
+          .catch((reason) => onError(message(reason)));
       }, 350);
     },
     [onError],
@@ -130,6 +158,7 @@ export function ReplaceView({
       id: newId(),
       name: t("replace.rule.default", { index: rules.length + 1 }),
       enabled: false,
+      action: "rewrite",
       expression,
       edits: [blankEdit("field")],
     };
@@ -170,29 +199,36 @@ export function ReplaceView({
   // operator supplies, so a rule can be checked before it is enabled.
   useEffect(() => {
     const requestId = ++previewRequest.current;
-    if (!desktop.isAvailable() || !sample.trim() || edits.length === 0) {
+    if (!desktop.isAvailable() || !sample.trim() || !selected) {
       setPreview({ hex: "", error: null });
       return undefined;
     }
     const timer = window.setTimeout(() => {
       void (async () => {
         try {
-          const bytes = await desktop.replacementPreview(
+          const result = await desktop.replacementRulePreview(
+            selected,
             parseHex(sample),
             state,
             direction,
-            edits,
             sampleVersion,
+            seed?.summary ?? null,
           );
-          // An older preview resolving late must not overwrite a newer one.
-          if (requestId === previewRequest.current) setPreview({ hex: formatHexInput(bytes), error: null });
+          const text = !result.matched
+            ? t("replace.preview.no-match")
+            : result.protected
+              ? t("replace.preview.protected")
+              : result.action === "drop"
+                ? t("replace.preview.drop")
+                : formatHexInput(base64ToBytes(result.logical_base64));
+          if (requestId === previewRequest.current) setPreview({ hex: text, error: null });
         } catch (reason) {
           if (requestId === previewRequest.current) setPreview({ hex: "", error: message(reason) });
         }
       })();
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [direction, edits, sample, sampleVersion, state]);
+  }, [direction, selected, sample, sampleVersion, state, seed]);
 
   return (
     <Split
@@ -226,7 +262,8 @@ export function ReplaceView({
             <button type="button" className="rule-open" onClick={() => setSelectedId(rule.id)}>
               <strong>{rule.name}</strong>
               <small>
-                {rule.expression || t("replace.every-packet")} · {rule.edits.length}
+                {rule.expression || t("replace.every-packet")} ·{" "}
+                {rule.action === "drop" ? t("replace.action.drop") : rule.edits.length}
               </small>
             </button>
             <button
@@ -260,6 +297,16 @@ export function ReplaceView({
                 onBlur={() => void validateExpression(selected.expression)}
               />
             </label>
+            <label>
+              {t("replace.action")}
+              <select
+                value={selected.action ?? "rewrite"}
+                onChange={(e) => patch({ action: e.target.value as "rewrite" | "drop" })}
+              >
+                <option value="rewrite">{t("replace.action.rewrite")}</option>
+                <option value="drop">{t("replace.action.drop")}</option>
+              </select>
+            </label>
             <label className="rule-enabled">
               <input
                 type="checkbox"
@@ -275,23 +322,27 @@ export function ReplaceView({
             </p>
           )}
 
-          <div className="rule-edits">
-            {edits.map((edit, index) => (
-              <EditRow
-                key={index}
-                edit={edit}
-                onChange={(next) => patch({ edits: edits.map((item, at) => (at === index ? next : item)) })}
-                onRemove={() => patch({ edits: edits.filter((_, at) => at !== index) })}
-              />
-            ))}
-            <button
-              type="button"
-              className="button"
-              onClick={() => patch({ edits: [...edits, blankEdit("field")] })}
-            >
-              <Plus size={14} /> {t("replace.add-edit")}
-            </button>
-          </div>
+          {selected.action === "drop" ? (
+            <p className="intercept-notice">{t("replace.blocker-note")}</p>
+          ) : (
+            <div className="rule-edits">
+              {edits.map((edit, index) => (
+                <EditRow
+                  key={index}
+                  edit={edit}
+                  onChange={(next) => patch({ edits: edits.map((item, at) => (at === index ? next : item)) })}
+                  onRemove={() => patch({ edits: edits.filter((_, at) => at !== index) })}
+                />
+              ))}
+              <button
+                type="button"
+                className="button"
+                onClick={() => patch({ edits: [...edits, blankEdit("field")] })}
+              >
+                <Plus size={14} /> {t("replace.add-edit")}
+              </button>
+            </div>
+          )}
 
           <div className="rule-preview">
             <div className="rule-preview-controls">

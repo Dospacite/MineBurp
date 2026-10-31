@@ -397,6 +397,21 @@ fn channel_of(fields: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The channel and loader a play `custom_payload` frame names, without
+/// decoding the rest of its body.
+///
+/// Capture stores this on every row so the history's channel search and the
+/// `channel` filter work for modern plugin messages, whose packet id is only
+/// known from the version table. Reading the identifier is one bounded string;
+/// the payload itself stays opaque until the packet is opened.
+#[must_use]
+pub fn plugin_channel(body: &[u8]) -> Option<(String, Option<String>)> {
+    let mut reader = Reader::new(body);
+    let channel = reader.identifier()?;
+    let loader = loader_for_channel(&channel).map(str::to_owned);
+    Some((channel, loader))
+}
+
 /// The hand-written decoders, keyed by the table name they decode.
 ///
 /// These predate the bundled descriptions and remain the decode for releases
@@ -2486,11 +2501,26 @@ fn summarize(name: &str, fields: &Value) -> String {
 }
 
 fn truncate(value: &str, limit: usize) -> String {
+    let clipped: String = value.chars().take(limit).map(visible_char).collect();
     if value.chars().count() <= limit {
-        return value.replace(['\n', '\r'], " ");
+        clipped
+    } else {
+        format!("{clipped}…")
     }
-    let clipped: String = value.chars().take(limit).collect();
-    format!("{}…", clipped.replace(['\n', '\r'], " "))
+}
+
+/// Line breaks become spaces; other control characters become their Unicode
+/// control picture, so a Forge handshake reads `host␀FORGE` rather than
+/// `hostFORGE` with an invisible NUL.
+fn visible_char(character: char) -> char {
+    match character {
+        '\n' | '\r' => ' ',
+        '\u{7f}' => '\u{2421}',
+        control if u32::from(control) < 0x20 => {
+            char::from_u32(0x2400 + u32::from(control)).unwrap_or(' ')
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -2557,6 +2587,18 @@ mod tests {
         assert_eq!(insight.name.as_deref(), Some("custom_payload"));
         assert_eq!(insight.channel.as_deref(), Some("fabric:registry/sync"));
         assert_eq!(insight.loader.as_deref(), Some("fabric"));
+    }
+
+    #[test]
+    fn reads_the_channel_from_a_modern_custom_payload_preamble() {
+        let mut body = Vec::new();
+        push_string(&mut body, "mineburp:inventory");
+        body.extend_from_slice(&[2, 0, 0, 0, 1]);
+
+        let (channel, loader) = plugin_channel(&body).expect("identifier");
+        assert_eq!(channel, "mineburp:inventory");
+        assert_eq!(loader, None);
+        assert!(plugin_channel(&[0x00]).is_none());
     }
 
     #[test]
@@ -3699,6 +3741,32 @@ mod tests {
         assert_eq!(
             insight.fields.unwrap()["server_address"],
             "play.example.net"
+        );
+    }
+
+    #[test]
+    fn summaries_show_handshake_loader_markers() {
+        let mut body = encode_var_i32(774).to_vec();
+        push_string(&mut body, "play.example.net\0FORGE");
+        body.extend_from_slice(&25_565_u16.to_be_bytes());
+        body.extend_from_slice(&encode_var_i32(2));
+
+        let mut logical = encode_var_i32(0).to_vec();
+        logical.extend_from_slice(&body);
+        let insight = inspect_logical(
+            ProtocolState::Handshake,
+            Direction::ClientToServer,
+            &logical,
+            None,
+        );
+        assert_eq!(
+            insight.summary.as_deref(),
+            Some("handshake: play.example.net\u{2400}FORGE")
+        );
+        // The field keeps the real bytes so edits round-trip.
+        assert_eq!(
+            insight.fields.unwrap()["server_address"],
+            "play.example.net\0FORGE"
         );
     }
 

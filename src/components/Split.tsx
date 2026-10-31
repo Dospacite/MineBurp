@@ -89,8 +89,14 @@ export function Split({
     persist(storageKey, latest.current);
   }
 
+  // The minimum also holds when the window shrinks, not just while dragging;
+  // it gives way to an even share when the panes cannot all fit. Fractions
+  // are scaled up because `fr` values that sum below 1 leave space unfilled
+  // once a pane is pinned at its minimum.
+  const floor = `min(${minimum}px, ${(100 / fractions.length).toFixed(2)}%)`;
   const template = fractions
-    .flatMap((size, index) => (index === 0 ? [`${size}fr`] : ["6px", `${size}fr`]))
+    .map((size) => `minmax(${floor}, ${(size * 100).toFixed(3)}fr)`)
+    .flatMap((track, index) => (index === 0 ? [track] : ["6px", track]))
     .join(" ");
 
   return (

@@ -58,16 +58,47 @@ function FieldRow({ field, onCommit }: { field: FieldSpan; onCommit: (value: str
     );
   }
 
-  const multiline = field.kind === "bytes" || field.kind === "prefixed_bytes" || draft.length > 96;
+  if (isNbt(field.kind)) {
+    return (
+      <label className="field-row field-nbt">
+        <span className="field-name">{field.name}</span>
+        <textarea
+          className="field-input nbt-json"
+          spellCheck={false}
+          rows={Math.min(18, Math.max(2, draft.split("\n").length))}
+          value={draft}
+          placeholder={t("fields.nbt.absent")}
+          title={t("fields.nbt.hint")}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={() => draft !== text(field.value) && onCommit(draft)}
+          onKeyDown={(event) => {
+            // Enter adds lines; Ctrl/Cmd+Enter commits, as Escape discards.
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.currentTarget.blur();
+            }
+            if (event.key === "Escape") setDraft(text(field.value));
+          }}
+        />
+        <span className="field-kind">nbt</span>
+      </label>
+    );
+  }
+
+  // A single-line input drops line breaks, so text holding one (a chat line,
+  // a sign) is edited in a textarea or it would lose them on commit.
+  const multiline =
+    field.kind === "bytes" || field.kind === "prefixed_bytes" || draft.length > 96 || draft.includes("\n");
 
   return (
     <label className="field-row">
       <span className="field-name">{field.name}</span>
       {multiline ? (
         <textarea
-          className="field-input hex"
+          className={`field-input ${field.kind === "string" ? "" : "hex"}`}
           spellCheck={false}
-          rows={Math.min(6, Math.ceil(draft.length / 64) || 1)}
+          rows={Math.min(12, Math.max(draft.split("\n").length, Math.ceil(draft.length / 64)) || 1)}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onBlur={() => draft !== text(field.value) && onCommit(draft)}
@@ -98,5 +129,9 @@ function text(value: FieldSpan["value"]): string {
 }
 
 function numeric(kind: FieldKind): boolean {
-  return !["string", "bytes", "prefixed_bytes", "bool"].includes(kind);
+  return !["string", "bytes", "prefixed_bytes", "bool", "nbt", "named_nbt", "prefixed_nbt"].includes(kind);
+}
+
+function isNbt(kind: FieldKind): boolean {
+  return kind === "nbt" || kind === "named_nbt" || kind === "prefixed_nbt";
 }

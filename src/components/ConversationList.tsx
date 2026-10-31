@@ -22,6 +22,7 @@ export const ConversationList = memo(function ConversationList({
   footer,
   onScrollStateChange,
   handleRef,
+  oldestFirst = false,
 }: {
   packets: readonly PacketSummary[];
   selectedId: number | null;
@@ -30,6 +31,8 @@ export const ConversationList = memo(function ConversationList({
   footer?: ReactNode;
   onScrollStateChange?: (atTop: boolean) => void;
   handleRef?: (handle: VirtualRowsHandle | null) => void;
+  /** Rows run oldest to newest; otherwise newest to oldest. */
+  oldestFirst?: boolean;
 }) {
   const navigate = useMemo(
     () => rowNavigationKeyHandler(packets.length, PACKET_ROW_HEIGHT),
@@ -64,7 +67,8 @@ export const ConversationList = memo(function ConversationList({
       }
       footer={footer}
       renderRow={(packet, index) => {
-        const previous = packets[index + 1];
+        // The packet before this one in time, whichever way the rows run.
+        const previous = packets[oldestFirst ? index - 1 : index + 1];
         const delta = previous ? packet.timestamp_micros - previous.timestamp_micros : 0;
         const turned = previous !== undefined && previous.direction !== packet.direction;
         const lane = (

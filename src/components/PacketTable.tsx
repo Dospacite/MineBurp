@@ -1,4 +1,4 @@
-import { Bookmark } from "lucide-react";
+import { ArrowDown, ArrowUp, Bookmark } from "lucide-react";
 import {
   type CSSProperties,
   type KeyboardEvent,
@@ -6,6 +6,7 @@ import {
   memo,
   type ReactNode,
   useCallback,
+  useEffect,
   useMemo,
 } from "react";
 
@@ -17,9 +18,13 @@ import {
   type ColumnId,
   type ColumnSetting,
   DEFAULT_TABLE_SETTINGS,
+  type DecodedColumn,
+  gridMinWidth,
   gridTemplate,
 } from "../lib/columns";
+import { createDecodedColumnStore } from "../lib/decodedColumns";
 import { formatPacketTime } from "../lib/time";
+import { DecodedColumnCell } from "./DecodedColumnCell";
 import { rowNavigationKeyHandler, VirtualRows, type VirtualRowsHandle } from "./VirtualRows";
 
 /** Must match `.packet-row` in styles.css: virtualization needs a fixed height. */
@@ -42,7 +47,15 @@ export const PacketTable = memo(function PacketTable({
   onRowMenu,
   onRowCommand,
   annotations,
+  oldestFirst = false,
+  onToggleOrder,
+  customColumns = [],
+  projectPath = null,
+  onDecodeError,
 }: {
+  customColumns?: DecodedColumn[];
+  projectPath?: string | null;
+  onDecodeError?: (error: string) => void;
   packets: readonly PacketSummary[];
   /**
    * The clicked row's id. Held by the caller rather than derived from the
@@ -65,9 +78,24 @@ export const PacketTable = memo(function PacketTable({
   onRowCommand?: (command: RowCommand, packet: PacketSummary) => void;
   /** Bookmarks and colours of the loaded rows, by packet id. */
   annotations?: ReadonlyMap<number, PacketAnnotation>;
+  /** Rows run oldest to newest; otherwise newest to oldest. */
+  oldestFirst?: boolean;
+  /**
+   * Flips the order. The caller re-queries the whole history in the new
+   * order; the table never sorts just the rows it holds.
+   */
+  onToggleOrder?: () => void;
 }) {
   const visibleColumns = useMemo(() => columns.filter((column) => column.visible), [columns]);
-  const template = useMemo(() => gridTemplate(columns), [columns]);
+  const visibleCustom = customColumns.filter((c) => c.visible && c.path.trim());
+  const pathKey = JSON.stringify(visibleCustom.map((c) => c.path));
+  const decodedStore = useMemo(
+    () => createDecodedColumnStore(projectPath, JSON.parse(pathKey), onDecodeError),
+    [projectPath, pathKey, onDecodeError],
+  );
+  useEffect(() => () => decodedStore.dispose(), [decodedStore]);
+  const template = `${gridTemplate(columns)}${" 160px".repeat(visibleCustom.length)}`;
+  const minWidth = gridMinWidth(columns) + visibleCustom.length * 160;
   const selectedIndex = useMemo(
     () => (selectedId === null ? -1 : packets.findIndex((packet) => packet.id === selectedId)),
     [packets, selectedId],
@@ -128,9 +156,12 @@ export const PacketTable = memo(function PacketTable({
   const cell = (id: ColumnId, packet: PacketSummary, index: number): ReactNode => {
     switch (id) {
       case "sequence":
-        return packet.sequence;
+        // The project-wide row id, as Compare, filters, and MCP number packets.
+        // `sequence` restarts for every connection, so it repeats across rows.
+        return packet.id;
       case "time": {
-        const previous = packets[index + 1]?.timestamp_micros ?? null;
+        // The packet before this one in time, whichever way the rows run.
+        const previous = packets[oldestFirst ? index - 1 : index + 1]?.timestamp_micros ?? null;
         return formatPacketTime(packet.timestamp_micros, timeMode, timeReference, previous);
       }
       case "connection":
@@ -195,14 +226,39 @@ export const PacketTable = memo(function PacketTable({
       activeIndex={packets.length > 0 ? activeIndex : undefined}
       onScrollStateChange={onScrollStateChange}
       handleRef={handleRef}
-      style={{ "--packet-columns": template } as CSSProperties}
+      style={{ "--packet-columns": template, "--row-min-width": `${minWidth}px` } as CSSProperties}
       header={
         <div className="packet-row packet-header" role="row" aria-rowindex={1}>
           {visibleColumns.map((column) => (
-            <span role="columnheader" key={column.id}>
-              {column.id === "time"
-                ? t(`table.column.time.${timeMode}`)
-                : t(COLUMN_DEFINITIONS[column.id].label)}
+            <span
+              role="columnheader"
+              key={column.id}
+              aria-sort={column.id === "sequence" ? (oldestFirst ? "ascending" : "descending") : undefined}
+            >
+              {column.id === "sequence" && onToggleOrder ? (
+                <button
+                  type="button"
+                  className="sort-toggle"
+                  onClick={onToggleOrder}
+                  title={t(oldestFirst ? "table.sort.oldest-first" : "table.sort.newest-first")}
+                >
+                  {t(COLUMN_DEFINITIONS[column.id].label)}
+                  {oldestFirst ? (
+                    <ArrowUp size={11} aria-hidden="true" />
+                  ) : (
+                    <ArrowDown size={11} aria-hidden="true" />
+                  )}
+                </button>
+              ) : column.id === "time" ? (
+                t(`table.column.time.${timeMode}`)
+              ) : (
+                t(COLUMN_DEFINITIONS[column.id].label)
+              )}
+            </span>
+          ))}
+          {visibleCustom.map((column) => (
+            <span role="columnheader" key={column.id} title={column.path}>
+              {column.label}
             </span>
           ))}
         </div>
@@ -226,6 +282,9 @@ export const PacketTable = memo(function PacketTable({
               <span role="gridcell" key={column.id} className={cellClass(column.id, packet)}>
                 {cell(column.id, packet, index)}
               </span>
+            ))}
+            {visibleCustom.map((column, index) => (
+              <DecodedColumnCell key={column.id} store={decodedStore} id={packet.id} index={index} />
             ))}
           </div>
         );

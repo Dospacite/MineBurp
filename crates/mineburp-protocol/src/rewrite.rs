@@ -16,7 +16,7 @@ use mineburp_core::{Direction, PacketEdit, ProtocolState};
 use regex::bytes::{NoExpand, Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::layout::{encode_field, layout_logical};
+use crate::layout::{encode_field_over, layout_logical};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RewriteError {
@@ -105,7 +105,8 @@ fn apply_edit(
         }
         PacketEdit::Field { name, value } => {
             let (span, _) = find_field(state, direction, protocol_version, frame, name)?;
-            let encoded = encode_field(span.kind, &Value::String(value.clone()))
+            let original = frame.get(span.offset..span.offset + span.length);
+            let encoded = encode_field_over(span.kind, &Value::String(value.clone()), original)
                 .map_err(RewriteError::Encoding)?;
             splice(frame, span.offset, span.length, &encoded)
         }
@@ -128,8 +129,9 @@ fn apply_edit(
             } else {
                 current.replace(find.as_str(), replace)
             };
-            let encoded =
-                encode_field(span.kind, &Value::String(updated)).map_err(RewriteError::Encoding)?;
+            let original = frame.get(span.offset..span.offset + span.length);
+            let encoded = encode_field_over(span.kind, &Value::String(updated), original)
+                .map_err(RewriteError::Encoding)?;
             splice(frame, span.offset, span.length, &encoded)
         }
     }

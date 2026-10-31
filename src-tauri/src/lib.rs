@@ -1,7 +1,7 @@
 mod capture_project;
 mod commands;
-mod export;
-mod paths;
+#[cfg(all(feature = "desktop-runtime", unix))]
+mod mcp;
 mod state;
 
 #[cfg(feature = "desktop-runtime")]
@@ -24,6 +24,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(setup)
         .invoke_handler(tauri::generate_handler![
+            commands::replacement_rule_preview,
+            commands::payload_generate,
+            commands::decoder_transform,
+            commands::workbench_document_get,
+            commands::workbench_document_save,
+            commands::channel_stats,
+            commands::packet_field_values,
+            commands::intruder_plan,
+            commands::sequencer_analyze,
             commands::app_capabilities,
             commands::decrypt_mode_status,
             commands::decrypt_mode_set,
@@ -56,6 +65,7 @@ pub fn run() {
             commands::packet_bytes,
             commands::inspect_bytes,
             commands::packet_layout,
+            commands::packet_layout_stored,
             commands::field_edit,
             commands::proxy_sessions,
             commands::intercept_settings_get,
@@ -91,6 +101,8 @@ pub fn run() {
             // The scratch project is session scratch space, not a saved
             // assessment; leaving it behind would quietly fill the temp
             // directory with abandoned captures.
+            #[cfg(unix)]
+            mcp::stop();
             handle
                 .state::<state::DesktopState>()
                 .discard_temporary_project();
@@ -118,6 +130,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .app_config_dir()?
         .join("client-assistance.properties");
     let state = state::DesktopState::new(agent_path, agent_config_path)?;
+    let persistence_proxy = state.proxy.clone();
+    tauri::async_runtime::spawn(async move {
+        // `setup` is synchronous, so `ProxyService::new` cannot see Tauri's
+        // Tokio runtime. Start the low-volume batch flusher from inside it.
+        let _ = persistence_proxy.start_persistence_flusher();
+    });
     let handle = app.handle().clone();
     let report = error_reporter(handle.clone());
     // A scratch project is opened before capture starts so nothing that
@@ -138,6 +156,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         report.clone(),
     );
     let capture_handle = handle.clone();
+    #[cfg(unix)]
+    let (mcp_handle, mcp_report) = (handle.clone(), report.clone());
     tauri::async_runtime::spawn(pump_proxy_events(handle, receiver));
     tauri::async_runtime::spawn(pump_capture(
         capture_handle,
@@ -146,6 +166,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         report,
     ));
     app.manage(state);
+    // After `manage`: the MCP host looks the state up on every call.
+    #[cfg(unix)]
+    mcp::start(&mcp_handle, move |message| mcp_report("mcp", message));
     Ok(())
 }
 

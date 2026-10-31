@@ -33,6 +33,7 @@ import { DecodedFields } from "./DecodedFields";
 import { EmptyState } from "./EmptyState";
 import { FieldTree, fieldAt } from "./FieldTree";
 import { type ByteRange, HEX_PAGE_BYTES, HexView } from "./HexView";
+import { SelectionToolbar } from "./SelectionToolbar";
 import { Split } from "./Split";
 
 /** Text copies stop here; the binary download always takes the whole payload. */
@@ -66,6 +67,7 @@ export const PacketInspector = memo(function PacketInspector({
     localStorage.getItem(TAB_KEY) === "structure" ? "structure" : "fields",
   );
   const [layout, setLayout] = useState<PacketLayout | null>(null);
+  const [selectedField, setSelectedField] = useState<FieldSpan | null>(null);
   const [marked, setMarked] = useState<ByteRange | null>(null);
   const layoutRequest = useRef(0);
   const packetId = packet?.summary.id ?? null;
@@ -85,12 +87,19 @@ export const PacketInspector = memo(function PacketInspector({
     const requestId = ++layoutRequest.current;
     setLayout(null);
     setMarked(null);
+    setSelectedField(null);
     setVisible(null);
     if (!packet || !desktop.isAvailable()) return;
     const { state, direction, protocol_version } = packet.summary;
     if (state === "opaque" || state === "closed" || loaded.length === 0) return;
-    void desktop
-      .packetLayout(loaded, state, direction, protocol_version)
+    // `loaded` is only the leading window; a larger packet is walked from the
+    // stored payload so the structure covers all of it.
+    const whole = packet.bytes_offset === 0 && loaded.length >= packet.total_bytes;
+    void (
+      whole
+        ? desktop.packetLayout(loaded, state, direction, protocol_version)
+        : desktop.packetLayoutStored(packet.summary.id)
+    )
       .then((next) => {
         if (requestId === layoutRequest.current) setLayout(next);
       })
@@ -103,16 +112,26 @@ export const PacketInspector = memo(function PacketInspector({
 
   const onHexSelection = useCallback(
     (range: ByteRange | null) => {
-      if (!range || !layout) return;
-      const field = fieldAt(layout.fields, range.offset);
-      setMarked(field ? { offset: field.offset, length: field.length } : null);
+      setMarked(range);
+      const field = range && layout ? fieldAt(layout.fields, range.offset) : null;
+      setSelectedField(
+        range && field && range.offset === field.offset && range.length === field.length ? field : null,
+      );
     },
     [layout],
   );
 
-  const onFieldSelect = useCallback((field: FieldSpan) => {
-    setMarked({ offset: field.offset, length: field.length });
-  }, []);
+  const onFieldSelect = useCallback(
+    (field: FieldSpan) => {
+      setMarked({ offset: field.offset, length: field.length });
+      setSelectedField(
+        layout?.fields.find(
+          (item) => item.name === field.name && item.offset === field.offset && item.length === field.length,
+        ) ?? null,
+      );
+    },
+    [layout],
+  );
 
   const loadWindow = useCallback(
     (offset: number, limit: number): Promise<ByteWindow | null> =>
@@ -301,7 +320,8 @@ export const PacketInspector = memo(function PacketInspector({
             onClick={() => onRepeater(packet)}
             title={t("menu.repeater.title")}
           >
-            <Send size={14} aria-hidden="true" /> {t("inspector.repeater")}
+            <Send size={14} aria-hidden="true" />
+            <span className="button-label">{t("inspector.repeater")}</span>
           </button>
         </div>
       </header>
@@ -379,11 +399,14 @@ export const PacketInspector = memo(function PacketInspector({
             {t("info.decode-error", { error: insight.error })}
           </p>
         )}
-        {packet.stored_decode_error && (
+        {packet.schema_decode_error && (
           <p className="inspector-error" role="note">
-            {t("info.schema-error", { error: packet.stored_decode_error })}
+            {t("info.schema-error", { error: packet.schema_decode_error })}
           </p>
         )}
+      </div>
+      <div className="inspector-selection">
+        <SelectionToolbar packet={packet} range={marked} field={selectedField} onError={onError} />
       </div>
       <Split
         orientation="rows"
@@ -412,7 +435,15 @@ export const PacketInspector = memo(function PacketInspector({
           </div>
           <div className="inspector-scroll" role="tabpanel">
             {tab === "fields" ? (
-              <DecodedFields insight={insight} schema={packet.stored_decoded} />
+              <DecodedFields
+                insight={insight}
+                schema={packet.schema_decoded}
+                selectFieldNames={layout?.fields.map((field) => field.name) ?? []}
+                onSelectField={(name) => {
+                  const field = layout?.fields.find((f) => f.name === name);
+                  if (field) onFieldSelect(field);
+                }}
+              />
             ) : (
               <FieldTree layout={layout} selected={markedKey} onSelect={onFieldSelect} />
             )}

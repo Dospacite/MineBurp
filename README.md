@@ -6,10 +6,16 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 
 ## What is implemented
 
+- **Minecraft Decoder** in a right sidebar, **Channel explorer** across the filtered capture, Ctrl/Cmd+K **command palette**, packet selection actions, bounded payload generators, Repeater undo/redo and named revisions, custom decoded-field history columns, and traffic presets. Intruder and Sequencer work saves in the project. See [workbench tools](docs/WORKBENCH.md).
+- **Automatic blockers** in Replace: enabled drop rules discard matched decoded packets before rewriting and Intercept, record the original as `dropped`, and do not advance protocol state.
+
+- **Intruder**: Sniper, Battering ram, Pitchfork, and Cluster bomb attacks over decoded fields or raw byte ranges, with first-attempt preview, sequential pacing, cancellation, and bounded traffic observations.
+- **Sequencer**: history/live field collection or pasted samples, duplicate detection, per-byte-position entropy and frequency analysis, and adjacent-sample correlation. See [research tools](docs/RESEARCH_TOOLS.md) for usage and statistical limits.
+
 - Stateful loopback TCP proxy with VarInt framing, compression, connection state tracking, and frame size limits.
 - Opt-in **Decrypt connections** mode. A configured Minecraft client receives a one-use, capability-protected private loopback route for each Minecraft network connect; there is no public proxy listener, target field, or PID workflow.
 - Online-mode encryption termination with independent client/server AES-128/CFB8 streams. MineBurp uses the signed-in Minecraft session to join the upstream server hash, then continues inspection in plaintext internally.
-- **Intercept**: hold status, configuration, and play packets on decrypted connections before they are forwarded, per direction and selected with the filter expression language. Each held packet can be forwarded, edited through its decoded fields or hex and then forwarded, or dropped. A held packet pauses only its own direction of its own connection. Handshake and login packets are never held, keep-alives and pings overtake a held packet instead of queueing behind it, an optional auto-forward deadline releases held packets with a visible countdown, and turning Intercept off forwards everything still held.
+- **Intercept**: hold handshake, status, login, configuration, and play packets on decrypted connections before they are forwarded, per direction and selected with the filter expression language. Each held packet can be forwarded, edited through its decoded fields or hex and then forwarded, or dropped. A held packet pauses only its own direction of its own connection. Keep-alives and pings overtake a held packet instead of queueing behind it, an optional auto-forward deadline releases held packets with a visible countdown, and turning Intercept off forwards everything still held.
 - **Network conditions**: per-direction fixed delay, jitter, and bandwidth limit on decrypted connections, set at runtime from the Intercept view.
 - Live Repeater injection in either direction with project-backed tabs. The Repeater decodes the frame it is editing into typed fields; editing a field re-encodes it — length prefixes included — and the hex follows, and editing the hex re-decodes the fields.
 - Automatic **Replace** rules that rewrite matching packets in either direction as they pass through: whole frame, byte range, byte sequence, literal text, regular expression, a named decoded field, or a find/replace inside one. Rules are selected with the same filter expression language as the history, are stored in the project, and can be previewed against a captured packet before they are enabled.
@@ -27,6 +33,7 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 - **Traffic statistics** for any filter: packets and bytes per direction over time, the busiest packet names by count and by bytes, the busiest connections, and a size histogram.
 - **pcapng export and import**. Export writes decrypted packets as one synthetic TCP stream per connection, with each packet named in a comment, and `tools/wireshark/mineburp.lua` dissects it in Wireshark. Import reads pcap or pcapng files into a project through the same reassembly as live capture, then splits each TCP stream into Minecraft packets — one row per packet with its state, id and name — following the handshake, compression, login and configuration the way the proxy does. Encrypted traffic (after an online-mode login) cannot be decrypted from a capture and is kept as labelled raw rows; a capture that starts mid-connection is synchronised by searching for frame boundaries, optionally with a protocol version you give it. Re-importing a MineBurp pcapng export restores the packets, states and names it was written with.
 - History maintenance: delete the packets a filter matches and compact the project file.
+- **MCP server** (`mineburp-mcp`): 19 context-efficient tools that let an MCP client such as Claude Code query and decode history, rewrite frames, manage rules, and drive Intercept and the Repeater. It bridges to the running app over a private Unix socket, or works directly on a `.mineburp` file when the app is closed. See [docs/MCP.md](docs/MCP.md).
 - Advanced packet filtering: traffic source, direction, protocol phase, and result sets; packet-name show/hide lists; payload size bounds; free-text search with regex, case-sensitive, and negative options; a filter expression language (`state == play && size > 256 && name ~ chat`) shared with replace rules; and payload content search by literal text, hex byte sequence, or regular expression, scoped to packets that contain the term, are exactly it, start with it, or end with it — each of which can be negated. A content search takes one term per line and matches any of them, and a hex term may be an inclusive range (`0c-0f`, `0100-01ff`), so hiding a handful of frames is one filter rather than one per frame. All of it runs in SQLite against the whole capture, not against the rows on screen.
 
 ## Repository layout
@@ -42,6 +49,7 @@ crates/
   mineburp-launcher/   launcher discovery and process isolation
   mineburp-capture/    automatic dumpcap boundary and packet parsing
   mineburp-packet-table/ generates play packet-id tables from a version's own data
+  mineburp-mcp/        MCP server and the history operations the desktop shares with it
 agent/                 Java 8-compatible, loader-independent Authlib and route agent
 src-tauri/             thin desktop command and event adapters
 src/                   React workbench; no protocol or persistence logic
@@ -52,10 +60,10 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ownership rules and extensi
 
 ## Development
 
-Requirements: Rust 1.97+, Node.js 22+, npm, Wireshark `dumpcap` with capture permission, a JDK with `javac` supporting `--release 8`, and the platform prerequisites for Tauri 2. On Arch Linux, install `webkit2gtk-4.1`; for other platforms, use the exact list in the [official Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Requirements: the Rust toolchain pinned in `rust-toolchain.toml`, Node.js 22, npm, Wireshark `dumpcap` with capture permission, JDK 21, and the platform prerequisites for Tauri 2. The agent build downloads its pinned ASM dependencies from Maven Central. Linux support requires a graphical desktop, procfs, and a supported Tauri/WebKitGTK environment; capture also depends on local permissions and process visibility. On Arch Linux, install `webkit2gtk-4.1`; for other platforms, use the exact list in the [official Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```bash
-npm install
+npm ci
 cargo test --workspace
 npm run test:agent
 npm run build
@@ -155,3 +163,7 @@ Current intentionally bounded areas are documented in [SECURITY.md](SECURITY.md)
 ## Verification
 
 The checked-in implementation is covered by unit tests for framing, zlib compression, VarInts, handshake marker preservation, AES stream state, RSA encryption bridging, one-use assisted session routing, reversible launcher configuration, schema limits, common loader-channel decoding, filter parsing, encrypted projects, and project artifact round trips. `npm run test:agent` also launches a real instrumented JVM and exercises both supported Authlib signatures plus the private Netty route hook.
+
+## License
+
+MineBurp is licensed under the [Apache License 2.0](LICENSE). Third-party components have their own licenses.

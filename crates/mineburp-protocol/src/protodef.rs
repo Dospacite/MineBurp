@@ -384,6 +384,17 @@ impl<'a> Decoder<'a> {
         });
     }
 
+    /// A boolean byte. The game reads any nonzero byte as true, but a span
+    /// of kind `bool` writes back 0 or 1; a byte that is neither is shown as
+    /// the number it is, so the frame rebuilt from the spans keeps it.
+    fn flag_span(&mut self, start: usize, byte: u8) {
+        if byte <= 1 {
+            self.span(FieldKind::Bool, start, Value::Bool(byte == 1));
+        } else {
+            self.span(FieldKind::U8, start, Value::from(byte));
+        }
+    }
+
     fn with_field<T>(
         &mut self,
         name: &str,
@@ -454,7 +465,7 @@ impl<'a> Decoder<'a> {
                 let start = self.position;
                 let byte = self.take(1)?[0];
                 let value = byte != 0;
-                self.span(FieldKind::Bool, start, Value::Bool(value));
+                self.flag_span(start, byte);
                 Ok(Value::Bool(value))
             }
             "u8" => {
@@ -518,9 +529,10 @@ impl<'a> Decoder<'a> {
             }
             "option" => {
                 let start = self.position;
-                let present = self.take(1)?[0] != 0;
+                let byte = self.take(1)?[0];
+                let present = byte != 0;
                 self.with_field("present", |decoder| {
-                    decoder.span(FieldKind::Bool, start, Value::Bool(present));
+                    decoder.flag_span(start, byte);
                     Ok(())
                 })?;
                 if present {
@@ -561,7 +573,13 @@ impl<'a> Decoder<'a> {
                         .get(self.position)
                         .ok_or_else(|| self.failure("metadata ended without its terminator"))?;
                     if u64::from(next) == end {
+                        // The terminator gets a span so the layout tiles the
+                        // whole frame and the Repeater writes it back.
+                        let start = self.position;
                         self.position += 1;
+                        self.path.push(PathPart::Field("end".into()));
+                        self.span(FieldKind::Bytes, start, Value::String(to_hex(&[next])));
+                        self.path.pop();
                         break;
                     }
                     if items.len() >= MAX_LOOP_ITEMS {
@@ -712,12 +730,14 @@ impl<'a> Decoder<'a> {
     /// Reads a one-byte integer, honouring a pending terminated-array mask.
     fn small(&mut self, signed: bool) -> Decoded<i64> {
         let start = self.position;
-        let mut byte = self.take(1)?[0];
-        if self.mask_top_bit_at == Some(start) {
-            byte &= 0x7f;
+        let byte = self.take(1)?[0];
+        // The top bit of a terminated array's leading byte is the array's
+        // continuation flag, not part of the value; the span says so, or an
+        // edit written back as a plain byte would end the array early.
+        let (value, kind) = if self.mask_top_bit_at == Some(start) {
             self.mask_top_bit_at = None;
-        }
-        let (value, kind) = if signed {
+            (i64::from(byte & 0x7f), FieldKind::FlaggedU7)
+        } else if signed {
             (i64::from(byte.cast_signed()), FieldKind::I8)
         } else {
             (i64::from(byte), FieldKind::U8)
@@ -1188,10 +1208,15 @@ impl<'a> Decoder<'a> {
     /// `optional` accepts a lone `TAG_End` as "absent".
     fn nbt(&mut self, named: bool, optional: bool) -> Decoded<Value> {
         let start = self.position;
+        let kind = if named {
+            FieldKind::NamedNbt
+        } else {
+            FieldKind::Nbt
+        };
         let tag = self.take(1)?[0];
         if tag == 0 {
             if optional || !named {
-                self.span(FieldKind::Bytes, start, Value::String("00".into()));
+                self.span(kind, start, Value::String(String::new()));
                 return Ok(Value::Null);
             }
             return self.fail("NBT root is TAG_End");
@@ -1201,8 +1226,18 @@ impl<'a> Decoder<'a> {
             self.take(length)?;
         }
         let value = self.nbt_payload(tag, 0)?;
-        let bytes = self.input[start..self.position].to_vec();
-        self.span(FieldKind::Bytes, start, Value::String(to_hex(&bytes)));
+        let bytes = &self.input[start..self.position];
+        // Large blobs (chunk block entities, registries) stay hex: as text
+        // they would be too big to edit and slow to render.
+        let text = (bytes.len() <= crate::layout::MAX_NBT_TEXT_BYTES)
+            .then(|| crate::nbt_text::to_text(bytes, named))
+            .flatten();
+        if let Some(text) = text {
+            self.span(kind, start, Value::String(text));
+        } else {
+            let hex = to_hex(bytes);
+            self.span(FieldKind::Bytes, start, Value::String(hex));
+        }
         Ok(value)
     }
 
@@ -1691,6 +1726,41 @@ mod tests {
         ];
         let decoded = decode(&types, &body);
         assert!(decoded.error.unwrap().contains("remain"));
+    }
+
+    #[test]
+    fn nbt_fields_are_laid_out_as_editable_json() {
+        let packet = serde_json::json!(["container", [
+            { "name": "tag", "type": "anonymousNbt" },
+            { "name": "extra", "type": "anonymousNbt" }
+        ]]);
+        let mut types = types(&packet);
+        types["anonymousNbt"] = Value::String("native".into());
+        // {a: 5b} followed by an absent value.
+        let body = [0x0a, 0x01, 0x00, 0x01, b'a', 0x05, 0x00, 0x00];
+        let decoded = decode(&types, &body);
+        assert!(decoded.error.is_none());
+        let kinds: Vec<_> = decoded
+            .spans
+            .iter()
+            .map(|span| (span.kind, span.value.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (FieldKind::Nbt, Value::String(r#"{"a": 5}"#.into())),
+                (FieldKind::Nbt, Value::String(String::new())),
+            ]
+        );
+        let encoded = crate::layout::encode_field_over(
+            FieldKind::Nbt,
+            &Value::String(r#"{"a": 7}"#.into()),
+            Some(&body[..7]),
+        );
+        assert_eq!(
+            encoded.unwrap(),
+            vec![0x0a, 0x01, 0x00, 0x01, b'a', 0x07, 0x00]
+        );
     }
 
     #[test]

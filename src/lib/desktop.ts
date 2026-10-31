@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentSetupOutcome,
   AppCapabilities,
+  AttackMode,
   BackendError,
   ByteWindow,
   CaptureStats,
@@ -34,10 +35,12 @@ import type {
   RepeaterTab,
   ReplacementRule,
   SavedFilter,
+  SequenceAnalysis,
   StatsOptions,
   TrafficStats,
 } from "../domain/types";
 import { t } from "../i18n";
+import { flushProjectEditors } from "./projectWrites";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -77,6 +80,7 @@ export function filterArgs(query: PacketHistoryQuery) {
     contentNegate: query.contentNegate ?? false,
     beforeId: query.beforeId ?? null,
     afterId: query.afterId ?? null,
+    oldestFirst: query.oldestFirst ?? false,
     // `false` would mean "only rows without a bookmark"; the UI only ever narrows to bookmarked ones.
     bookmarked: query.bookmarked ? true : null,
   };
@@ -84,6 +88,24 @@ export function filterArgs(query: PacketHistoryQuery) {
 
 export const desktop = {
   isAvailable: inTauri,
+  intruderPlan: (mode: AttackMode, lengths: number[]) =>
+    call<Array<Array<number | null>>>("intruder_plan", { mode, lengths }),
+  sequencerAnalyze: (samples: string[]) => call<SequenceAnalysis>("sequencer_analyze", { samples }),
+  workbenchDocumentGet: (expectedPath: string, key: string) =>
+    call<unknown | null>("workbench_document_get", { expectedPath, key }),
+  workbenchDocumentSave: (expectedPath: string, key: string, value: unknown) =>
+    call<void>("workbench_document_save", { expectedPath, key, value }),
+  payloadGenerate: (generator: import("../domain/types").PayloadGenerator) =>
+    call<string[]>("payload_generate", { generator }),
+  decoderTransform: (operation: string, input: string) =>
+    call<{ output: string; consumed: number | null; trailing_hex: string }>("decoder_transform", {
+      operation,
+      input,
+    }),
+  channelStats: (query: PacketHistoryQuery = {}) =>
+    call<import("../domain/types").ChannelStat[]>("channel_stats", { filter: filterArgs(query) }),
+  packetFieldValues: (expectedPath: string, ids: number[], paths: string[]) =>
+    call<Record<string, Array<unknown | null>>>("packet_field_values", { expectedPath, ids, paths }),
   capabilities: () => call<AppCapabilities>("app_capabilities"),
   captureStart: () => call<void>("capture_start"),
   captureStop: () => call<void>("capture_stop"),
@@ -91,13 +113,19 @@ export const desktop = {
   decryptMode: () => call<DecryptModeStatus>("decrypt_mode_status"),
   setDecryptMode: (enabled: boolean) => call<DecryptModeStatus>("decrypt_mode_set", { enabled }),
   projectCurrent: () => call<ProjectInfo | null>("project_current"),
-  projectCreate: (path: string, name: string, passphrase?: string) =>
-    call<ProjectInfo>("project_create", { path, name, passphrase: passphrase || null }),
-  projectOpen: (path: string, passphrase?: string) =>
-    call<ProjectInfo>("project_open", { path, passphrase: passphrase || null, readOnly: false }),
+  projectCreate: async (path: string, name: string, passphrase?: string) => {
+    await flushProjectEditors();
+    return call<ProjectInfo>("project_create", { path, name, passphrase: passphrase || null });
+  },
+  projectOpen: async (path: string, passphrase?: string) => {
+    await flushProjectEditors();
+    return call<ProjectInfo>("project_open", { path, passphrase: passphrase || null, readOnly: false });
+  },
   /** Copies the open project (usually the temporary session) to a new file and switches to it. */
-  projectSaveAs: (path: string, name: string, passphrase?: string) =>
-    call<ProjectInfo>("project_save_as", { path, name, passphrase: passphrase || null }),
+  projectSaveAs: async (path: string, name: string, passphrase?: string) => {
+    await flushProjectEditors();
+    return call<ProjectInfo>("project_save_as", { path, name, passphrase: passphrase || null });
+  },
   interceptSettings: () => call<InterceptSettings>("intercept_settings_get"),
   setInterceptSettings: (settings: InterceptSettings) =>
     call<InterceptSettings>("intercept_settings_set", { settings }),
@@ -184,6 +212,8 @@ export const desktop = {
       direction,
       protocolVersion,
     }),
+  /** Walks a stored packet's whole payload, not just the window `packet` sends. */
+  packetLayoutStored: (id: number) => call<PacketLayout | null>("packet_layout_stored", { id }),
   /**
    * Re-encodes one decoded field and splices it back into the frame.
    *
@@ -203,6 +233,18 @@ export const desktop = {
   replacementRules: () => call<ReplacementRule[]>("replacement_rules_get"),
   saveReplacementRules: (rules: ReplacementRule[]) => call<void>("replacement_rules_set", { rules }),
   /** Runs a rule's edits against one frame without sending anything. */
+  replacementRulePreview: (
+    rule: ReplacementRule,
+    bytes: Uint8Array,
+    protocolState: ProtocolState,
+    direction: Direction,
+    protocolVersion: number | null,
+    summary: PacketSummary | null,
+  ) =>
+    call<{ matched: boolean; action: "rewrite" | "drop"; protected: boolean; logical_base64: string }>(
+      "replacement_rule_preview",
+      { rule, logicalBase64: bytesToBase64(bytes), protocolState, direction, protocolVersion, summary },
+    ),
   replacementPreview: (
     bytes: Uint8Array,
     protocolState: ProtocolState,
@@ -253,6 +295,15 @@ export const desktop = {
   onBackendError: async (listener: (error: BackendError) => void): Promise<UnlistenFn> => {
     if (!inTauri()) return () => undefined;
     return listen<BackendError>("backend-error", ({ payload }) => listener(payload));
+  },
+  /**
+   * Something an MCP client changed behind the UI's back: `project`, `rules`,
+   * `intercept`, `network`, `packets`, `schemas`, `repeater`, `filters`,
+   * `annotations`, `capture`, or `decrypt`.
+   */
+  onMcpChange: async (listener: (topic: string) => void): Promise<UnlistenFn> => {
+    if (!inTauri()) return () => undefined;
+    return listen<string>("mcp-change", ({ payload }) => listener(payload));
   },
   /**
    * Coalesced signal that new rows landed in the project.

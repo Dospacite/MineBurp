@@ -72,6 +72,49 @@ async fn wait_for_held(proxy: &ProxyService) -> u64 {
 }
 
 #[tokio::test]
+async fn a_handshake_can_be_held_before_the_protocol_state_advances() {
+    let proxy = ProxyService::new();
+    proxy
+        .set_intercept_settings(InterceptSettings {
+            enabled: true,
+            client_to_server: true,
+            server_to_client: false,
+            expression: "state == handshake".into(),
+            ..InterceptSettings::default()
+        })
+        .expect("settings");
+    let (mut client, server) = status_exchange(&proxy).await;
+
+    let id = wait_for_held(&proxy).await;
+    let held = proxy.intercepted();
+    assert_eq!(
+        held[0].summary.state,
+        mineburp_core::ProtocolState::Handshake
+    );
+    assert_eq!(
+        proxy.sessions()[0].state,
+        mineburp_core::ProtocolState::Handshake,
+        "holding the handshake must not advance the session"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), client.receive())
+            .await
+            .is_err(),
+        "the server cannot answer before the handshake is forwarded"
+    );
+
+    proxy
+        .resolve_intercept(id, InterceptDecision::Forward)
+        .expect("forward handshake");
+    let response = client.receive().await;
+    assert_eq!(&response.body[1..], ORIGINAL.as_bytes());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server finishes")
+        .expect("server task");
+}
+
+#[tokio::test]
 async fn a_held_frame_waits_and_is_forwarded_as_edited() {
     let proxy = ProxyService::new();
     hold_server_responses(&proxy);

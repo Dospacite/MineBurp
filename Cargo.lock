@@ -2087,6 +2087,7 @@ dependencies = [
  "mineburp-capture",
  "mineburp-core",
  "mineburp-launcher",
+ "mineburp-mcp",
  "mineburp-project",
  "mineburp-protocol",
  "mineburp-proxy",
@@ -2114,6 +2115,28 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "mineburp-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "hex",
+ "mineburp-capture",
+ "mineburp-core",
+ "mineburp-launcher",
+ "mineburp-project",
+ "mineburp-protocol",
+ "mineburp-proxy",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 

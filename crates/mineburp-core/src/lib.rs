@@ -12,6 +12,9 @@ pub use filter::{
 };
 pub use model::{
     ConnectionId, ConnectionSnapshot, ConnectionStatus, Direction, Disposition, FlowMetadata,
-    PacketDetail, PacketEdit, PacketId, PacketSummary, ProtocolState, RepeaterAttempt, RepeaterTab,
-    ReplacementRule, Target, TrafficSource, WireMetadata,
+    PacketDetail, PacketEdit, PacketId, PacketSummary, ProtocolState, RepeaterAttempt,
+    RepeaterEditHistory, RepeaterRevision, RepeaterTab, ReplacementAction, ReplacementRule, Target,
+    TrafficSource, WireMetadata,
 };
+
+pub mod research;

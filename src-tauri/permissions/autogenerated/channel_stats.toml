@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-channel-stats"
+description = "Enables the channel_stats command without any pre-configured scope."
+commands.allow = ["channel_stats"]
+
+[[permission]]
+identifier = "deny-channel-stats"
+description = "Denies the channel_stats command without any pre-configured scope."
+commands.deny = ["channel_stats"]

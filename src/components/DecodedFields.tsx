@@ -13,15 +13,23 @@ export const DecodedFields = memo(function DecodedFields({
   insight,
   /** Fields a user-supplied schema pack decoded, shown alongside the built-in ones. */
   schema,
+  onSelectField,
+  selectFieldNames,
 }: {
   insight: PacketInsight;
   schema?: unknown;
+  onSelectField?: (name: string) => void;
+  selectFieldNames?: string[];
 }) {
+  // A schema field with a built-in field's name replaces it in place rather
+  // than listing the name twice.
   const entries = [
-    ...(insight.fields ? Object.entries(insight.fields) : []),
-    ...(schema && typeof schema === "object" && !Array.isArray(schema)
-      ? Object.entries(schema as Record<string, unknown>)
-      : []),
+    ...new Map<string, unknown>([
+      ...(insight.fields ? Object.entries(insight.fields) : []),
+      ...(schema && typeof schema === "object" && !Array.isArray(schema)
+        ? Object.entries(schema as Record<string, unknown>)
+        : []),
+    ]),
   ];
 
   if (entries.length === 0 && insight.stream.length === 0) {
@@ -34,7 +42,15 @@ export const DecodedFields = memo(function DecodedFields({
         <dl className="decoded-grid">
           {entries.map(([key, value]) => (
             <div key={key}>
-              <dt>{key.replaceAll("_", " ")}</dt>
+              <dt>
+                {onSelectField && (!selectFieldNames || selectFieldNames.includes(key)) ? (
+                  <button type="button" className="field-select-button" onClick={() => onSelectField(key)}>
+                    {key.replaceAll("_", " ")}
+                  </button>
+                ) : (
+                  key.replaceAll("_", " ")
+                )}
+              </dt>
               <dd>
                 <FieldValue value={value} />
               </dd>
@@ -61,6 +77,17 @@ export const DecodedFields = memo(function DecodedFields({
   );
 });
 
+/**
+ * Shows control characters as their Unicode control pictures, so a Forge
+ * handshake address reads `host␀FORGE` instead of hiding the NUL.
+ */
+export function visibleControls(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching them is the point.
+  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, (control) =>
+    String.fromCharCode(control === "\u007f" ? 0x2421 : 0x2400 + control.charCodeAt(0)),
+  );
+}
+
 function FieldValue({ value }: { value: unknown }) {
   const [expanded, setExpanded] = useState(false);
   // Serialising a large decoded value (NBT, a chunk's block entities) is the
@@ -68,7 +95,7 @@ function FieldValue({ value }: { value: unknown }) {
   const text = useMemo(
     () =>
       typeof value === "string"
-        ? value
+        ? visibleControls(value)
         : value === null
           ? "—"
           : typeof value === "object"

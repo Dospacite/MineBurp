@@ -5,6 +5,7 @@ use mineburp_core::{
     ConnectionSnapshot, ConnectionStatus, Disposition, PacketDetail, PacketSummary, ProtocolState,
     Target, TrafficSource, WireMetadata,
 };
+use mineburp_mcp::ops::persist;
 use mineburp_project::ProjectStore;
 use mineburp_proxy::ProxyService;
 use parking_lot::RwLock;
@@ -83,23 +84,6 @@ pub fn spawn_capture_project_writer(
         }
     });
     sender
-}
-
-/// Saves one batch: the connection rows first (packets reference them), then
-/// the packets in one transaction.
-///
-/// One connection row per flow per batch rather than per frame: the counters
-/// are cumulative, so only the last value matters.
-pub fn persist<'a>(
-    store: &ProjectStore,
-    connections: impl IntoIterator<Item = &'a ConnectionSnapshot>,
-    details: &[PacketDetail],
-) -> Result<(), mineburp_project::ProjectError> {
-    for snapshot in connections {
-        store.save_connection(snapshot)?;
-    }
-    store.insert_packets(details)?;
-    Ok(())
 }
 
 /// Whether this frame is the client's leg of a stream the proxy is decrypting.

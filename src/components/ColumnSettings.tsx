@@ -1,8 +1,9 @@
 import { ArrowDown, ArrowUp } from "lucide-react";
-
+import { useState } from "react";
 import type { TimeMode } from "../domain/types";
 import { t } from "../i18n";
 import { COLUMN_DEFINITIONS, DEFAULT_TABLE_SETTINGS, moveColumn, type TableSettings } from "../lib/columns";
+import { newId } from "../lib/ids";
 import { Modal } from "./Modal";
 
 const TIME_MODES: TimeMode[] = ["absolute", "relative", "delta"];
@@ -18,6 +19,8 @@ export function ColumnSettings({
   onClose: () => void;
 }) {
   const { columns } = settings;
+  const [path, setPath] = useState("");
+  const custom = settings.customColumns ?? [];
   return (
     <Modal
       title={t("columns.title")}
@@ -92,6 +95,89 @@ export function ColumnSettings({
             </li>
           ))}
         </ul>
+      </fieldset>
+      <fieldset className="filter-group">
+        <legend>{t("columns.decoded")}</legend>
+        <p>{t("columns.decoded-note")}</p>
+        {custom.map((column) => (
+          <div className="decoded-column-setting" key={column.id}>
+            <label>
+              <input
+                type="checkbox"
+                checked={column.visible}
+                onChange={(e) =>
+                  onChange({
+                    ...settings,
+                    customColumns: custom.map((c) =>
+                      c.id === column.id ? { ...c, visible: e.target.checked } : c,
+                    ),
+                  })
+                }
+              />
+              {t("columns.show")}
+            </label>
+            <input
+              aria-label={t("columns.label")}
+              maxLength={80}
+              value={column.label}
+              onChange={(e) =>
+                onChange({
+                  ...settings,
+                  customColumns: custom.map((c) =>
+                    c.id === column.id ? { ...c, label: e.target.value } : c,
+                  ),
+                })
+              }
+            />
+            <input
+              aria-label={t("columns.path")}
+              maxLength={256}
+              value={column.path}
+              onChange={(e) =>
+                onChange({
+                  ...settings,
+                  customColumns: custom.map((c) => (c.id === column.id ? { ...c, path: e.target.value } : c)),
+                })
+              }
+            />
+            <button
+              type="button"
+              className="button"
+              onClick={() =>
+                onChange({ ...settings, customColumns: custom.filter((c) => c.id !== column.id) })
+              }
+            >
+              {t("columns.remove")}
+            </button>
+          </div>
+        ))}
+        <label>
+          {t("columns.path")}
+          <input
+            value={path}
+            maxLength={256}
+            onChange={(e) => setPath(e.target.value)}
+            placeholder="data[0].slot"
+          />
+        </label>
+        <button
+          type="button"
+          className="button"
+          disabled={!path.trim() || custom.length >= 8}
+          onClick={() => {
+            const value = path.trim();
+            onChange({
+              ...settings,
+              customColumns: [
+                ...custom,
+                { id: newId(), path: value, label: value.slice(0, 80), visible: true },
+              ],
+            });
+            setPath("");
+          }}
+        >
+          {t("columns.add")}
+        </button>
       </fieldset>
     </Modal>
   );

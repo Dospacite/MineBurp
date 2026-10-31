@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -60,8 +60,8 @@ function view(bytes: number[], total = bytes.length): PacketView {
       error: null,
       stream: [],
     },
-    stored_decoded: null,
-    stored_decode_error: null,
+    schema_decoded: null,
+    schema_decode_error: null,
     total_bytes: total,
     bytes_offset: 0,
     bytes_base64: btoa(String.fromCharCode(...bytes)),
@@ -140,5 +140,40 @@ describe("RepeaterView", () => {
     await user.type(screen.getByRole("textbox", { name: "Bytes" }), "41 gg 42");
     expect(screen.getByRole("alert")).toHaveTextContent("“g” in “gg” is not a hex digit.");
     expect(screen.getByRole("button", { name: /Send/ })).toBeDisabled();
+  });
+});
+
+describe("Repeater edit history", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(desktop, "isAvailable").mockReturnValue(false);
+    vi.spyOn(desktop, "repeaterTabSave").mockResolvedValue();
+  });
+  it("undoes packet edits, restores named revisions, and saves history with the tab", async () => {
+    render(
+      <RepeaterView
+        sessions={[session]}
+        request={{ packet: view([5, 104]), nonce: 1 }}
+        onRequestHandled={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+    const editor = await screen.findByRole("textbox", { name: "Bytes" });
+    fireEvent.change(editor, { target: { value: "05 69" } });
+    await userEvent.click(screen.getByRole("button", { name: "Undo edit" }));
+    expect(editor).toHaveValue("05 68");
+    await userEvent.click(screen.getByRole("button", { name: "Redo edit" }));
+    expect(editor).toHaveValue("05 69");
+    await userEvent.type(screen.getByRole("textbox", { name: "Revision name" }), "candidate");
+    await userEvent.click(screen.getByRole("button", { name: "Create revision" }));
+    fireEvent.change(editor, { target: { value: "05 70" } });
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Restore a revision" }), "candidate");
+    expect(editor).toHaveValue("05 69");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(desktop.repeaterTabSave).toHaveBeenCalled());
+    expect(vi.mocked(desktop.repeaterTabSave).mock.calls[0]?.[0].edit_history).toMatchObject({
+      original: "05 68",
+      revisions: [{ name: "candidate", hex: "05 69" }],
+    });
   });
 });

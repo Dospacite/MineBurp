@@ -157,18 +157,18 @@ impl Interceptor {
         Ok(())
     }
 
-    /// Whether a frame in `state` with this summary should be held.
-    ///
-    /// Handshake and login frames never are: the proxy rewrites them itself
-    /// (target address, encryption bridge, compression), and an operator edit
-    /// there would desynchronise the session rather than test the server.
+    /// Whether a decoded frame in `state` with this summary should be held.
     pub fn should_hold(&self, summary: &PacketSummary) -> bool {
         let guard = self.settings.read();
         let (settings, filter) = &*guard;
         if !settings.enabled
             || !matches!(
                 summary.state,
-                ProtocolState::Status | ProtocolState::Configuration | ProtocolState::Play
+                ProtocolState::Handshake
+                    | ProtocolState::Status
+                    | ProtocolState::Login
+                    | ProtocolState::Configuration
+                    | ProtocolState::Play
             )
         {
             return false;
@@ -319,17 +319,31 @@ mod tests {
     }
 
     #[test]
-    fn holds_only_selected_play_traffic() {
+    fn holds_selected_traffic_in_every_decoded_phase() {
         let interceptor = enabled("name ~ chat");
         let c2s = Direction::ClientToServer;
         assert!(interceptor.should_hold(&summary(ProtocolState::Play, c2s, "chat_message")));
         assert!(!interceptor.should_hold(&summary(ProtocolState::Play, c2s, "move_player")));
-        assert!(!interceptor.should_hold(&summary(ProtocolState::Login, c2s, "chat_message")));
+        assert!(interceptor.should_hold(&summary(ProtocolState::Login, c2s, "chat_message")));
         assert!(!interceptor.should_hold(&summary(
             ProtocolState::Play,
             Direction::ServerToClient,
             "chat_message"
         )));
+
+        let interceptor = enabled("");
+        for state in [
+            ProtocolState::Handshake,
+            ProtocolState::Status,
+            ProtocolState::Login,
+            ProtocolState::Configuration,
+            ProtocolState::Play,
+        ] {
+            assert!(interceptor.should_hold(&summary(state, c2s, "packet")));
+        }
+        for state in [ProtocolState::Opaque, ProtocolState::Closed] {
+            assert!(!interceptor.should_hold(&summary(state, c2s, "packet")));
+        }
     }
 
     #[test]

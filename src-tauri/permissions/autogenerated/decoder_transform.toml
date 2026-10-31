@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-decoder-transform"
+description = "Enables the decoder_transform command without any pre-configured scope."
+commands.allow = ["decoder_transform"]
+
+[[permission]]
+identifier = "deny-decoder-transform"
+description = "Denies the decoder_transform command without any pre-configured scope."
+commands.deny = ["decoder_transform"]

@@ -6,6 +6,7 @@ import {
   EyeOff,
   Filter,
   GitCompare,
+  LocateFixed,
   MessagesSquare,
   Network,
   Pause,
@@ -35,6 +36,7 @@ import { ColumnSettings } from "./ColumnSettings";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { ConversationList } from "./ConversationList";
 import { EmptyState } from "./EmptyState";
+import { GoToPacketDialog } from "./GoToPacketDialog";
 import { PacketFilterBar } from "./PacketFilterBar";
 import { COPY_LIMIT, type CopyFormat, renderCopy } from "./PacketInspector";
 import { PacketTable, type RowCommand } from "./PacketTable";
@@ -47,10 +49,14 @@ export const RETAINED_ROWS = 5_000;
 const TAIL_INTERVAL_MS = 700;
 /** Pause after the last filter edit before the history is re-queried. */
 const RELOAD_DEBOUNCE_MS = 300;
+/** Rows loaded on each side of a packet the history jumps to. */
+export const AROUND_ROWS = Math.floor(PAGE_SIZE / 2);
 
 /** What the history can ask the rest of the workbench to do with a packet. */
 export interface PacketActions {
   sendToRepeater: (id: number) => void;
+  sendToIntruder?: (id: number) => void;
+  sendToSequencer?: (id: number) => void;
   /** Puts a packet on one side of the comparison; `b` also opens the Compare view. */
   compare: (id: number, slot: "a" | "b") => void;
   /** Whether a first packet is waiting to be compared against. */
@@ -87,6 +93,38 @@ export async function fetchNewer(
     if (newest === undefined) return { rows, complete: true };
     cursor = newest;
   }
+}
+
+/** A window of rows centred on one packet, in the history's order. */
+export interface PacketWindow {
+  rows: PacketSummary[];
+  /** Matching rows exist older than the window. */
+  olderMore: boolean;
+  /** Matching rows exist newer than the window. */
+  newerMore: boolean;
+}
+
+/**
+ * Reads the matching rows around one packet, for a jump to a packet that is
+ * not loaded. Null when the packet does not match the query.
+ */
+export async function fetchAround(query: PacketHistoryQuery, id: number): Promise<PacketWindow | null> {
+  // Both halves are read newest first; the order is applied at the end.
+  const base = { ...query, oldestFirst: false };
+  const [upTo, after] = await Promise.all([
+    desktop.packets({ ...base, beforeId: id + 1, afterId: null, limit: AROUND_ROWS + 2 }),
+    // `afterId` alone reads the oldest rows past it: the ones next to the target.
+    desktop.packets({ ...base, afterId: id, beforeId: null, limit: AROUND_ROWS + 1 }),
+  ]);
+  if (upTo[0]?.id !== id) return null;
+  const older = upTo.slice(0, AROUND_ROWS + 1);
+  const newer = after.length > AROUND_ROWS ? after.slice(after.length - AROUND_ROWS) : after;
+  const rows = [...newer, ...older];
+  return {
+    rows: query.oldestFirst ? rows.reverse() : rows,
+    olderMore: upTo.length > AROUND_ROWS + 1,
+    newerMore: after.length > AROUND_ROWS,
+  };
 }
 
 export function PacketHistory({
@@ -133,12 +171,29 @@ export function PacketHistory({
   const [hasNew, setHasNew] = useState(false);
   const [layout, setLayout] = useState<"table" | "conversation">("table");
   const [settings, setSettings] = useState<TableSettings>(loadTableSettings);
+  useEffect(() => {
+    const refresh = () => setSettings(loadTableSettings());
+    window.addEventListener("mineburp:table-settings", refresh);
+    return () => window.removeEventListener("mineburp:table-settings", refresh);
+  }, []);
   const [columnsOpen, setColumnsOpen] = useState(false);
   const [timeReference, setTimeReference] = useState<number | null>(null);
   const [menu, setMenu] = useState<{ packet: PacketSummary; x: number; y: number } | null>(null);
   const [editing, setEditing] = useState<number | null>(null);
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
+  const [goToOpen, setGoToOpen] = useState(false);
+  /**
+   * The loaded rows stop short of the live end after a jump: the newest rows
+   * newest first, the start of the history oldest first.
+   */
+  const [detached, setDetached] = useState(false);
   const annotations = useAnnotations();
+  const section = useRef<HTMLElement>(null);
+  const selectedRef = useRef(selectedId);
+  selectedRef.current = selectedId;
+  /** A row to scroll to, and maybe focus, once the rows holding it render. */
+  const pendingReveal = useRef<{ id: number; focus: boolean } | null>(null);
+  const [revealSignal, setRevealSignal] = useState(0);
   const request = useRef(0);
   /** A reload is waiting on the backend; a newer one cancels it there too. */
   const reloading = useRef(false);
@@ -165,9 +220,16 @@ export function PacketHistory({
     });
   }, []);
 
+  const oldestFirst = settings.oldestFirst;
+  const oldestFirstRef = useRef(oldestFirst);
+  oldestFirstRef.current = oldestFirst;
+  const hasMoreRef = useRef(hasMore);
+  hasMoreRef.current = hasMore;
+  // The order is part of the query, so flipping it re-reads the history from
+  // the database in that order rather than sorting the loaded page.
   const query = useMemo<PacketHistoryQuery>(
-    () => ({ ...filter, search: filter.search.trim(), connectionId }),
-    [connectionId, filter],
+    () => ({ ...filter, search: filter.search.trim(), connectionId, oldestFirst }),
+    [connectionId, filter, oldestFirst],
   );
   const queryKey = JSON.stringify(query);
   const queryRef = useRef(query);
@@ -178,31 +240,126 @@ export function PacketHistory({
     [onError],
   );
 
-  const reload = useCallback(async () => {
-    if (!project || !desktop.isAvailable()) return;
-    const requestId = ++request.current;
-    epoch.current++;
-    // A superseded query — typically a payload search — would otherwise keep
-    // a reader busy until its time budget ran out.
-    if (reloading.current) await desktop.packetsQueryCancel().catch(() => undefined);
-    if (requestId !== request.current) return;
-    reloading.current = true;
-    setLoading(true);
-    try {
-      const result = await desktop.packets({ ...queryRef.current, limit: PAGE_SIZE + 1 });
-      if (requestId !== request.current) return;
-      setPackets(() => result.slice(0, PAGE_SIZE));
-      setHasMore(result.length > PAGE_SIZE);
-      setHasNew(false);
-    } catch (reason) {
-      if (requestId === request.current) fail(reason);
-    } finally {
-      if (requestId === request.current) {
-        reloading.current = false;
-        setLoading(false);
+  const queueReveal = useCallback((id: number, focus: boolean) => {
+    pendingReveal.current = { id, focus };
+    setRevealSignal((value) => value + 1);
+  }, []);
+
+  /** Whether keyboard focus is on the rows, so a reveal may move it with them. */
+  const rowsHaveFocus = useCallback(
+    () => section.current?.querySelector("[role='grid']")?.contains(document.activeElement) ?? false,
+    [],
+  );
+
+  /** Replaces the rows with a window around a packet and stops following. */
+  const applyWindow = useCallback(
+    (slice: PacketWindow) => {
+      setPackets(() => slice.rows);
+      if (oldestFirstRef.current) {
+        setHasMore(slice.newerMore);
+        setDetached(slice.olderMore);
+        setHasNew(false);
+      } else {
+        setHasMore(slice.olderMore);
+        setDetached(slice.newerMore);
+        // New traffic would land above rows that do not reach it.
+        if (slice.newerMore) setFollowing(false);
+        setHasNew(slice.newerMore);
       }
+    },
+    [setPackets],
+  );
+
+  /**
+   * Re-reads the history from its live end. With `keepSelection`, a selected
+   * packet that still matches stays loaded and in view even when it is far
+   * from the newest rows, so changing a filter does not lose the operator's
+   * place.
+   */
+  const reload = useCallback(
+    async (keepSelection = false) => {
+      if (!project || !desktop.isAvailable()) return;
+      const requestId = ++request.current;
+      epoch.current++;
+      // A superseded query — typically a payload search — would otherwise keep
+      // a reader busy until its time budget ran out.
+      if (reloading.current) await desktop.packetsQueryCancel().catch(() => undefined);
+      if (requestId !== request.current) return;
+      reloading.current = true;
+      setLoading(true);
+      try {
+        const anchor = keepSelection ? selectedRef.current : null;
+        const result = await desktop.packets({ ...queryRef.current, limit: PAGE_SIZE + 1 });
+        if (requestId !== request.current) return;
+        const page = result.slice(0, PAGE_SIZE);
+        const around =
+          anchor !== null && !page.some((packet) => packet.id === anchor)
+            ? await fetchAround(queryRef.current, anchor)
+            : null;
+        if (requestId !== request.current) return;
+        const focus = rowsHaveFocus();
+        if (around) {
+          applyWindow(around);
+        } else {
+          setPackets(() => page);
+          setHasMore(result.length > PAGE_SIZE);
+          setHasNew(false);
+          setDetached(false);
+        }
+        if (anchor !== null && anchor === selectedRef.current) queueReveal(anchor, focus);
+      } catch (reason) {
+        if (requestId === request.current) fail(reason);
+      } finally {
+        if (requestId === request.current) {
+          reloading.current = false;
+          setLoading(false);
+        }
+      }
+    },
+    [applyWindow, fail, project, queueReveal, rowsHaveFocus, setPackets],
+  );
+
+  /**
+   * Oldest first, new traffic belongs after the last row. It is appended only
+   * while the end of the history is loaded and the history has room; past
+   * that, "Load newer" picks it up, so the rows never skip a stretch.
+   */
+  const appendNewest = useCallback(async () => {
+    const last = packetsRef.current.at(-1)?.id;
+    if (last === undefined) {
+      await reload();
+      return;
     }
-  }, [fail, project, setPackets]);
+    if (hasMoreRef.current) return;
+    if (packetsRef.current.length >= RETAINED_ROWS) {
+      setHasMore(true);
+      return;
+    }
+    const started = epoch.current;
+    let result: PacketSummary[];
+    try {
+      result = await desktop.packets({
+        ...queryRef.current,
+        afterId: last,
+        beforeId: null,
+        limit: PAGE_SIZE + 1,
+      });
+    } catch (reason) {
+      // A read cancelled because the filter changed is not a failure.
+      if (started === epoch.current) throw reason;
+      return;
+    }
+    if (started !== epoch.current) return;
+    const page = result.slice(0, PAGE_SIZE);
+    if (page.length > 0) {
+      setPackets((current) => {
+        const known = new Set(current.map((packet) => packet.id));
+        const fresh = page.filter((packet) => !known.has(packet.id));
+        return fresh.length === 0 ? current : [...current, ...fresh];
+      });
+    }
+    if (result.length > PAGE_SIZE) setHasMore(true);
+  }, [reload, setPackets]);
 
   /**
    * Prepends rows newer than what is loaded, leaving everything already
@@ -221,6 +378,10 @@ export function PacketHistory({
     try {
       do {
         tailAgain.current = false;
+        if (oldestFirstRef.current) {
+          await appendNewest();
+          continue;
+        }
         const newest = packetsRef.current[0]?.id;
         if (newest === undefined) {
           await reload();
@@ -258,19 +419,23 @@ export function PacketHistory({
     } finally {
       tailBusy.current = false;
     }
-  }, [fail, project, reload, setPackets]);
+  }, [appendNewest, fail, project, reload, setPackets]);
   const pullTailRef = useRef(pullTail);
   pullTailRef.current = pullTail;
 
-  const loadOlder = useCallback(async () => {
+  /** Loads the next page past the last row: older rows, or newer ones when oldest first. */
+  const loadMore = useCallback(async () => {
     if (!project || loading || !hasMore) return;
-    const oldest = packetsRef.current.at(-1)?.id;
-    if (oldest === undefined) return;
+    const last = packetsRef.current.at(-1)?.id;
+    if (last === undefined) return;
     const requestId = ++request.current;
     const started = epoch.current;
     setLoading(true);
     try {
-      const result = await desktop.packets({ ...queryRef.current, beforeId: oldest, limit: PAGE_SIZE + 1 });
+      const cursor = oldestFirstRef.current
+        ? { afterId: last, beforeId: null }
+        : { beforeId: last, afterId: null };
+      const result = await desktop.packets({ ...queryRef.current, ...cursor, limit: PAGE_SIZE + 1 });
       if (requestId !== request.current || started !== epoch.current) return;
       const page = result.slice(0, PAGE_SIZE);
       setPackets((current) => {
@@ -293,13 +458,95 @@ export function PacketHistory({
   reloadRef.current = reload;
   useEffect(() => {
     void queryKey;
-    const timer = window.setTimeout(() => void reloadRef.current(), RELOAD_DEBOUNCE_MS);
+    const timer = window.setTimeout(() => void reloadRef.current(true), RELOAD_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
   }, [queryKey, project?.path]);
 
   useEffect(() => {
-    if (reloadSignal > 0) void reloadRef.current();
+    if (reloadSignal > 0) void reloadRef.current(true);
   }, [reloadSignal]);
+
+  // Scrolls to a queued row once it is among the rendered rows. Focus waits
+  // for the virtual window to catch up with the scroll, a frame or two.
+  useEffect(() => {
+    void revealSignal;
+    const target = pendingReveal.current;
+    if (!target) return;
+    const index = packets.findIndex((packet) => packet.id === target.id);
+    if (index < 0 || !table.current) return;
+    pendingReveal.current = null;
+    table.current.revealRow(index, "center");
+    if (!target.focus) return;
+    let frames = 0;
+    const focus = () => {
+      const current = packetsRef.current.findIndex((packet) => packet.id === target.id);
+      const row = current < 0 ? null : (table.current?.revealRow(current) ?? null);
+      if (row) row.focus();
+      else if (current >= 0 && ++frames < 8) requestAnimationFrame(focus);
+    };
+    requestAnimationFrame(focus);
+  }, [packets, revealSignal]);
+
+  /** Selects a packet by id, loading the rows around it when it is not loaded. */
+  const goToPacket = useCallback(
+    async (id: number) => {
+      if (packetsRef.current.some((packet) => packet.id === id)) {
+        onSelect(id);
+        queueReveal(id, true);
+        return;
+      }
+      if (!project || !desktop.isAvailable()) return;
+      const requestId = ++request.current;
+      epoch.current++;
+      setLoading(true);
+      try {
+        const around = await fetchAround(queryRef.current, id);
+        if (requestId !== request.current) return;
+        if (around) {
+          applyWindow(around);
+          onSelect(id);
+          queueReveal(id, true);
+          return;
+        }
+        const view = await desktop.packet(id);
+        if (requestId !== request.current) return;
+        if (view) {
+          // Still worth opening: the inspector shows it even though no row does.
+          onSelect(id);
+          onNotice?.(t("goto.filtered", { id }));
+        } else {
+          onError(t("goto.missing", { id }));
+        }
+      } catch (reason) {
+        if (requestId === request.current) fail(reason);
+      } finally {
+        if (requestId === request.current) setLoading(false);
+      }
+    },
+    [applyWindow, fail, onError, onNotice, onSelect, project, queueReveal],
+  );
+
+  /** Leaves a jumped-to window for the live end of the history. */
+  const backToLive = useCallback(() => {
+    setDetached(false);
+    setHasNew(false);
+    if (!oldestFirstRef.current) setFollowing(true);
+    table.current?.scrollToTop();
+    void reloadRef.current();
+  }, []);
+
+  // Ctrl/Cmd+G opens Go to packet, as in Wireshark.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey) return;
+      if (event.key.toLowerCase() !== "g") return;
+      if (document.querySelector("[role='dialog']")) return;
+      event.preventDefault();
+      setGoToOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Annotations are fetched for loaded rows only, in batches, and cached.
   useEffect(() => {
@@ -319,7 +566,7 @@ export function PacketHistory({
   // as new traffic.
   useEffect(() => {
     if (!project || appendSignal === 0) return undefined;
-    if (!followingRef.current) {
+    if (!followingRef.current && !oldestFirstRef.current) {
       setHasNew(true);
       return undefined;
     }
@@ -349,7 +596,8 @@ export function PacketHistory({
     [connections],
   );
 
-  const effectiveReference = timeReference ?? packets.at(-1)?.timestamp_micros ?? null;
+  const oldestLoaded = oldestFirst ? packets[0] : packets.at(-1);
+  const effectiveReference = timeReference ?? oldestLoaded?.timestamp_micros ?? null;
 
   const copyRow = useCallback(
     async (packet: PacketSummary, format: CopyFormat) => {
@@ -418,6 +666,12 @@ export function PacketHistory({
           icon: <Send size={13} />,
           onSelect: () => actions.sendToRepeater(packet.id),
         },
+        ...(actions.sendToIntruder
+          ? [{ label: t("menu.intruder"), onSelect: () => actions.sendToIntruder?.(packet.id) }]
+          : []),
+        ...(actions.sendToSequencer
+          ? [{ label: t("menu.sequencer"), onSelect: () => actions.sendToSequencer?.(packet.id) }]
+          : []),
         { kind: "separator" },
         {
           label: t("menu.compare-a"),
@@ -474,6 +728,12 @@ export function PacketHistory({
         },
       );
     }
+    items.push({
+      label: t("menu.goto"),
+      shortcut: "Ctrl+G",
+      icon: <LocateFixed size={13} />,
+      onSelect: () => setGoToOpen(true),
+    });
     items.push(
       timeReference === packet.timestamp_micros
         ? {
@@ -523,24 +783,28 @@ export function PacketHistory({
 
   const footer = (
     <div className="history-footer">
-      <button
-        type="button"
-        className="button"
-        disabled={!hasMore || loading}
-        onClick={() => void loadOlder()}
-      >
-        {hasMore ? t("history.load-older") : t("history.start-of-history")}
+      <button type="button" className="button" disabled={!hasMore || loading} onClick={() => void loadMore()}>
+        {oldestFirst
+          ? hasMore
+            ? t("history.load-newer")
+            : t("history.end-of-history")
+          : hasMore
+            ? t("history.load-older")
+            : t("history.start-of-history")}
       </button>
     </div>
   );
   // Scrolling away from the newest row pauses following, so reading older
   // traffic is never interrupted by arriving packets.
+  // Oldest first, new rows land below the operator and never move what they
+  // are reading, so there is nothing to pause.
   const onScrollStateChange = (atTop: boolean) => {
-    if (!atTop && followingRef.current) setFollowing(false);
+    if (!oldestFirst && !atTop && followingRef.current) setFollowing(false);
   };
+  const toggleOrder = () => updateSettings({ ...settings, oldestFirst: !oldestFirst });
 
   return (
-    <section className="packet-history" aria-label={t("history.title")}>
+    <section className="packet-history" aria-label={t("history.title")} ref={section}>
       <PacketFilterBar
         filter={filter}
         onChange={onFilterChange}
@@ -593,11 +857,15 @@ export function PacketHistory({
           )}
         </div>
         <div className="history-follow">
-          {!following && hasNew && (
+          {!oldestFirst && !following && (hasNew || detached) && (
             <button
               type="button"
               className="link-button"
               onClick={() => {
+                if (detached) {
+                  backToLive();
+                  return;
+                }
                 setFollowing(true);
                 setHasNew(false);
                 table.current?.scrollToTop();
@@ -607,24 +875,41 @@ export function PacketHistory({
               {t("history.jump-newest")}
             </button>
           )}
-          <button
-            type="button"
-            className={`follow-toggle ${following ? "on" : ""}`}
-            aria-pressed={following}
-            onClick={() => {
-              const next = !following;
-              setFollowing(next);
-              if (next && hasNew) {
-                setHasNew(false);
-                void pullTail();
-              }
-            }}
-            title={following ? t("history.pause") : t("history.resume")}
-          >
-            {following ? <Play size={11} /> : <Pause size={11} />}
-            {following ? t("history.following") : t("history.paused")}
-          </button>
-          <span>{loading ? t("history.updating") : t("history.newest-first")}</span>
+          {oldestFirst && detached && (
+            <button type="button" className="link-button" onClick={backToLive}>
+              {t("history.back-to-start")}
+            </button>
+          )}
+          {!oldestFirst && (
+            <button
+              type="button"
+              className={`follow-toggle ${following ? "on" : ""}`}
+              aria-pressed={following}
+              onClick={() => {
+                const next = !following;
+                if (next && detached) {
+                  backToLive();
+                  return;
+                }
+                setFollowing(next);
+                if (next && hasNew) {
+                  setHasNew(false);
+                  void pullTail();
+                }
+              }}
+              title={following ? t("history.pause") : t("history.resume")}
+            >
+              {following ? <Play size={11} /> : <Pause size={11} />}
+              {following ? t("history.following") : t("history.paused")}
+            </button>
+          )}
+          <span>
+            {loading
+              ? t("history.updating")
+              : oldestFirst
+                ? t("history.oldest-first")
+                : t("history.newest-first")}
+          </span>
         </div>
       </div>
       {packets.length ? (
@@ -635,6 +920,9 @@ export function PacketHistory({
             onSelect={onSelect}
             handleRef={bindTable}
             columns={settings.columns}
+            customColumns={settings.customColumns}
+            projectPath={project?.path ?? null}
+            onDecodeError={onError}
             timeMode={settings.timeMode}
             timeReference={effectiveReference}
             connectionLabels={connectionLabels}
@@ -643,6 +931,8 @@ export function PacketHistory({
             annotations={annotations}
             onScrollStateChange={onScrollStateChange}
             footer={footer}
+            oldestFirst={oldestFirst}
+            onToggleOrder={toggleOrder}
           />
         ) : (
           <ConversationList
@@ -653,6 +943,7 @@ export function PacketHistory({
             onRowMenu={onRowMenu}
             onScrollStateChange={onScrollStateChange}
             footer={footer}
+            oldestFirst={oldestFirst}
           />
         )
       ) : (
@@ -673,8 +964,19 @@ export function PacketHistory({
       {editing !== null && (
         <AnnotationEditor packetId={editing} onClose={() => setEditing(null)} onError={onError} />
       )}
+      {goToOpen && (
+        <GoToPacketDialog
+          initial={selectedId}
+          onGo={(id) => void goToPacket(id)}
+          onClose={() => setGoToOpen(false)}
+        />
+      )}
       {bookmarksOpen && (
-        <BookmarksDialog onSelect={onSelect} onClose={() => setBookmarksOpen(false)} onError={onError} />
+        <BookmarksDialog
+          onSelect={(id) => void goToPacket(id)}
+          onClose={() => setBookmarksOpen(false)}
+          onError={onError}
+        />
       )}
       {columnsOpen && (
         <ColumnSettings settings={settings} onChange={updateSettings} onClose={() => setColumnsOpen(false)} />

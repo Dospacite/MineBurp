@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workbench-document-save"
+description = "Enables the workbench_document_save command without any pre-configured scope."
+commands.allow = ["workbench_document_save"]
+
+[[permission]]
+identifier = "deny-workbench-document-save"
+description = "Denies the workbench_document_save command without any pre-configured scope."
+commands.deny = ["workbench_document_save"]

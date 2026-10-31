@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-packet-layout-stored"
+description = "Enables the packet_layout_stored command without any pre-configured scope."
+commands.allow = ["packet_layout_stored"]
+
+[[permission]]
+identifier = "deny-packet-layout-stored"
+description = "Denies the packet_layout_stored command without any pre-configured scope."
+commands.deny = ["packet_layout_stored"]

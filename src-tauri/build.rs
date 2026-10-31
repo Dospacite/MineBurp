@@ -7,6 +7,15 @@
 //! in `src/lib.rs` keeps the three lists identical.
 
 const COMMANDS: &[&str] = &[
+    "replacement_rule_preview",
+    "payload_generate",
+    "decoder_transform",
+    "workbench_document_get",
+    "workbench_document_save",
+    "channel_stats",
+    "packet_field_values",
+    "intruder_plan",
+    "sequencer_analyze",
     "app_capabilities",
     "decrypt_mode_status",
     "decrypt_mode_set",
@@ -39,6 +48,7 @@ const COMMANDS: &[&str] = &[
     "packet_bytes",
     "inspect_bytes",
     "packet_layout",
+    "packet_layout_stored",
     "field_edit",
     "proxy_sessions",
     "intercept_settings_get",

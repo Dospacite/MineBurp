@@ -122,7 +122,7 @@ export function ProjectControl({
         title={temporary ? t("project.temporary.title") : project?.path}
       >
         <FolderOpen size={15} aria-hidden="true" />
-        <span>{project?.name ?? t("project.open")}</span>
+        <span className="project-name">{project?.name ?? t("project.open")}</span>
         {temporary && <span className="project-tag">{t("project.temporary.tag")}</span>}
         {project?.encrypted && <LockKeyhole size={13} aria-label={t("project.encrypted")} />}
       </button>

@@ -237,6 +237,12 @@
           "markdownDescription": "Enables the capture_stop command without any pre-configured scope."
         },
         {
+          "description": "Enables the channel_stats command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-channel-stats",
+          "markdownDescription": "Enables the channel_stats command without any pre-configured scope."
+        },
+        {
           "description": "Enables the client_assist_status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-client-assist-status",
@@ -247,6 +253,12 @@
           "type": "string",
           "const": "allow-connections-query",
           "markdownDescription": "Enables the connections_query command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the decoder_transform command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-decoder-transform",
+          "markdownDescription": "Enables the decoder_transform command without any pre-configured scope."
         },
         {
           "description": "Enables the decrypt_mode_set command without any pre-configured scope.",
@@ -315,6 +327,12 @@
           "markdownDescription": "Enables the intercept_settings_set command without any pre-configured scope."
         },
         {
+          "description": "Enables the intruder_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-intruder-plan",
+          "markdownDescription": "Enables the intruder_plan command without any pre-configured scope."
+        },
+        {
           "description": "Enables the launcher_client_assist_configure command without any pre-configured scope.",
           "type": "string",
           "const": "allow-launcher-client-assist-configure",
@@ -375,10 +393,22 @@
           "markdownDescription": "Enables the packet_detail command without any pre-configured scope."
         },
         {
+          "description": "Enables the packet_field_values command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-field-values",
+          "markdownDescription": "Enables the packet_field_values command without any pre-configured scope."
+        },
+        {
           "description": "Enables the packet_layout command without any pre-configured scope.",
           "type": "string",
           "const": "allow-packet-layout",
           "markdownDescription": "Enables the packet_layout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the packet_layout_stored command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-packet-layout-stored",
+          "markdownDescription": "Enables the packet_layout_stored command without any pre-configured scope."
         },
         {
           "description": "Enables the packets_delete command without any pre-configured scope.",
@@ -409,6 +439,12 @@
           "type": "string",
           "const": "allow-packets-query-cancel",
           "markdownDescription": "Enables the packets_query_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the payload_generate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-payload-generate",
+          "markdownDescription": "Enables the payload_generate command without any pre-configured scope."
         },
         {
           "description": "Enables the project_checkpoint command without any pre-configured scope.",
@@ -489,6 +525,12 @@
           "markdownDescription": "Enables the replacement_preview command without any pre-configured scope."
         },
         {
+          "description": "Enables the replacement_rule_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-replacement-rule-preview",
+          "markdownDescription": "Enables the replacement_rule_preview command without any pre-configured scope."
+        },
+        {
           "description": "Enables the replacement_rules_get command without any pre-configured scope.",
           "type": "string",
           "const": "allow-replacement-rules-get",
@@ -525,10 +567,28 @@
           "markdownDescription": "Enables the schema_validate command without any pre-configured scope."
         },
         {
+          "description": "Enables the sequencer_analyze command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sequencer-analyze",
+          "markdownDescription": "Enables the sequencer_analyze command without any pre-configured scope."
+        },
+        {
           "description": "Enables the traffic_stats command without any pre-configured scope.",
           "type": "string",
           "const": "allow-traffic-stats",
           "markdownDescription": "Enables the traffic_stats command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workbench_document_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-workbench-document-get",
+          "markdownDescription": "Enables the workbench_document_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workbench_document_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-workbench-document-save",
+          "markdownDescription": "Enables the workbench_document_save command without any pre-configured scope."
         },
         {
           "description": "Denies the app_capabilities command without any pre-configured scope.",
@@ -591,6 +651,12 @@
           "markdownDescription": "Denies the capture_stop command without any pre-configured scope."
         },
         {
+          "description": "Denies the channel_stats command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-channel-stats",
+          "markdownDescription": "Denies the channel_stats command without any pre-configured scope."
+        },
+        {
           "description": "Denies the client_assist_status command without any pre-configured scope.",
           "type": "string",
           "const": "deny-client-assist-status",
@@ -601,6 +667,12 @@
           "type": "string",
           "const": "deny-connections-query",
           "markdownDescription": "Denies the connections_query command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the decoder_transform command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-decoder-transform",
+          "markdownDescription": "Denies the decoder_transform command without any pre-configured scope."
         },
         {
           "description": "Denies the decrypt_mode_set command without any pre-configured scope.",
@@ -669,6 +741,12 @@
           "markdownDescription": "Denies the intercept_settings_set command without any pre-configured scope."
         },
         {
+          "description": "Denies the intruder_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-intruder-plan",
+          "markdownDescription": "Denies the intruder_plan command without any pre-configured scope."
+        },
+        {
           "description": "Denies the launcher_client_assist_configure command without any pre-configured scope.",
           "type": "string",
           "const": "deny-launcher-client-assist-configure",
@@ -729,10 +807,22 @@
           "markdownDescription": "Denies the packet_detail command without any pre-configured scope."
         },
         {
+          "description": "Denies the packet_field_values command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-field-values",
+          "markdownDescription": "Denies the packet_field_values command without any pre-configured scope."
+        },
+        {
           "description": "Denies the packet_layout command without any pre-configured scope.",
           "type": "string",
           "const": "deny-packet-layout",
           "markdownDescription": "Denies the packet_layout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the packet_layout_stored command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-packet-layout-stored",
+          "markdownDescription": "Denies the packet_layout_stored command without any pre-configured scope."
         },
         {
           "description": "Denies the packets_delete command without any pre-configured scope.",
@@ -763,6 +853,12 @@
           "type": "string",
           "const": "deny-packets-query-cancel",
           "markdownDescription": "Denies the packets_query_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the payload_generate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-payload-generate",
+          "markdownDescription": "Denies the payload_generate command without any pre-configured scope."
         },
         {
           "description": "Denies the project_checkpoint command without any pre-configured scope.",
@@ -843,6 +939,12 @@
           "markdownDescription": "Denies the replacement_preview command without any pre-configured scope."
         },
         {
+          "description": "Denies the replacement_rule_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-replacement-rule-preview",
+          "markdownDescription": "Denies the replacement_rule_preview command without any pre-configured scope."
+        },
+        {
           "description": "Denies the replacement_rules_get command without any pre-configured scope.",
           "type": "string",
           "const": "deny-replacement-rules-get",
@@ -879,10 +981,28 @@
           "markdownDescription": "Denies the schema_validate command without any pre-configured scope."
         },
         {
+          "description": "Denies the sequencer_analyze command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sequencer-analyze",
+          "markdownDescription": "Denies the sequencer_analyze command without any pre-configured scope."
+        },
+        {
           "description": "Denies the traffic_stats command without any pre-configured scope.",
           "type": "string",
           "const": "deny-traffic-stats",
           "markdownDescription": "Denies the traffic_stats command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workbench_document_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-workbench-document-get",
+          "markdownDescription": "Denies the workbench_document_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workbench_document_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-workbench-document-save",
+          "markdownDescription": "Denies the workbench_document_save command without any pre-configured scope."
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",

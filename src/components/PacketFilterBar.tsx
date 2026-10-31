@@ -13,6 +13,7 @@ import type {
 import { EMPTY_FILTER } from "../domain/types";
 import { t } from "../i18n";
 import { desktop } from "../lib/desktop";
+import { TRAFFIC_PRESETS, type TrafficPreset, trafficPreset } from "../lib/trafficPresets";
 import { ExpressionInput } from "./ExpressionInput";
 import { Modal } from "./Modal";
 import { SavedFilters } from "./SavedFilters";
@@ -161,6 +162,23 @@ export function PacketFilterBar({
   return (
     <section className={`packet-filter ${active ? "active" : ""}`} aria-label={t("filter.toggle")}>
       <div className="filter-summary">
+        <select
+          className="traffic-preset"
+          aria-label={t("preset.title")}
+          value=""
+          onChange={(e) => {
+            if (e.target.value) onChange(trafficPreset(e.target.value as TrafficPreset));
+          }}
+        >
+          <option value="" disabled>
+            {t("preset.title")}
+          </option>
+          {TRAFFIC_PRESETS.map((p) => (
+            <option key={p} value={p}>
+              {t(`preset.${p}`)}
+            </option>
+          ))}
+        </select>
         <button type="button" className="filter-toggle" onClick={() => setOpen(true)} aria-haspopup="dialog">
           <Filter size={13} aria-hidden="true" />
           <span>{summary ?? t("filter.all-packets")}</span>
