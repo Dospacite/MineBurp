@@ -97,3 +97,24 @@ Java agent. Online-mode upstream servers still require client assistance.
 The small client in `test-projects/runtime-client` creates this route itself and
 handles Fabric configuration pings and teleport acknowledgments. See its README
 for the memory limits and interactive request format.
+
+Read-only `status`, `packets`, `packet`, `connections`, and `stats` accept
+`format: "json"`. The content text then contains JSON: packet lists and
+connections are arrays; packet detail includes summary, annotation, a bounded
+hex window, offset and total_bytes. Status and statistics are objects.
+
+`rewrite`, `rules` preview, and `intercept` show accept `hex_limit` in bytes
+(default 512, maximum 65536). Long output is capped and reports the bytes shown
+and total; increase the limit to inspect more. Rewrites and rule previews also
+report changed byte ranges as half-open offsets, capped at 32 ranges.
+
+Replacing a temporary project containing packets through `project` open,
+create, or save_as requires `discard: true`. Use Save As to preserve a session.
+The stdio server reconnects to the desktop socket per tool call and uses offline
+mode when it cannot connect. `passphrase_env` is resolved by the stdio process
+before forwarding the value over the private socket.
+
+The desktop `replacement_rules_set` command accepts optional `expectedPath`.
+When supplied, it must equal the current project path. Rule expressions are
+validated and saved before the live proxy applies them. MCP rule edits hold a
+mutex for the project throughout the read, modification, save, and apply steps.

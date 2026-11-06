@@ -42,6 +42,10 @@ pub fn tools() -> Vec<Tool> {
                             "",
                         ),
                     ),
+                    (
+                        "discard",
+                        boolean("allow replacing a temporary session containing packets"),
+                    ),
                     ("path", string("absolute path")),
                     ("name", string("project name (create, save_as)")),
                     ("passphrase", string("SQLCipher passphrase")),
@@ -102,6 +106,10 @@ pub fn tools() -> Vec<Tool> {
                     ("edits", edits_ref()),
                     ("set", set_schema()),
                     ("packet", integer("preview: history id")),
+                    (
+                        "hex_limit",
+                        super::integer("maximum output bytes, default 512, maximum 65536"),
+                    ),
                     ("hex", string("preview: frame hex")),
                 ],
                 &[],
@@ -159,6 +167,25 @@ fn info_text(ctx: &Ctx<'_>, store: &ProjectStore) -> String {
 }
 
 pub async fn project(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
+    if matches!(args.action("info").as_str(), "open" | "create" | "save_as")
+        && ctx.host.project_is_temporary()
+        && !args.flag("discard")
+    {
+        let store = ctx.project()?;
+        let has_packets = blocking(move || {
+            store
+                .query_packets_filtered(&mineburp_project::PacketQuery {
+                    limit: 1,
+                    ..Default::default()
+                })
+                .map(|rows| !rows.is_empty())
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        if has_packets {
+            return Err("temporary project contains packets; use Save As to preserve them, or pass discard=true to replace the session".into());
+        }
+    }
     match args.action("info").as_str() {
         "info" => Ok(info_text(ctx, &ctx.project()?)),
         "open" => {
@@ -319,13 +346,28 @@ pub async fn project(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            if filter.values().all(Value::is_null) && !args.flag("confirm") {
+            let query = ctx.query(&filter, 500).await?;
+            let unrestricted = query.connection_id.is_none()
+                && query.search.is_none()
+                && query.directions.is_empty()
+                && query.states.is_empty()
+                && query.sources.is_empty()
+                && query.dispositions.is_empty()
+                && query.include_names.is_empty()
+                && query.exclude_names.is_empty()
+                && query.min_size.is_none()
+                && query.max_size.is_none()
+                && query.expression.is_none()
+                && query.content.is_none()
+                && query.before_id.is_none()
+                && query.after_id.is_none()
+                && query.bookmarked.is_none();
+            if unrestricted && !args.flag("confirm") {
                 return Err(
                     "an empty filter deletes the whole history; pass confirm=true to do that"
                         .into(),
                 );
             }
-            let query = ctx.query(&filter, 500).await?;
             let prune = !args.flag("keep_connections");
             let summary = blocking(move || {
                 store
@@ -395,24 +437,35 @@ async fn save_rules(ctx: &Ctx<'_>, rules: Vec<ReplacementRule>) -> Result<(), St
                 .map_err(|error| format!("rule `{}`: {error}", rule.name))?;
         }
     }
-    if let Some(proxy) = ctx.host.proxy() {
-        proxy
-            .set_replacement_rules(rules.clone())
-            .map_err(|error| error.to_string())?;
-    }
     let store = ctx.project()?;
+    let saved = rules.clone();
     blocking(move || {
         store
-            .save_replacement_rules(&rules)
+            .save_replacement_rules(&saved)
             .map_err(|error| error.to_string())
     })
     .await?;
+    if let Some(proxy) = ctx.host.proxy() {
+        proxy
+            .set_replacement_rules(rules)
+            .map_err(|error| error.to_string())?;
+    }
     ctx.host.notify("rules");
     Ok(())
 }
 
 pub async fn rules(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static RULE_LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
     let store = ctx.project()?;
+    let lock = RULE_LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(store.info().path.clone())
+        .or_default()
+        .clone();
+    let _guard = lock.lock().await;
     let mut rules = blocking(move || {
         store
             .load_replacement_rules()
@@ -532,7 +585,7 @@ pub async fn rules(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
             }
             let before = frame.bytes.len();
             let rewritten = frames::apply(&frame, &edits)?;
-            let mut out = String::new();
+            let mut out = render::changed_ranges(&frame.bytes, &rewritten);
             if let Some(matched) = matched {
                 let _ = writeln!(
                     out,
@@ -544,7 +597,10 @@ pub async fn rules(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
                 out,
                 "{before}B → {}B\nhex: {}",
                 rewritten.len(),
-                render::hex(&rewritten, 0, false)
+                render::capped_hex(
+                    &rewritten,
+                    args.usize("hex_limit").unwrap_or(512).min(65536)
+                )
             );
             let insight = mineburp_protocol::inspect_logical(
                 frame.state,

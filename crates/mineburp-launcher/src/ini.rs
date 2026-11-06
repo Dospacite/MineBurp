@@ -96,6 +96,14 @@ impl IniDocument {
         }
     }
 
+    pub(crate) fn restore(&mut self, key: &str, value: Option<&str>) {
+        if let Some(value) = value {
+            self.set(key, value);
+        } else if let Some(index) = self.find(key) {
+            self.lines.remove(index);
+        }
+    }
+
     pub(crate) fn render(&self) -> String {
         let mut text = self.lines.join(self.newline);
         if self.trailing_newline || !text.is_empty() {

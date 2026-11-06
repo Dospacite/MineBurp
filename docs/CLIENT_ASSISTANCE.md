@@ -75,3 +75,16 @@ The Java agent is fail-open: any instrumentation, configuration, or broker error
 ## Optional direct OAuth
 
 A distributor with its own approved public-client registration may compile with `MINEBURP_MICROSOFT_CLIENT_ID`. That enables an advanced direct sign-in panel and injects `mineburp-auth` as the same `SessionJoinProvider` contract. No client secret is used or bundled. This is optional and is not required for vanilla or modded clients using launcher assistance.
+
+The desktop copies its bundled agent to
+`app_data_dir/agent/mineburp-agent-<sha256-prefix>.jar` before generating launcher
+arguments. This path survives AppImage unmounts and changes only when the agent
+bytes change. Instance descriptors expose `client_assist_stale` when the stored
+argument differs from the current argument; configuring the instance again
+replaces arguments recorded in MineBurp's managed state.
+
+Prism and MultiMC require `OverrideJavaArgs=true`. When enabling an instance
+that used global JVM arguments, MineBurp copies those arguments into the
+instance before appending its agent. Removal restores the original override
+flag and instance arguments, including absent keys. Official profiles without
+`javaArgs` receive the launcher's default JVM flags; removal deletes that key.

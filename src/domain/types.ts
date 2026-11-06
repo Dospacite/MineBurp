@@ -236,6 +236,7 @@ export interface InstanceDescriptor {
   loader: LoaderKind;
   icon_path: string | null;
   supports_agent_configuration: boolean;
+  client_assist_stale?: boolean;
   client_assist_configured: boolean;
 }
 

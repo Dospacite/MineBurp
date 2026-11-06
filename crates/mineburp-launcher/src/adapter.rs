@@ -39,6 +39,8 @@ pub struct InstanceDescriptor {
     pub supports_agent_configuration: bool,
     /// Whether the instance currently contains `MineBurp`'s Java-agent argument.
     pub client_assist_configured: bool,
+    #[serde(default)]
+    pub client_assist_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

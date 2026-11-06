@@ -73,22 +73,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    #[cfg(unix)]
-    if !options.offline && options.project.is_none() {
-        let path = options
-            .socket
-            .clone()
-            .unwrap_or_else(mineburp_mcp::socket::default_socket_path);
-        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
-            eprintln!(
-                "mineburp-mcp: connected to the MineBurp app at {}",
-                path.display()
-            );
-            return bridge(stream).await;
-        }
-        eprintln!("mineburp-mcp: the MineBurp app is not running; serving offline");
-    }
-
     let project = match &options.project {
         Some(path) => {
             let passphrase = if let Some(variable) = &options.passphrase_env {
@@ -116,7 +100,16 @@ async fn main() -> ExitCode {
         }
         None => None,
     };
-    let server = Arc::new(McpServer::new(Arc::new(OfflineHost::new(project))));
+    let mut server = McpServer::new(Arc::new(OfflineHost::new(project)));
+    #[cfg(unix)]
+    if !options.offline && options.project.is_none() {
+        server = server.with_socket(
+            options
+                .socket
+                .unwrap_or_else(mineburp_mcp::socket::default_socket_path),
+        );
+    }
+    let server = Arc::new(server);
     match serve(tokio::io::stdin(), tokio::io::stdout(), server).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -124,20 +117,4 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Copies stdio to the app's socket and back.
-///
-/// Ends when the app side closes: after stdin's EOF is passed on, the app
-/// finishes the calls in flight and closes, and if the app quits first there
-/// is nothing left to talk to.
-#[cfg(unix)]
-async fn bridge(stream: tokio::net::UnixStream) -> ExitCode {
-    let (mut socket_read, mut socket_write) = stream.into_split();
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut socket_write).await;
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket_write).await;
-    });
-    let _ = tokio::io::copy(&mut socket_read, &mut tokio::io::stdout()).await;
-    ExitCode::SUCCESS
 }

@@ -190,8 +190,11 @@ pub fn tools() -> Vec<Tool> {
     ]
 }
 
-pub async fn status(ctx: &Ctx<'_>) -> ToolResult {
+pub async fn status(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
     let host = ctx.host;
+    if args.str("format") == Some("json") {
+        return Ok(json!({"mode":host.mode(),"temporary":host.project_is_temporary(),"project":host.project().map(|store| json!({"name":store.info().name,"path":store.info().path})),"sessions":host.proxy().map(|proxy| proxy.sessions())}).to_string());
+    }
     let mut out = format!("mode: {}", host.mode());
     match host.project() {
         Some(store) => {
@@ -368,6 +371,9 @@ pub async fn packets(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
         });
     }
     // The store returns newest first; read oldest → newest.
+    if args.str("format") == Some("json") {
+        return serde_json::to_string(&rows).map_err(|error| error.to_string());
+    }
     let mut rows = rows;
     rows.reverse();
     let connections: std::collections::HashSet<Uuid> =
@@ -461,6 +467,9 @@ pub async fn packet(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
     })
     .await?;
     let window = window.ok_or_else(|| format!("packet #{id} does not exist"))?;
+    if args.str("format") == Some("json") {
+        return Ok(json!({"summary":window.summary,"annotation":annotation,"hex":hex::encode(&window.bytes),"offset":window.offset,"total_bytes":window.total_bytes}).to_string());
+    }
     let summary = &window.summary;
     let mut out = render::packet_line(summary, true);
     let _ = write!(
@@ -615,6 +624,10 @@ pub async fn connections(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
         .into_iter()
         .filter(|(_, live)| !live_only || *live)
         .collect();
+    if args.str("format") == Some("json") {
+        return serde_json::to_string(&rows[..rows.len().min(limit)])
+            .map_err(|error| error.to_string());
+    }
     if rows.is_empty() {
         return Ok(if live_only {
             "no live sessions".into()
@@ -657,6 +670,9 @@ pub async fn stats(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
             .map_err(|error| error.to_string())
     })
     .await?;
+    if args.str("format") == Some("json") {
+        return serde_json::to_string(&stats).map_err(|error| error.to_string());
+    }
     if stats.total_packets == 0 {
         return Ok("no packets match".into());
     }

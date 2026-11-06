@@ -125,6 +125,34 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         development_agent
     };
+    let agent_path = if agent_path.is_file() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        let bytes = std::fs::read(&agent_path)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let directory = app.path().app_data_dir()?.join("agent");
+        std::fs::create_dir_all(&directory)?;
+        let destination = directory.join(format!("mineburp-agent-{}.jar", &digest[..16]));
+        if !destination.is_file() || std::fs::read(&destination)? != bytes {
+            let temporary = directory.join(format!(".agent-{}.tmp", uuid::Uuid::new_v4()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            }
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &destination)?;
+        }
+        destination
+    } else {
+        agent_path
+    };
     let agent_config_path = app
         .path()
         .app_config_dir()?

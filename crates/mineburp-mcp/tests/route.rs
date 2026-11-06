@@ -70,3 +70,66 @@ async fn route_creates_connectable_loopback_listener_and_limits_pending_routes()
         let _ = proxy.stop_session(session.id);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bridge_switches_offline_online_and_back() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("mcp.sock");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_mineburp-mcp"))
+        .args(["--socket", path.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"format\":\"json\"}}}\n";
+    input.write_all(request).await.unwrap();
+    let offline = output.next_line().await.unwrap().unwrap();
+    assert!(offline.contains("offline"));
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let proxy = ProxyService::new();
+        mineburp_mcp::serve(
+            reader,
+            writer,
+            Arc::new(McpServer::new(Arc::new(LiveHost(proxy)))),
+        )
+        .await
+        .unwrap();
+    });
+    input.write_all(request).await.unwrap();
+    let online = output.next_line().await.unwrap().unwrap();
+    assert!(online.contains("desktop"));
+    task.await.unwrap();
+    std::fs::remove_file(&path).unwrap();
+    input.write_all(request).await.unwrap();
+    let offline = output.next_line().await.unwrap().unwrap();
+    assert!(offline.contains("offline"));
+    drop(input);
+    assert!(child.wait().await.unwrap().success());
+}
+
+#[tokio::test]
+async fn concurrent_rule_adds_preserve_both_updates() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProjectStore::create(
+        temp.path().join("rules.mineburp"),
+        "rules",
+        mineburp_project::ProjectOptions::default(),
+    )
+    .unwrap();
+    let server = McpServer::new(Arc::new(OfflineHost::new(Some(store.clone()))));
+    let (first, second) = tokio::join!(
+        server.call("rules", json!({"action":"add","name":"first","expr":"state == handshake","set":{"server_address":"a"}})),
+        server.call("rules", json!({"action":"add","name":"second","expr":"state == handshake","set":{"server_address":"b"}}))
+    );
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(second["isError"], false, "{second}");
+    assert_eq!(store.load_replacement_rules().unwrap().len(), 2);
+}

@@ -139,6 +139,12 @@ impl DesktopState {
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
+        for rule in &replacements {
+            if !rule.expression.trim().is_empty() {
+                mineburp_core::FilterExpression::parse(&rule.expression)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         self.proxy
             .set_schema_packs(packs)
             .map_err(|error| error.to_string())?;
@@ -234,7 +240,10 @@ pub fn remove_abandoned_sessions(sessions_dir: &Path) -> usize {
                 .next()
                 .and_then(|value| value.parse::<u32>().ok());
             let abandoned = match pid {
-                Some(pid) => pid != std::process::id() && !process_alive(pid),
+                Some(pid) => {
+                    pid != std::process::id()
+                        && (!process_alive(pid) || older_than_a_day(&entry.path()))
+                }
                 None => older_than_a_day(&entry.path()),
             };
             if abandoned {
@@ -273,7 +282,27 @@ fn process_alive(pid: u32) -> bool {
 
 /// Without a cheap, safe liveness check, a file is treated as abandoned only
 /// once it has gone a day without writes.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    // Use the OS utility because this workspace forbids unsafe FFI.
+    std::process::Command::new("tasklist.exe")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map_or(true, |output| {
+            !output.status.success()
+                || String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_alive(_pid: u32) -> bool {
     true
 }
@@ -306,7 +335,7 @@ fn capture_backend() -> Arc<dyn SideCapture> {
 }
 
 fn default_launcher_config() -> LauncherConfig {
-    let home = env::var_os("HOME").map(PathBuf::from);
+    let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     let app_data = env::var_os("APPDATA").map(PathBuf::from);
     let local_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
 
@@ -411,6 +440,45 @@ fn preferred_executable(candidates: &[PathBuf], fallback: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_install_preserves_temporary_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = DesktopState::new(
+            directory.path().join("agent.jar"),
+            directory.path().join("agent.properties"),
+        )
+        .unwrap();
+        let original = state
+            .open_temporary_project(&directory.path().join("sessions"))
+            .unwrap();
+        let original_path = original.info().path.clone();
+        drop(original);
+        let invalid = ProjectStore::create(
+            directory.path().join("invalid.mineburp"),
+            "invalid",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let rule = mineburp_core::ReplacementRule {
+            expression: "state ==".into(),
+            id: uuid::Uuid::new_v4(),
+            name: "invalid".into(),
+            enabled: true,
+            action: mineburp_core::ReplacementAction::default(),
+            edits: Vec::new(),
+        };
+        invalid.save_replacement_rules(&[rule]).unwrap();
+        assert!(state.install_project(invalid).await.is_err());
+        assert!(state.project_is_temporary());
+        assert_eq!(
+            state.project.read().as_ref().unwrap().info().path,
+            original_path
+        );
+        assert!(original_path.exists());
+        state.discard_temporary_project();
+        assert!(!original_path.exists());
+    }
 
     #[test]
     fn removes_only_sessions_whose_process_is_gone() {

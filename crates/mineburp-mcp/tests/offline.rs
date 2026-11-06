@@ -328,3 +328,20 @@ async fn edits_annotates_and_manages_project_state() {
         .await;
     assert!(item.contains("diamond_sword"), "{item}");
 }
+
+#[tokio::test]
+async fn semantically_empty_delete_filters_require_confirmation() {
+    let session = Session::new();
+    for filter in [json!({"expr":""}), json!({"states":[]})] {
+        let error = session
+            .err(
+                "project",
+                json!({"action":"delete_packets","filter":filter}),
+            )
+            .await;
+        assert!(error.contains("confirm=true"), "{error}");
+    }
+    let text = session.ok("packets", json!({"format":"json"})).await;
+    let rows: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+}

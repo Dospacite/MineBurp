@@ -40,6 +40,14 @@ pub fn catalog() -> Vec<Tool> {
     tools.extend(frames::tools());
     tools.extend(live::tools());
     tools.extend(project::tools());
+    for tool in &mut tools {
+        if matches!(
+            tool.name,
+            "status" | "packets" | "packet" | "connections" | "stats"
+        ) {
+            tool.schema["properties"]["format"] = json!({"type":"string","enum":["text","json"]});
+        }
+    }
     tools
 }
 
@@ -47,7 +55,7 @@ pub async fn dispatch(host: &dyn Host, name: &str, arguments: Value) -> ToolResu
     let args = Args::new(arguments)?;
     let ctx = Ctx { host };
     match name {
-        "status" => history::status(&ctx).await,
+        "status" => history::status(&ctx, &args).await,
         "packets" => history::packets(&ctx, &args).await,
         "packet" => history::packet(&ctx, &args).await,
         "connections" => history::connections(&ctx, &args).await,
@@ -346,7 +354,7 @@ const FILTER_KEYS: &[&str] = &[
 ];
 
 /// The members of the `packets` tool that are not part of the filter itself.
-const PACKETS_EXTRA_KEYS: &[&str] = &["limit", "before", "after", "wait_ms", "summaries"];
+const PACKETS_EXTRA_KEYS: &[&str] = &["format", "limit", "before", "after", "wait_ms", "summaries"];
 
 fn reject_unknown_keys(
     arguments: &Map<String, Value>,
