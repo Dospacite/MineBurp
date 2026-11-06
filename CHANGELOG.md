@@ -26,6 +26,12 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Messages in the corner dismiss themselves (errors after 10 s, confirmations after 4 s) unless hovered.
 
 ### Fixed
+- Bound hostile NBT text rendering and use indexed compound/template lookups; packets exceeding the work budget remain hex.
+- Reject overflowing registry holder values and safely identify the minimum signed time value.
+- Edit modern text components as NBT, including protocol 776; validate legacy JSON components before exposing string spans.
+- Look up replacement-rule fields only through the requested span, skipping buffer and NBT presentation for preceding fields.
+- Reject invalid characters in Repeater hex field edits using the same strict parser as replacement rules.
+- Reject schema packs with missing collection lengths, invalid count references, or reversed protocol ranges.
 - Save as can create a destination after reopening a project; the destination is reserved atomically with private permissions.
 - Late full-packet loads cannot overwrite newer Repeater edits.
 - Repeater: text components (chat, tab list header and footer, item lore, entity names) and block entity NBT were shown as raw hex. A list of compounds typed every item by its first, so `{"": "text"}` wrappers turned the byte flags of later parts into ints and the round trip failed. Each item is now typed by the item it replaces.

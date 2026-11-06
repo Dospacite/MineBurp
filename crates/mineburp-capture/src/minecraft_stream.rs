@@ -1409,6 +1409,8 @@ fn probe(input: &[u8], threshold: Option<i32>, context: &ProbeContext) -> Probe 
         {
             return Probe::Invalid;
         }
+        // Import-only boundary validation, never the live capture path.
+        // Definition node/depth limits and NBT text work limits bound this probe.
         if described {
             if decode_with_definition(
                 context.state,

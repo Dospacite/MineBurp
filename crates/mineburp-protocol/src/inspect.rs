@@ -1243,7 +1243,7 @@ fn decode_update_time(body: &[u8], _protocol: Option<i32>) -> Option<(&'static s
     let mut reader = Reader::new(body);
     let world_age = reader.i64().filter(|value| *value >= 0)?;
     let time_of_day = reader.i64()?;
-    if time_of_day.abs() > 1_000_000_000_000 {
+    if time_of_day.unsigned_abs() > 1_000_000_000_000 {
         return None;
     }
     let day_time = time_of_day.rem_euclid(24_000);
@@ -3854,5 +3854,22 @@ mod tests {
             None,
         );
         assert_eq!(insight.name.as_deref(), None);
+    }
+}
+
+#[cfg(test)]
+mod wire_overflow_regression {
+    #[test]
+    fn minimum_time_does_not_panic() {
+        let mut body = vec![0; 8];
+        body.extend_from_slice(&i64::MIN.to_be_bytes());
+        let _ = super::identify_packet(
+            mineburp_core::ProtocolState::Play,
+            mineburp_core::Direction::ServerToClient,
+            0,
+            &body,
+            None,
+        );
+        assert!(super::decode_update_time(&body, None).is_none());
     }
 }

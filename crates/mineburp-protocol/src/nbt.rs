@@ -344,6 +344,91 @@ fn translate(key: &str, arguments: Option<&Vec<Value>>, depth: usize) -> String 
     format!("{key}({})", rendered.join(", "))
 }
 
+/// Measures network NBT without constructing values or rendered text.
+pub(crate) fn skip_nbt(input: &[u8], named: bool) -> Option<usize> {
+    fn take(input: &[u8], position: &mut usize, count: usize) -> Option<()> {
+        *position = position.checked_add(count)?;
+        (*position <= input.len()).then_some(())
+    }
+    fn string(input: &[u8], position: &mut usize) -> Option<()> {
+        let bytes: [u8; 2] = input
+            .get(*position..position.checked_add(2)?)?
+            .try_into()
+            .ok()?;
+        take(input, position, 2 + usize::from(u16::from_be_bytes(bytes)))
+    }
+    fn payload(
+        input: &[u8],
+        position: &mut usize,
+        tag: u8,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Option<()> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        *budget = budget.checked_sub(1)?;
+        match tag {
+            1 => take(input, position, 1),
+            2 => take(input, position, 2),
+            3 | 5 => take(input, position, 4),
+            4 | 6 => take(input, position, 8),
+            8 => string(input, position),
+            7 | 9 | 11 | 12 => {
+                let element = if tag == 9 {
+                    let element = *input.get(*position)?;
+                    take(input, position, 1)?;
+                    element
+                } else {
+                    0
+                };
+                let bytes = input
+                    .get(*position..position.checked_add(4)?)?
+                    .try_into()
+                    .ok()?;
+                let count = usize::try_from(i32::from_be_bytes(bytes)).ok()?;
+                take(input, position, 4)?;
+                if tag == 9 {
+                    if count > *budget {
+                        return None;
+                    }
+                    for _ in 0..count {
+                        payload(input, position, element, depth + 1, budget)?;
+                    }
+                    Some(())
+                } else {
+                    let width = match tag {
+                        11 => 4,
+                        12 => 8,
+                        _ => 1,
+                    };
+                    take(input, position, count.checked_mul(width)?)
+                }
+            }
+            10 => loop {
+                let child = *input.get(*position)?;
+                take(input, position, 1)?;
+                if child == 0 {
+                    break Some(());
+                }
+                string(input, position)?;
+                payload(input, position, child, depth + 1, budget)?;
+            },
+            _ => None,
+        }
+    }
+    let tag = *input.first()?;
+    let mut position = 1;
+    if tag != 0 {
+        if named {
+            string(input, &mut position)?;
+        }
+        let mut budget = MAX_NODES;
+        payload(input, &mut position, tag, 0, &mut budget)?;
+    }
+    Some(position)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

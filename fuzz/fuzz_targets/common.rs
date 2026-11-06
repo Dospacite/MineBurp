@@ -26,6 +26,7 @@ impl From<State> for ProtocolState {
     }
 }
 
+#[allow(dead_code)]
 pub fn direction(server_to_client: bool) -> Direction {
     if server_to_client {
         Direction::ServerToClient
@@ -37,8 +38,14 @@ pub fn direction(server_to_client: bool) -> Direction {
 /// Picks a protocol version that has real tables behind it most of the time,
 /// and an arbitrary one otherwise.
 pub fn version(selector: u8, raw: i32) -> Option<i32> {
-    const KNOWN: [i32; 12] = [4, 5, 47, 340, 754, 759, 760, 763, 764, 766, 767, 769];
-    match selector % 16 {
+    static KNOWN: std::sync::LazyLock<Vec<i32>> = std::sync::LazyLock::new(|| {
+        let mut versions = mineburp_protocol::definition_protocols();
+        versions.extend(mineburp_protocol::PacketRegistry::tabulated_protocols());
+        versions.sort_unstable();
+        versions.dedup();
+        versions
+    });
+    match selector {
         0 => None,
         1 => Some(raw),
         index => Some(KNOWN[usize::from(index - 2) % KNOWN.len()]),

@@ -63,3 +63,31 @@ path = "fuzz_targets/layout_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nbt_text"
+path = "fuzz_targets/nbt_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encryption"
+path = "fuzz_targets/encryption.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decoder"
+path = "fuzz_targets/decoder.rs"
+test = false
+doc = false
+bench = false
