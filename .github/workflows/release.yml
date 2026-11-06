@@ -1,0 +1,87 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Check version and extract changelog notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p release-artifacts
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const version = process.env.RELEASE_TAG.slice(1);
+          const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1']));
+          const cargo = metadata.packages.find(p => p.name === 'mineburp-desktop').version;
+          const pkg = JSON.parse(fs.readFileSync('package.json'));
+          const lock = JSON.parse(fs.readFileSync('package-lock.json'));
+          if ([cargo, pkg.version, lock.version, lock.packages[''].version].some(v => v !== version)) throw new Error('Tag/version mismatch');
+          const text = fs.readFileSync('CHANGELOG.md', 'utf8');
+          const sections = text.split(/^## /m);
+          const section = sections.find(s => s.startsWith(`[${version}]`));
+          if (!section) throw new Error('Missing versioned CHANGELOG section');
+          fs.writeFileSync('release-notes.md', section.slice(section.indexOf('\n') + 1).split(/^\[[^\n]+\]:/m)[0].trim() + '\n');
+          JS
+      - run: npm run build:agent
+      - run: npm run prepare:sidecar
+      - name: Build Linux app packages
+        run: npm run tauri -- build
+      - name: Generate Rust and npm CycloneDX SBOMs
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --all --override-filename rust.cdx
+          while IFS= read -r file; do
+            name=$(printf '%s' "$file" | tr '/' '-')
+            cp "$file" "release-artifacts/$name"
+          done < <(find crates src-tauri -name '*.cdx.json')
+          test -n "$(find release-artifacts -name '*rust.cdx.json' -print -quit)"
+          npx --yes --package @cyclonedx/cyclonedx-npm cyclonedx-npm --omit dev --output-file release-artifacts/npm.cdx.json
+          test -n "$(find release-artifacts -name '*.cdx.json' -print -quit)"
+      - name: Collect artifacts and checksums
+        run: |
+          cp target/release/bundle/appimage/*.AppImage release-artifacts/
+          cp target/release/bundle/deb/*.deb release-artifacts/
+          cp src-tauri/binaries/mineburp-mcp-* release-artifacts/
+          cp agent/build/mineburp-agent.jar release-artifacts/
+          cd release-artifacts
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-artifacts/**
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: release-artifacts/
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "MineBurp $RELEASE_TAG" --notes-file release-notes.md
+          find release-artifacts -type f -print0 | xargs -0 gh release upload "$RELEASE_TAG"
