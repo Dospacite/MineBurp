@@ -121,11 +121,16 @@ pub struct ProjectView {
     #[serde(flatten)]
     info: ProjectInfo,
     temporary: bool,
+    recovered_projects: Vec<PathBuf>,
 }
 
 impl ProjectView {
     fn new(info: ProjectInfo, temporary: bool) -> Self {
-        Self { info, temporary }
+        Self {
+            info,
+            temporary,
+            recovered_projects: Vec::new(),
+        }
     }
 }
 
@@ -189,7 +194,7 @@ pub async fn project_save_as(
     let source = current_project(&state)?;
     let path = validate_path(&path, PathPurpose::NewProject, &[])?;
     let store = tauri::async_runtime::spawn_blocking(move || {
-        source.save_as(
+        source.save_as_and_handoff(
             path,
             &name,
             ProjectOptions {
@@ -217,7 +222,10 @@ pub fn project_current(state: State<'_, DesktopState>) -> Option<ProjectView> {
         .read()
         .as_ref()
         .map(|store| store.info().clone())?;
-    Some(ProjectView::new(info, state.project_is_temporary()))
+    let mut view = ProjectView::new(info, state.project_is_temporary());
+    view.recovered_projects
+        .clone_from(&state.recovered_projects.read());
+    Some(view)
 }
 
 /// Every connection the open project knows about.
@@ -253,7 +261,7 @@ pub async fn packets_query(
 ) -> CommandResult<Vec<PacketSummary>> {
     let store = current_project(&state)?;
     let query = filter.into_query()?;
-    tauri::async_runtime::spawn_blocking(move || store.query_packets_filtered(&query))
+    tauri::async_runtime::spawn_blocking(move || store.query_history_page(&query))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
@@ -273,9 +281,11 @@ pub async fn packets_export(
     let store = current_project(&state)?;
     let path = validate_path(&path, PathPurpose::ExportJson, &[&store.info().path])?;
     let query = filter.into_query()?;
-    tauri::async_runtime::spawn_blocking(move || ops::export_json(&store, &query, &path))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        ops::export_json_with_overwrite(&store, &query, &path, true)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// The vocabulary the filter expression accepts, for the UI's help affordance.
@@ -1060,9 +1070,11 @@ pub async fn packets_export_pcapng(
     let store = current_project(&state)?;
     let path = validate_path(&path, PathPurpose::ExportPcap, &[&store.info().path])?;
     let query = filter.into_query()?;
-    tauri::async_runtime::spawn_blocking(move || ops::export_pcapng(&store, &query, &path))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        ops::export_pcapng_with_overwrite(&store, &query, &path, true)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Reads a pcap or pcapng file into the open project.

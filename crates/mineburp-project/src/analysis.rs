@@ -322,10 +322,24 @@ impl ProjectStore {
         options: StatsOptions,
     ) -> Result<TrafficStats, ProjectError> {
         let compiled = compile_query(query)?;
-        let where_clause = compiled.where_clause.clone();
-        self.with_reader(|connection| {
-            compiled.install(connection)?;
-            let values = compiled.values.clone();
+        self.with_reader(|source| {
+            compiled.install(source)?;
+            let mut connection = rusqlite::Connection::open("")?;
+            connection.execute_batch("CREATE TABLE packets(timestamp_micros INTEGER, size INTEGER, direction TEXT, name TEXT, connection_id TEXT);")?;
+            {
+                let transaction = connection.transaction()?;
+                let mut insert = transaction.prepare("INSERT INTO packets VALUES (?1,?2,?3,?4,?5)")?;
+                let mut select = source.prepare(&format!("SELECT timestamp_micros,size,direction,name,connection_id FROM packets{}", compiled.where_clause))?;
+                let mut rows = select.query(params_from_iter(compiled.values.iter()))?;
+                while let Some(row) = rows.next()? {
+                    insert.execute(rusqlite::params![row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?])?;
+                }
+                drop(insert);
+                transaction.commit()?;
+            }
+            let connection = &connection;
+            let where_clause = String::new();
+            let values: Vec<rusqlite::types::Value> = Vec::new();
             let mut stats = TrafficStats::default();
             let (count, bytes, first, last): (i64, i64, Option<i64>, Option<i64>) = connection
                 .query_row(
@@ -384,15 +398,35 @@ impl ProjectStore {
     ) -> Result<DeleteSummary, ProjectError> {
         self.ensure_writable()?;
         let compiled = compile_query(query)?;
-        let mut connection = self.connection.lock();
-        compiled.install(&connection)?;
-        let transaction = connection.transaction()?;
-        let packets = transaction.execute(
-            &format!("DELETE FROM packets{}", compiled.where_clause),
-            params_from_iter(compiled.values.iter()),
+        let maximum: i64 = self.connection.lock().query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM packets",
+            [],
+            |row| row.get(0),
         )?;
+        let mut packets = 0;
+        let mut start = 0_i64;
+        while start < maximum {
+            let end = start.saturating_add(4096).min(maximum);
+            let connection = self.connection.lock();
+            compiled.install(&connection)?;
+            let conjunction = if compiled.where_clause.is_empty() {
+                " WHERE "
+            } else {
+                " AND "
+            };
+            packets += connection.execute(
+                &format!(
+                    "DELETE FROM packets{}{conjunction}id > {start} AND id <= {end}",
+                    compiled.where_clause
+                ),
+                params_from_iter(compiled.values.iter()),
+            )?;
+            drop(connection);
+            start = end;
+        }
+        let connection = self.connection.lock();
         let connections = if prune_connections {
-            transaction.execute(
+            connection.execute(
                 "DELETE FROM connections
                  WHERE status <> '\"active\"'
                    AND NOT EXISTS (SELECT 1 FROM packets WHERE connection_id = connections.id)",
@@ -401,7 +435,6 @@ impl ProjectStore {
         } else {
             0
         };
-        transaction.commit()?;
         Ok(DeleteSummary {
             packets: packets as u64,
             connections: connections as u64,
@@ -412,15 +445,7 @@ impl ProjectStore {
     pub fn compact(&self) -> Result<CompactSummary, ProjectError> {
         self.ensure_writable()?;
         let before = file_size(&self.info().path);
-        let connection = self.connection.lock();
-        connection.execute_batch(
-            "PRAGMA wal_checkpoint(TRUNCATE);
-             VACUUM;
-             PRAGMA wal_checkpoint(TRUNCATE);
-             PRAGMA analysis_limit=1000;
-             PRAGMA optimize;",
-        )?;
-        drop(connection);
+        self.compact_export()?;
         Ok(CompactSummary {
             bytes_before: before,
             bytes_after: file_size(&self.info().path),

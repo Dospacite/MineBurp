@@ -27,7 +27,7 @@ const MAX_BUFFERED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WINDOW: u32 = 16 * 1024 * 1024;
 /// How long a gap may stay open, in capture time, before it is skipped.
 const GAP_TIMEOUT_MICROS: i64 = 750_000;
-/// Directions tracked at once; the least recently seen is forgotten first.
+/// Directions tracked at once; one existing direction is evicted at capacity.
 const MAX_FLOWS: usize = 8_192;
 
 /// Bytes ready to publish, with the capture time of the segment that carried
@@ -99,10 +99,10 @@ impl TcpReassembler {
     ) -> Vec<Released> {
         let key = (source, destination);
         if !self.flows.contains_key(&key) && self.flows.len() >= MAX_FLOWS {
-            self.flows.shift_remove_index(0);
+            self.flows.swap_remove_index(0);
         }
-        // Move the flow to the back so eviction drops the least recently seen.
-        let mut direction = self.flows.shift_remove(&key).unwrap_or_default();
+        // Swap removal avoids shifting every other flow on each segment.
+        let mut direction = self.flows.swap_remove(&key).unwrap_or_default();
         let released = direction.accept(tcp, timestamp_micros, payload, meta, &mut self.stats);
         let finished = direction.closed && direction.pending.is_empty();
         if !finished {
@@ -131,6 +131,10 @@ impl TcpReassembler {
     fn tracked(&self) -> usize {
         self.flows.len()
     }
+}
+
+fn segment_cost(payload: &[u8], meta: &SegmentMeta) -> usize {
+    payload.len() + meta.comment.as_ref().map_or(0, String::len) + 128
 }
 
 impl Direction {
@@ -169,7 +173,16 @@ impl Direction {
         }
         if ahead < MAX_WINDOW {
             // A segment beyond a hole: hold it until the hole fills.
-            if self.buffered + payload.len() > MAX_BUFFERED_BYTES {
+            if self.buffered + segment_cost(payload, &meta) > MAX_BUFFERED_BYTES
+                || self.pending.len() >= 8192
+            {
+                if self.pending.is_empty() {
+                    stats.gaps += 1;
+                    self.gap_pending = true;
+                    self.next = Some(data_sequence);
+                    self.deliver(timestamp, payload.to_vec(), meta, &mut released);
+                    return released;
+                }
                 // Out of room: give up on the hole now rather than drop data.
                 released.extend(self.skip_gap(stats));
                 released.extend(self.accept(tcp, timestamp, payload, meta, stats));
@@ -178,7 +191,7 @@ impl Direction {
             if self.pending.contains_key(&data_sequence) {
                 stats.duplicates += 1;
             } else {
-                self.buffered += payload.len();
+                self.buffered += segment_cost(payload, &meta);
                 self.pending
                     .insert(data_sequence, (timestamp, payload.to_vec(), meta));
                 self.gap_since.get_or_insert(timestamp);
@@ -231,40 +244,28 @@ impl Direction {
     /// Delivers buffered segments that have become contiguous.
     fn drain(&mut self, released: &mut Vec<Released>) {
         while let Some(next) = self.next {
-            // Find a buffered segment that starts at or before `next`.
-            let candidate = self
-                .pending
-                .iter()
-                .find(|(sequence, (_, payload, _))| {
-                    let behind = next.wrapping_sub(**sequence);
-                    // Starts at `next`, or before it but still reaches past it.
-                    behind < MAX_WINDOW && behind < u32::try_from(payload.len()).unwrap_or(u32::MAX)
-                })
-                .map(|(sequence, _)| *sequence);
-            // Discard buffered segments that are now wholly behind `next`.
-            let stale: Vec<u32> = self
-                .pending
-                .iter()
-                .filter(|(sequence, (_, payload, _))| {
-                    let behind = next.wrapping_sub(**sequence);
-                    behind != 0
-                        && behind < MAX_WINDOW
-                        && behind >= u32::try_from(payload.len()).unwrap_or(u32::MAX)
-                })
-                .map(|(sequence, _)| *sequence)
-                .collect();
-            for sequence in stale {
-                if let Some((_, payload, _)) = self.pending.remove(&sequence) {
-                    self.buffered -= payload.len();
-                }
-            }
+            // At most two numeric ranges cover the preceding sequence window,
+            // including wraparound. Each entry is visited only when removed.
+            let low = next.wrapping_sub(MAX_WINDOW - 1);
+            let candidate = if low <= next {
+                self.pending.range(low..=next).next().map(|(key, _)| *key)
+            } else {
+                self.pending
+                    .range(low..)
+                    .next()
+                    .or_else(|| self.pending.range(..=next).next())
+                    .map(|(key, _)| *key)
+            };
             let Some(sequence) = candidate else {
                 break;
             };
             let Some((timestamp, payload, meta)) = self.pending.remove(&sequence) else {
                 break;
             };
-            self.buffered -= payload.len();
+            self.buffered -= segment_cost(&payload, &meta);
+            if next.wrapping_sub(sequence) as usize >= payload.len() {
+                continue;
+            }
             let skip = next.wrapping_sub(sequence) as usize;
             self.deliver(
                 timestamp,
@@ -288,9 +289,10 @@ impl Direction {
         // The buffered segment nearest ahead of `next`, in sequence space.
         let Some(sequence) = self
             .pending
-            .keys()
-            .copied()
-            .min_by_key(|sequence| sequence.wrapping_sub(next))
+            .range(next..)
+            .next()
+            .or_else(|| self.pending.first_key_value())
+            .map(|(sequence, _)| *sequence)
         else {
             self.gap_since = None;
             return released;
@@ -458,6 +460,20 @@ mod tests {
         };
         tracker.push(a, b, fin, 1, b"", SegmentMeta::default());
         assert_eq!(tracker.tracked(), 0);
+    }
+
+    #[test]
+    fn many_tiny_reordered_segments() {
+        let mut tracker = TcpReassembler::default();
+        let (a, b) = (address(1), address(2));
+        tracker.push(a, b, tcp(0), 0, b"x", SegmentMeta::default());
+        for sequence in (2..8000).rev() {
+            tracker.push(a, b, tcp(sequence), 0, b"x", SegmentMeta::default());
+        }
+        assert_eq!(
+            collect(tracker.push(a, b, tcp(1), 0, b"x", SegmentMeta::default())).len(),
+            7999
+        );
     }
 
     #[test]

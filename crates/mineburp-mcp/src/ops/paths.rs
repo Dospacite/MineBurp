@@ -81,6 +81,11 @@ pub fn validate_path(
                 .parent()
                 .filter(|parent| parent.is_dir())
                 .ok_or_else(|| "the destination folder does not exist".to_owned())?;
+            if std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err("destination must not be a symbolic link".into());
+            }
             if path.is_dir() {
                 return Err(format!("{} is a folder", path.display()));
             }
