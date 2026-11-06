@@ -20,6 +20,10 @@ use tauri::{Emitter, Manager};
 const LIVE_FLUSH: Duration = Duration::from_millis(140);
 
 #[cfg(feature = "desktop-runtime")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "most of the body is the generate_handler! command list"
+)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

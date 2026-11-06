@@ -419,6 +419,7 @@ fn connection_comparison_classifies_payloads_and_missing_packets() {
     );
 }
 
+#[tokio::test]
 async fn project_scope_round_trip_and_validation() {
     let session = Session::new();
     assert_eq!(session.ok("project", json!({"action":"scope"})).await, "[]");
