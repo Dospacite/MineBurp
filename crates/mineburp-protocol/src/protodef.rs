@@ -223,6 +223,19 @@ pub fn decode_packet(
     body: &[u8],
     protocol: Option<i32>,
 ) -> Option<DefinitionDecode> {
+    decode_packet_until(state, direction, packet_id, body, protocol, None)
+}
+
+/// Stops decoding once the requested span has been read. Presentation of
+/// buffers and NBT is suppressed in this mode.
+pub(crate) fn decode_packet_until(
+    state: ProtocolState,
+    direction: Direction,
+    packet_id: i32,
+    body: &[u8],
+    protocol: Option<i32>,
+    target: Option<&str>,
+) -> Option<DefinitionDecode> {
     let root = definition(protocol?)?;
     let global = root.get("types")?.as_object()?;
     let side = root
@@ -235,6 +248,7 @@ pub fn decode_packet(
         .as_object()?;
     let (packet, ty) = packet_type(side, global, packet_id)?;
     let mut decoder = Decoder {
+        target,
         input: body,
         position: 0,
         local: side,
@@ -291,6 +305,7 @@ enum PathPart {
 }
 
 struct Decoder<'a> {
+    target: Option<&'a str>,
     input: &'a [u8],
     position: usize,
     local: &'a Map<String, Value>,
@@ -313,6 +328,14 @@ static NULL: Value = Value::Null;
 static VOID: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| Value::String("void".into()));
 
 impl<'a> Decoder<'a> {
+    fn display_hex(&self, bytes: &[u8]) -> String {
+        if self.target.is_some() {
+            String::new()
+        } else {
+            to_hex(bytes)
+        }
+    }
+
     fn fail<T>(&self, message: impl Into<String>) -> Decoded<T> {
         Err(Failure {
             message: message.into(),
@@ -375,6 +398,12 @@ impl<'a> Decoder<'a> {
             return;
         }
         let name = self.path_name();
+        if self
+            .target
+            .is_some_and(|target| crate::rewrite::normalise(&name) != target)
+        {
+            return;
+        }
         self.spans.push(FieldSpan {
             name,
             kind,
@@ -420,6 +449,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read(&mut self, ty: &Value, depth: usize) -> Decoded<Value> {
+        if self.target.is_some() && !self.spans.is_empty() {
+            return self.fail("requested field found");
+        }
         if depth > MAX_DEPTH {
             return self.fail("types nest too deeply");
         }
@@ -506,7 +538,11 @@ impl<'a> Decoder<'a> {
                     .try_into()
                     .map_err(|_| self.failure("short UUID"))?;
                 let text = uuid::Uuid::from_bytes(bytes).hyphenated().to_string();
-                self.span(FieldKind::Bytes, start, Value::String(to_hex(&bytes)));
+                self.span(
+                    FieldKind::Bytes,
+                    start,
+                    Value::String(self.display_hex(&bytes)),
+                );
                 Ok(Value::String(text))
             }
             "pstring" => self.pstring(arguments, depth),
@@ -514,8 +550,16 @@ impl<'a> Decoder<'a> {
             "restBuffer" => {
                 let start = self.position;
                 let bytes = self.take(self.remaining())?.to_vec();
-                self.span(FieldKind::Bytes, start, Value::String(to_hex(&bytes)));
-                Ok(preview(&bytes))
+                self.span(
+                    FieldKind::Bytes,
+                    start,
+                    Value::String(self.display_hex(&bytes)),
+                );
+                Ok(if self.target.is_some() {
+                    Value::Null
+                } else {
+                    preview(&bytes)
+                })
             }
             "container" => {
                 let fields = arguments
@@ -578,7 +622,11 @@ impl<'a> Decoder<'a> {
                         let start = self.position;
                         self.position += 1;
                         self.path.push(PathPart::Field("end".into()));
-                        self.span(FieldKind::Bytes, start, Value::String(to_hex(&[next])));
+                        self.span(
+                            FieldKind::Bytes,
+                            start,
+                            Value::String(self.display_hex(&[next])),
+                        );
                         self.path.pop();
                         break;
                     }
@@ -642,7 +690,13 @@ impl<'a> Decoder<'a> {
                         .and_then(Value::as_str)
                         .unwrap_or("id")
                         .to_owned();
-                    object.insert(field, Value::from(id - 1));
+                    object.insert(
+                        field,
+                        Value::from(
+                            id.checked_sub(1)
+                                .ok_or_else(|| self.failure("invalid holder id"))?,
+                        ),
+                    );
                 }
                 Ok(Value::Object(object))
             }
@@ -671,7 +725,12 @@ impl<'a> Decoder<'a> {
                         .unwrap_or("ids")
                         .to_owned();
                     let ty = otherwise.get("type").unwrap_or(&NULL);
-                    let count = usize::try_from(count - 1).unwrap_or(usize::MAX);
+                    let count = usize::try_from(
+                        count
+                            .checked_sub(1)
+                            .ok_or_else(|| self.failure("invalid holder count"))?,
+                    )
+                    .unwrap_or(usize::MAX);
                     let items =
                         self.with_field(&field, |decoder| decoder.repeat(count, ty, depth + 1))?;
                     object.insert(field, Value::Array(items));
@@ -758,7 +817,7 @@ impl<'a> Decoder<'a> {
             .map_err(|_| self.failure("short read"))?;
         let value = convert(bytes);
         let span_value = if kind == FieldKind::Bytes {
-            Value::String(to_hex(&bytes))
+            Value::String(self.display_hex(&bytes))
         } else {
             value.clone()
         };
@@ -809,7 +868,7 @@ impl<'a> Decoder<'a> {
             self.span(
                 FieldKind::Bytes,
                 text_start,
-                Value::String(to_hex(text.as_bytes())),
+                Value::String(self.display_hex(text.as_bytes())),
             );
         }
         Ok(Value::String(text))
@@ -819,8 +878,16 @@ impl<'a> Decoder<'a> {
         let start = self.position;
         if arguments.get("rest").and_then(Value::as_bool) == Some(true) {
             let bytes = self.take(self.remaining())?.to_vec();
-            self.span(FieldKind::Bytes, start, Value::String(to_hex(&bytes)));
-            return Ok(preview(&bytes));
+            self.span(
+                FieldKind::Bytes,
+                start,
+                Value::String(self.display_hex(&bytes)),
+            );
+            return Ok(if self.target.is_some() {
+                Value::Null
+            } else {
+                preview(&bytes)
+            });
         }
         let prefixed = arguments.get("countType").and_then(Value::as_str) == Some("varint");
         let length = self.length(arguments, depth)?;
@@ -833,12 +900,20 @@ impl<'a> Decoder<'a> {
             self.span(
                 FieldKind::PrefixedBytes,
                 start,
-                Value::String(to_hex(&bytes)),
+                Value::String(self.display_hex(&bytes)),
             );
         } else {
-            self.span(FieldKind::Bytes, data_start, Value::String(to_hex(&bytes)));
+            self.span(
+                FieldKind::Bytes,
+                data_start,
+                Value::String(self.display_hex(&bytes)),
+            );
         }
-        Ok(preview(&bytes))
+        Ok(if self.target.is_some() {
+            Value::Null
+        } else {
+            preview(&bytes)
+        })
     }
 
     fn repeat(&mut self, count: usize, ty: &Value, depth: usize) -> Decoded<Vec<Value>> {
@@ -1119,7 +1194,7 @@ impl<'a> Decoder<'a> {
                 array.copy_from_slice(&bytes);
                 (FieldKind::I64, Value::from(i64::from_be_bytes(array)))
             }
-            _ => (FieldKind::Bytes, Value::String(to_hex(&bytes))),
+            _ => (FieldKind::Bytes, Value::String(self.display_hex(&bytes))),
         };
         self.span(kind, start, value);
         Ok(object)
@@ -1194,7 +1269,11 @@ impl<'a> Decoder<'a> {
         #[allow(clippy::cast_precision_loss, reason = "the scale is a small integer")]
         let scale = scale as f64;
         let bytes = self.input[start..self.position].to_vec();
-        self.span(FieldKind::Bytes, start, Value::String(to_hex(&bytes)));
+        self.span(
+            FieldKind::Bytes,
+            start,
+            Value::String(self.display_hex(&bytes)),
+        );
         Ok(serde_json::json!({
             "x": float(unpack(packed >> 3) * scale),
             "y": float(unpack(packed >> 18) * scale),
@@ -1213,6 +1292,13 @@ impl<'a> Decoder<'a> {
         } else {
             FieldKind::Nbt
         };
+        if self.target.is_some() {
+            let length = crate::nbt::skip_nbt(&self.input[start..], named)
+                .ok_or_else(|| self.failure("invalid NBT"))?;
+            self.take(length)?;
+            self.span(kind, start, Value::Null);
+            return Ok(Value::Null);
+        }
         let tag = self.take(1)?[0];
         if tag == 0 {
             if optional || !named {
@@ -1229,13 +1315,13 @@ impl<'a> Decoder<'a> {
         let bytes = &self.input[start..self.position];
         // Large blobs (chunk block entities, registries) stay hex: as text
         // they would be too big to edit and slow to render.
-        let text = (bytes.len() <= crate::layout::MAX_NBT_TEXT_BYTES)
+        let text = (self.target.is_none() && bytes.len() <= crate::layout::MAX_NBT_TEXT_BYTES)
             .then(|| crate::nbt_text::to_text(bytes, named))
             .flatten();
         if let Some(text) = text {
             self.span(kind, start, Value::String(text));
         } else {
-            let hex = to_hex(bytes);
+            let hex = self.display_hex(bytes);
             self.span(FieldKind::Bytes, start, Value::String(hex));
         }
         Ok(value)
@@ -1391,8 +1477,13 @@ impl<'a> Decoder<'a> {
             .read_to_end(&mut inflated)
             .map_err(|_| self.failure("compressed NBT does not inflate"))?;
         let bytes = self.input[start..self.position].to_vec();
-        self.span(FieldKind::Bytes, start, Value::String(to_hex(&bytes)));
+        self.span(
+            FieldKind::Bytes,
+            start,
+            Value::String(self.display_hex(&bytes)),
+        );
         let mut inner = Decoder {
+            target: self.target,
             input: &inflated,
             position: 0,
             local: self.local,
@@ -1604,6 +1695,7 @@ mod tests {
         let global = Map::new();
         let side = types.as_object().unwrap();
         let mut decoder = Decoder {
+            target: None,
             input: body,
             position: 0,
             local: side,
@@ -2039,5 +2131,21 @@ mod differential {
             report.len(),
             report.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod holder_overflow_regression {
+    #[test]
+    fn minimum_holder_id_does_not_panic() {
+        let decode = super::decode_packet(
+            mineburp_core::ProtocolState::Play,
+            mineburp_core::Direction::ServerToClient,
+            0x68,
+            &[0x80, 0x80, 0x80, 0x80, 0x08],
+            Some(767),
+        )
+        .unwrap();
+        assert!(decode.error.is_some());
     }
 }

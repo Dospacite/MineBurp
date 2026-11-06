@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MineBurp",
-  "version": "0.1.0",
   "identifier": "tools.mineburp.desktop",
   "build": {
     "beforeDevCommand": "npm run build:agent && npm run dev",
@@ -26,11 +25,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "appimage",
+      "deb"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "Minecraft protocol workbench",
     "resources": {
       "../agent/build/mineburp-agent.jar": "resources/mineburp-agent.jar"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "wireshark-common"
+        ]
+      }
     }
   }
 }

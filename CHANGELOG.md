@@ -5,16 +5,26 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 ## [Unreleased]
 
 ### Added
+
+- Recovered sessions in the project menu with packet counts and dates, and Open, Save as…, and confirmed Delete actions confined to the private recovered-sessions directory.
+- Per-project target scope: an allowlist of exact hosts, `*.example.com` wildcards, and IPv4/IPv6 CIDRs with optional ports (project migration 8; migration 7 is reserved for findings). Out-of-scope agent routes are refused so the client connects directly, and Repeater, Intercept, and replacement rules skip out-of-scope connections. Traffic shows an out-of-scope badge and refused-route count; MCP `project action=scope` shows and sets the scope.
+- Lab listener panel in Traffic: a loopback-only address toward a target for headless offline lab clients, with optional stay-armed mode (at most eight concurrent clients, stops after 60 idle seconds), subject to target scope.
+- Exit cleanup stops capture and live sessions and closes every shared project database handle before deleting the temporary project, so Windows can remove the file.
+
+- Setup diagnostics with bounded dumpcap probing, capture permission hints, stale assistance reconfiguration, and a Decrypt warning when no agent is connected.
+
+- Project findings with bounded evidence, severity/status tracking, desktop and MCP CRUD, and Markdown/HTML reporting.
+- Compare whole connections with filtered direction-wise alignment, payload differences, per-name counts, keyboard navigation, and MCP `connections action="compare"`.
 - Minecraft Decoder in the right sidebar, with chained hex/text/Base64, VarInt/VarLong, Minecraft string, UUID, integer, compression, NBT, and JSON transforms.
 - Channel explorer, Ctrl/Cmd+K command palette, packet selection actions, payload generators, decoded-field history columns, and traffic presets.
 - Project-backed Intruder and Sequencer configuration, samples, analysis, and results, with autosave and flush before project changes/exit.
 - Repeater edit undo/redo, original comparison, and named revisions stored with saved tabs.
 - Automatic drop rules in Replace, including selector preview, history recording, and MCP `behavior="drop"` support.
-- **MCP server**: `mineburp-mcp` exposes 18 tools (history, decoding, frame rewriting, rules, annotations, saved filters, schema packs, project import/export, Intercept, Repeater, network shaping, capture, launchers) over stdio. It bridges to the running app through a user-only Unix socket (disable with `MINEBURP_MCP=0`) or works offline on a project file. Changes made through it refresh the UI.
+- **MCP server**: `mineburp-mcp` exposes 19 tools (history, decoding, frame rewriting, rules, annotations, saved filters, schema packs, project import/export, Intercept, Repeater, network shaping, capture, launchers) over stdio. It bridges to the running app through a user-only Unix socket (disable with `MINEBURP_MCP=0`) or works offline on a project file. Changes made through it refresh the UI.
 - **Intercept** view: hold matching packets on decrypted connections, then forward, edit-and-forward, or drop them (Ctrl+Enter / Ctrl+Backspace). Dropped and edited packets are recorded with the `dropped` and `edited` results.
 - **Save as** copies the open project — including the temporary session — to a new file (re-keyed with an optional passphrase) and continues recording there.
 - Native open/save dialogs for projects and exports, and a recent-projects list.
-- Ctrl/⌘+1–6 switches workbench views.
+- Ctrl/⌘+1–0 switches workbench views.
 - Click the packet list's `#` header to switch between newest first and oldest first. The database orders the whole matching history, so oldest first starts at the first packet ever captured, not the oldest one loaded. "Load newer packets" pages forward, new traffic is appended once the end is loaded, and the choice is remembered with the column settings.
 - **Go to packet** (row menu or Ctrl/⌘+G) selects a packet by its `#` number and scrolls to it, loading the rows around it when it is not loaded. Choosing a bookmark does the same.
 - Repeater: NBT fields are shown and edited as JSON (`{"text": "hi", "bold": 1}`) instead of raw hex. Values keep the NBT type they had, new ones are inferred, and SNBT suffixes (`5b`, `1.5f`, `[B; 1, 2]`) force a type. NBT over 256 KiB, or NBT that would not survive the round trip, stays hex.
@@ -26,6 +36,37 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Messages in the corner dismiss themselves (errors after 10 s, confirmations after 4 s) unless hovered.
 
 ### Fixed
+- Bound hostile NBT text rendering and use indexed compound/template lookups; packets exceeding the work budget remain hex.
+- Reject overflowing registry holder values and safely identify the minimum signed time value.
+- Edit modern text components as NBT, including protocol 776; validate legacy JSON components before exposing string spans.
+- Look up replacement-rule fields only through the requested span, skipping buffer and NBT presentation for preceding fields.
+- Reject invalid characters in Repeater hex field edits using the same strict parser as replacement rules.
+- Reject schema packs with missing collection lengths, invalid count references, or reversed protocol ranges.
+- Slow project writes no longer stall live proxy traffic or route creation; persistence overflow reports dropped rows.
+- Intercept backlogs account for frame overhead and drain without repeated scans.
+- Queued compression and login/configuration transitions preserve decoding and packet order.
+- Keep-alives overtaking held packets now apply rewrite rules and record edits.
+- Disabling Intercept cannot strand a concurrently arriving held packet.
+- Upstream connects time out and stop on cancellation; stopped listening routes publish Closed and connecting routes count toward admission limits.
+- The client-assistance broker retries accept errors instead of stopping.
+- Replacement rules targeting absent fields no longer log a warning per packet.
+- Serialize decoded-field edits in Repeater and Intercept, commit multiline fields with Ctrl/Cmd+Enter, and await pending edits before sending.
+- Save dirty Repeater tabs before project changes and closing; retain Intercept drafts when held packets leave the queue and offer sending those drafts to Repeater.
+- Reload project-scoped rules and annotations after external edits, and guard rule writes with the expected project path.
+- Isolate traffic append and connection updates, memoize persistent tools and hex parsing, and stabilize history-table callbacks.
+- Scope Repeater shortcuts to its editor, preserve native text undo, coalesce hex typing into undo steps, and support arrow-key tab navigation with tabpanel semantics.
+- Preserve connection lists after failed status queries, prevent overlapping status refreshes, and reset packet history on project changes.
+- Keep the launcher agent in a stable per-user path across AppImage launches; report stale configured arguments.
+- Enable Prism/MultiMC JVM overrides with inherited global flags and restore original launcher settings on removal; preserve official launcher defaults.
+- Validate and persist replacement rules before applying them, serialize MCP rule edits, and protect temporary captures and unrestricted history deletion.
+- Reconnect MCP desktop calls, bound input and hex output, and provide JSON history output.
+
+- Save As publishes a synced private snapshot and moves the live writer under its lock; passive flow identity survives the change. Abandoned sessions remain recoverable under `sessions/recovered`, listed by `project_current`.
+- Compaction uses a sibling SQLCipher export and reopens database handles; bulk history deletion releases the writer between bounded id ranges.
+- History cancellation is isolated from export and analysis readers. Exact payload searches filter sizes before decompression; statistics evaluate payload filters once.
+- JSON and pcapng exports publish complete files atomically, reject symlinks, and require explicit overwrite for existing targets.
+- TCP reassembly bounds metadata and segment counts, avoids shifting all flows, and drains ordered ranges without repeated full-map scans.
+- ASCII-insensitive searches preserve non-ASCII exact matches; newer compatible project schemas can open read-only.
 - Save as can create a destination after reopening a project; the destination is reserved atomically with private permissions.
 - Late full-packet loads cannot overwrite newer Repeater edits.
 - Repeater: text components (chat, tab list header and footer, item lore, entity names) and block entity NBT were shown as raw hex. A list of compounds typed every item by its first, so `{"": "text"}` wrappers turned the byte flags of later parts into ints and the round trip failed. Each item is now typed by the item it replaces.
@@ -78,4 +119,4 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - New indexes on `packets(disposition)` and `packets(size)` for filtered history queries.
 - CSP remains `default-src 'self'` with `unsafe-inline` only for dynamic split-pane styles (documented).
 
-[0.1.0]: https://github.com/mineburp/mineburp/releases/tag/v0.1.0
+[0.1.0]: https://github.com/Dospacite/MineBurp/releases/tag/v0.1.0

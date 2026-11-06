@@ -16,7 +16,7 @@ use mineburp_core::{Direction, PacketEdit, ProtocolState};
 use regex::bytes::{NoExpand, Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::layout::{encode_field_over, layout_logical};
+use crate::layout::encode_field_over;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RewriteError {
@@ -190,7 +190,7 @@ fn find_field(
     name: &str,
 ) -> Result<(crate::layout::FieldSpan, String), RewriteError> {
     let wanted = normalise(name);
-    let layout = layout_logical(state, direction, frame, protocol_version);
+    let layout = crate::layout::lookup_field(state, direction, frame, protocol_version, &wanted);
     let span = layout
         .fields
         .into_iter()
@@ -203,7 +203,7 @@ fn find_field(
     Ok((span, current))
 }
 
-fn normalise(name: &str) -> String {
+pub(crate) fn normalise(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
@@ -264,7 +264,7 @@ fn replace_pattern(pattern: &Regex, frame: &[u8], replace: &[u8], all: bool) -> 
 /// Whitespace, commas, colons, and underscores separate tokens, and each token
 /// may carry a `0x` or `\x` prefix. Anything else is an error: silently
 /// dropping a stray `g` would rewrite the frame with bytes nobody typed.
-fn parse_hex(input: &str) -> Result<Vec<u8>, RewriteError> {
+pub(crate) fn parse_hex(input: &str) -> Result<Vec<u8>, RewriteError> {
     let mut digits = Vec::with_capacity(input.len());
     for token in input
         .split(|character: char| character.is_whitespace() || matches!(character, ',' | ':' | '_'))
@@ -296,6 +296,7 @@ fn parse_hex(input: &str) -> Result<Vec<u8>, RewriteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout_logical;
     use crate::varint::encode_var_i32;
 
     fn handshake(address: &str) -> Vec<u8> {

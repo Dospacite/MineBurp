@@ -18,8 +18,19 @@ export function initialHistory(hex: string): RepeaterEditHistory {
     revisions: [],
   };
 }
-export function recordEdit(history: RepeaterEditHistory, before: string, after: string): RepeaterEditHistory {
-  return before === after ? history : { ...history, past: trim([...history.past, before]), future: [] };
+const typingTimes = new WeakMap<RepeaterEditHistory, number>();
+export function recordEdit(
+  history: RepeaterEditHistory,
+  before: string,
+  after: string,
+  typing = false,
+): RepeaterEditHistory {
+  if (before === after) return history;
+  const now = Date.now();
+  const coalesce = typing && now - (typingTimes.get(history) ?? -Infinity) < 600;
+  const next = { ...history, past: coalesce ? history.past : trim([...history.past, before]), future: [] };
+  if (typing) typingTimes.set(next, now);
+  return next;
 }
 export function undoEdit(
   history: RepeaterEditHistory,

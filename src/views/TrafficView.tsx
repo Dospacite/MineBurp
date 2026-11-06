@@ -14,15 +14,17 @@ import {
   WifiOff,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-
 import { ContextMenu, type MenuItem } from "../components/ContextMenu";
+import { DecryptWarning } from "../components/DecryptWarning";
 import { DeleteHistoryDialog } from "../components/DeleteHistoryDialog";
 import { EmptyState } from "../components/EmptyState";
 import { ImportCaptureDialog } from "../components/ImportCaptureDialog";
+import { LabListener } from "../components/LabListener";
 import { describe } from "../components/PacketFilterBar";
 import { type PacketActions, PacketHistory } from "../components/PacketHistory";
 import { PacketInspector } from "../components/PacketInspector";
 import { Split } from "../components/Split";
+import { OutOfScopeBadge, ScopeStatus } from "../components/TargetScope";
 import type {
   AppCapabilities,
   CaptureStats,
@@ -37,6 +39,7 @@ import { annotationStore } from "../lib/annotations";
 import { desktop } from "../lib/desktop";
 import { chooseExportDestination, choosePcapngDestination } from "../lib/files";
 import { formatBytes } from "../lib/format";
+import { useTrafficAppend, useTrafficConnections } from "../lib/trafficStore";
 
 type CaptureStatus = "starting" | "running" | "unavailable" | "failed";
 
@@ -45,7 +48,7 @@ const STATS_POLL_MS = 2_000;
 export function TrafficView({
   capabilities,
   project,
-  connections,
+  connections: providedConnections,
   selectedPacket,
   selectedPacketId,
   filter,
@@ -54,7 +57,7 @@ export function TrafficView({
   onConnectionChange,
   decryptMode,
   captureStatus,
-  appendSignal,
+  appendSignal: providedAppendSignal,
   onSelectPacket,
   onDecryptModeChange,
   onOpenRepeater,
@@ -65,7 +68,7 @@ export function TrafficView({
 }: {
   capabilities: AppCapabilities | null;
   project: ProjectInfo | null;
-  connections: ConnectionSnapshot[];
+  connections?: ConnectionSnapshot[];
   selectedPacket: PacketView | null;
   selectedPacketId: number | null;
   /** Held by the workbench so it survives a trip to another view. */
@@ -75,7 +78,7 @@ export function TrafficView({
   onConnectionChange: (connectionId: string | null) => void;
   decryptMode: DecryptModeStatus | null;
   captureStatus: CaptureStatus;
-  appendSignal: number;
+  appendSignal?: number;
   onSelectPacket: (id: number) => void;
   onDecryptModeChange: (enabled: boolean) => Promise<DecryptModeStatus>;
   /** Sends the inspected packet to a new Repeater tab. */
@@ -86,6 +89,10 @@ export function TrafficView({
   /** Rows were added or removed outside the live capture; connections need a refresh. */
   onDataChanged?: () => void;
 }) {
+  const storedConnections = useTrafficConnections();
+  const connections = providedConnections ?? storedConnections;
+  const storeSignal = useTrafficAppend();
+  const appendSignal = providedAppendSignal ?? storeSignal;
   const [dataMenu, setDataMenu] = useState<{ x: number; y: number } | null>(null);
   const [dialog, setDialog] = useState<"delete" | "import" | null>(null);
   const [reloadSignal, setReloadSignal] = useState(0);
@@ -227,6 +234,7 @@ export function TrafficView({
       className="capture-layout"
     >
       <aside className="flow-pane" aria-label={t("traffic.capture.sidebar")}>
+        <DecryptWarning enabled={decryptEnabled} />
         <div className={`decrypt-control ${decryptEnabled ? "enabled" : ""}`}>
           <span className="decrypt-icon" aria-hidden="true">
             {decryptEnabled ? <ShieldCheck size={16} /> : <ShieldOff size={16} />}
@@ -243,6 +251,7 @@ export function TrafficView({
             {decryptEnabled ? t("traffic.decrypt.on") : t("traffic.decrypt.off")}
           </button>
         </div>
+        <ScopeStatus status={decryptMode} />
         <div className={`capture-status ${captureStatus}`} role="status" aria-live="polite">
           {captureStatus === "running" ? (
             <Radio size={15} />
@@ -261,6 +270,7 @@ export function TrafficView({
         {(captureStatus === "running" || captureStatus === "failed") && capture?.available && (
           <CaptureCounters />
         )}
+        <LabListener onError={onError} />
         <div className="flow-toolbar">
           <label className="flow-search">
             <Search size={12} aria-hidden="true" />
@@ -315,6 +325,7 @@ export function TrafficView({
               <span>
                 <strong>
                   {connection.target.host}:{connection.target.port}
+                  <OutOfScopeBadge connection={connection} />
                 </strong>
                 <small>
                   {connection.packet_count.toLocaleString()} · {formatBytes(connection.byte_count)}
@@ -330,6 +341,7 @@ export function TrafficView({
       <main className="traffic-pane">
         {project ? (
           <PacketHistory
+            key={project?.path}
             project={project}
             connectionId={connectionId}
             filter={filter}

@@ -15,7 +15,7 @@ use mineburp_core::{
     TrafficSource,
 };
 use mineburp_protocol::SchemaPack;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use rusqlite::{
     Connection, ErrorCode, InterruptHandle, OpenFlags, OptionalExtension, Transaction,
@@ -27,7 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize as _;
 
-const PROJECT_SCHEMA_VERSION: i32 = 6;
+const PROJECT_SCHEMA_VERSION: i32 = 8;
 
 /// How long one read query may run before it is interrupted.
 ///
@@ -258,20 +258,33 @@ pub enum ProjectError {
     PacketNotFound(i64),
     #[error("project storage error: {0}")]
     Storage(String),
+    #[error("target scope is not valid: {0}")]
+    InvalidScope(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct ProjectStore {
+    key: Arc<RwLock<StoreKey>>,
+    live_path: Arc<RwLock<PathBuf>>,
     /// The writer. Every insert, update, and migration goes through it; on a
     /// read-only project it is also the only connection.
     pub(crate) connection: Arc<Mutex<Connection>>,
     /// Readers for history queries, so a long search never blocks capture's
     /// writes and capture's writes never block a page load.
-    pub(crate) readers: Arc<ReaderPool>,
+    pub(crate) readers: Arc<RwLock<ReaderPool>>,
     info: ProjectInfo,
+    identity: Uuid,
+    history_readers: Arc<RwLock<ReaderPool>>,
     read_only: bool,
     budget_millis: Arc<AtomicU64>,
     inserted_since_optimize: Arc<AtomicU64>,
+}
+
+struct StoreKey(zeroize::Zeroizing<String>);
+impl std::fmt::Debug for StoreKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
 }
 
 /// A few read-only connections to the same file.
@@ -320,6 +333,45 @@ impl ReaderPool {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
         self.connections[index].lock()
     }
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Writes a private snapshot; the caller syncs and publishes it after metadata changes.
+fn export_database(connection: &Connection, path: &Path, key: &str) -> Result<(), ProjectError> {
+    let target = path
+        .to_str()
+        .ok_or_else(|| ProjectError::Corrupt("project path is not valid UTF-8".into()))?;
+    let mut create = std::fs::OpenOptions::new();
+    create.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        create.mode(0o600);
+    }
+    drop(create.open(path)?);
+    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let result = (|| {
+        connection.execute("ATTACH DATABASE ?1 AS saved KEY ?2", params![target, key])?;
+        let exported = connection
+            .query_row("SELECT sqlcipher_export('saved')", [], |_| Ok(()))
+            .and_then(|()| {
+                connection.execute_batch(&format!("PRAGMA saved.user_version={version};"))
+            });
+        let detached = connection.execute_batch("DETACH DATABASE saved;");
+        exported?;
+        detached
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result.map_err(ProjectError::from)
 }
 
 fn validate_passphrase(passphrase: Option<&str>) -> Result<(), ProjectError> {
@@ -374,9 +426,12 @@ impl ProjectStore {
             }],
         )?;
         let readers = ReaderPool::open(&path, options.passphrase.as_deref())?;
+        let history_readers = ReaderPool::open(&path, options.passphrase.as_deref())?;
         Ok(Self::assemble(
             connection,
             readers,
+            history_readers,
+            options.passphrase.as_deref(),
             ProjectInfo {
                 path,
                 name: name.to_owned(),
@@ -412,7 +467,7 @@ impl ProjectStore {
         )?;
         let schema_version: i32 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if schema_version > PROJECT_SCHEMA_VERSION {
+        if schema_version > PROJECT_SCHEMA_VERSION && !options.read_only {
             return Err(ProjectError::NewerSchema(schema_version));
         }
         if !options.read_only {
@@ -431,14 +486,21 @@ impl ProjectStore {
         let encrypted = meta_value(&connection, "encrypted")?.is_some_and(|value| value == "true")
             || options.passphrase.is_some();
         let readers = ReaderPool::open(&path, options.passphrase.as_deref())?;
+        let history_readers = ReaderPool::open(&path, options.passphrase.as_deref())?;
         Ok(Self::assemble(
             connection,
             readers,
+            history_readers,
+            options.passphrase.as_deref(),
             ProjectInfo {
                 path,
                 name,
                 encrypted,
-                schema_version: PROJECT_SCHEMA_VERSION,
+                schema_version: if options.read_only {
+                    schema_version
+                } else {
+                    PROJECT_SCHEMA_VERSION
+                },
             },
             options.read_only,
         ))
@@ -447,12 +509,20 @@ impl ProjectStore {
     fn assemble(
         connection: Connection,
         readers: ReaderPool,
+        history_readers: ReaderPool,
+        key: Option<&str>,
         info: ProjectInfo,
         read_only: bool,
     ) -> Self {
         Self {
+            key: Arc::new(RwLock::new(StoreKey(zeroize::Zeroizing::new(
+                key.unwrap_or("").to_owned(),
+            )))),
+            live_path: Arc::new(RwLock::new(info.path.clone())),
+            identity: Uuid::new_v4(),
             connection: Arc::new(Mutex::new(connection)),
-            readers: Arc::new(readers),
+            readers: Arc::new(RwLock::new(readers)),
+            history_readers: Arc::new(RwLock::new(history_readers)),
             info,
             read_only,
             budget_millis: Arc::new(AtomicU64::new(
@@ -470,10 +540,10 @@ impl ProjectStore {
         );
     }
 
-    /// Stops every read query running right now; each fails with
+    /// Stops desktop history page queries running right now; each fails with
     /// [`ProjectError::Interrupted`]. Writes are not affected.
     pub fn interrupt_reads(&self) {
-        for handle in &self.readers.interrupts {
+        for handle in &self.history_readers.read().interrupts {
             handle.interrupt();
         }
     }
@@ -488,7 +558,8 @@ impl ProjectStore {
         &self,
         work: impl FnOnce(&Connection) -> Result<T, ProjectError>,
     ) -> Result<T, ProjectError> {
-        let connection = self.readers.acquire();
+        let pool = self.readers.read();
+        let connection = pool.acquire();
         let budget = Duration::from_millis(self.budget_millis.load(Ordering::Relaxed));
         let deadline = Instant::now() + budget;
         let expired = Arc::new(AtomicBool::new(false));
@@ -523,6 +594,11 @@ impl ProjectStore {
     }
 
     #[must_use]
+    /// Stable across a live Save As handoff.
+    pub fn identity(&self) -> Uuid {
+        self.identity
+    }
+
     pub fn info(&self) -> &ProjectInfo {
         &self.info
     }
@@ -571,13 +647,34 @@ impl ProjectStore {
     /// is the only listing that can offer the operator all of the traffic the
     /// history actually contains.
     pub fn list_connections(&self, limit: usize) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
+        self.list_connections_ordered(limit, false)
+    }
+
+    /// Connections most recently inserted into this project, for Compare defaults.
+    pub fn recent_connections(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
+        self.list_connections_ordered(limit, true)
+    }
+
+    fn list_connections_ordered(
+        &self,
+        limit: usize,
+        recent: bool,
+    ) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
         self.with_reader(|connection| {
-            let mut statement = connection.prepare_cached(
+            let order = if recent {
+                "rowid DESC"
+            } else {
+                "packet_count DESC"
+            };
+            let mut statement = connection.prepare_cached(&format!(
                 "SELECT id, target_host, target_port, listener_address, status, state,
                         protocol_version, minecraft_version, loader, compression_threshold,
                         encrypted_client, encrypted_server, packet_count, byte_count, last_error
-                 FROM connections ORDER BY packet_count DESC LIMIT ?1",
-            )?;
+                 FROM connections ORDER BY {order} LIMIT ?1",
+            ))?;
             let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
                 Ok(ConnectionSnapshot {
                     id: parse_uuid(&row.get::<_, String>(0)?)?,
@@ -715,6 +812,90 @@ impl ProjectStore {
         })
     }
 
+    /// The ordered target scope allowlist; empty permits every target.
+    ///
+    /// A project older than schema 8 opened read-only has no scope table and
+    /// therefore no scope.
+    pub fn target_scope(&self) -> Result<Vec<String>, ProjectError> {
+        self.with_reader(|connection| {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'target_scope')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+            let mut query =
+                connection.prepare("SELECT pattern FROM target_scope ORDER BY position")?;
+            query
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProjectError::from)
+        })
+    }
+
+    /// Replaces the target scope allowlist after validating every pattern.
+    pub fn set_target_scope(&self, patterns: &[String]) -> Result<(), ProjectError> {
+        self.ensure_writable()?;
+        mineburp_core::scope::validate(patterns).map_err(ProjectError::InvalidScope)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM target_scope", [])?;
+        for (position, pattern) in patterns.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO target_scope(pattern,position) VALUES(?1,?2)",
+                params![pattern, i64::try_from(position).unwrap_or(i64::MAX)],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Closes file handles across every clone before Windows file deletion.
+    /// Only use once the application is exiting.
+    pub fn close_for_exit(&self) -> Result<(), ProjectError> {
+        let replacement = Connection::open_in_memory()?;
+        let pool = || -> Result<ReaderPool, ProjectError> {
+            Ok(ReaderPool {
+                connections: vec![Mutex::new(Connection::open_in_memory()?)],
+                interrupts: Vec::new(),
+                next: AtomicUsize::new(0),
+            })
+        };
+        let readers = pool()?;
+        let history = pool()?;
+        let mut current_readers = self.readers.write();
+        let mut current_history = self.history_readers.write();
+        let mut writer = self.connection.lock();
+        *current_readers = readers;
+        *current_history = history;
+        *writer = replacement;
+        Ok(())
+    }
+
+    /// Exact packet count without loading payloads or history pages.
+    pub fn packet_count(&self) -> Result<u64, ProjectError> {
+        self.with_reader(|connection| {
+            connection
+                .query_row("SELECT COUNT(*) FROM packets", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| u64::try_from(count).unwrap_or(0))
+                .map_err(ProjectError::from)
+        })
+    }
+
+    /// A desktop history page, cancellable separately from exports and analysis.
+    pub fn query_history_page(
+        &self,
+        query: &PacketQuery,
+    ) -> Result<Vec<PacketSummary>, ProjectError> {
+        let mut history = self.clone();
+        history.readers = self.history_readers.clone();
+        history.query_packets_filtered(query)
+    }
+
     pub fn query_packets_filtered(
         &self,
         query: &PacketQuery,
@@ -784,9 +965,23 @@ impl ProjectStore {
         name: &str,
         mut options: ProjectOptions,
     ) -> Result<Self, ProjectError> {
-        let result = self.save_as_inner(path.as_ref(), name, &options);
+        let result = self.save_as_inner(path.as_ref(), name, &options, false);
         if let Some(passphrase) = options.passphrase.as_mut() {
             passphrase.zeroize();
+        }
+        result
+    }
+
+    /// Moves the shared live writer to the copy before releasing its lock.
+    pub fn save_as_and_handoff(
+        &self,
+        path: impl AsRef<Path>,
+        name: &str,
+        mut options: ProjectOptions,
+    ) -> Result<Self, ProjectError> {
+        let result = self.save_as_inner(path.as_ref(), name, &options, true);
+        if let Some(key) = options.passphrase.as_mut() {
+            key.zeroize();
         }
         result
     }
@@ -796,49 +991,27 @@ impl ProjectStore {
         path: &Path,
         name: &str,
         options: &ProjectOptions,
+        handoff: bool,
     ) -> Result<Self, ProjectError> {
         validate_passphrase(options.passphrase.as_deref())?;
         let path = path.to_path_buf();
         if path.exists() {
             return Err(ProjectError::AlreadyExists(path));
         }
-        let target = path
-            .to_str()
-            .ok_or_else(|| ProjectError::Corrupt("project path is not valid UTF-8".into()))?;
-        // Reopened writer connections omit SQLITE_OPEN_CREATE, which SQLite
-        // also applies to ATTACH. Reserve an empty destination explicitly so
-        // Save as works after reopening, with atomic creation and private mode.
-        let mut create = std::fs::OpenOptions::new();
-        create.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            create.mode(0o600);
-        }
-        drop(create.open(&path)?);
-        {
-            let connection = self.connection.lock();
-            let version: i32 =
-                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            // An empty key attaches the copy as plaintext SQLite.
-            if let Err(error) = connection.execute(
-                "ATTACH DATABASE ?1 AS saved KEY ?2",
-                params![target, options.passphrase.as_deref().unwrap_or("")],
-            ) {
-                let _ = std::fs::remove_file(&path);
-                return Err(error.into());
-            }
-            let exported = connection
-                .query_row("SELECT sqlcipher_export('saved')", [], |_| Ok(()))
-                .and_then(|()| {
-                    connection.execute_batch(&format!("PRAGMA saved.user_version = {version};"))
-                });
-            connection.execute_batch("DETACH DATABASE saved;")?;
-            if let Err(error) = exported {
-                let _ = std::fs::remove_file(&path);
-                return Err(error.into());
-            }
-        }
+        let final_path = path.clone();
+        let mut partial = path.as_os_str().to_owned();
+        partial.push(".partial");
+        let path = PathBuf::from(partial);
+        // Match compact's lock order. Existing reads finish before publishing,
+        // and subsequent reads use the same database as the shared writer.
+        let mut readers = handoff.then(|| self.readers.write());
+        let mut history = handoff.then(|| self.history_readers.write());
+        let mut connection = self.connection.lock();
+        export_database(
+            &connection,
+            &path,
+            options.passphrase.as_deref().unwrap_or(""),
+        )?;
         let copy = Self::open_inner(
             &path,
             &ProjectOptions {
@@ -861,6 +1034,36 @@ impl ProjectStore {
                 }],
             )?;
         }
+        copy.connection
+            .lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        drop(copy);
+        std::fs::File::open(&path)?.sync_all()?;
+        // A hard link publishes without clobbering a concurrently created target.
+        std::fs::hard_link(&path, &final_path)?;
+        std::fs::remove_file(&path)?;
+        sync_parent(&final_path)?;
+        let mut copy = Self::open_inner(&final_path, options)?;
+        if handoff {
+            std::mem::swap(&mut *connection, &mut *copy.connection.lock());
+            copy.connection = self.connection.clone();
+            if let Some(pool) = readers.as_mut() {
+                std::mem::swap(&mut **pool, &mut *copy.readers.write());
+            }
+            if let Some(pool) = history.as_mut() {
+                std::mem::swap(&mut **pool, &mut *copy.history_readers.write());
+            }
+            copy.readers = self.readers.clone();
+            copy.history_readers = self.history_readers.clone();
+            *self.live_path.write() = final_path;
+            *self.key.write() = StoreKey(zeroize::Zeroizing::new(
+                options.passphrase.as_deref().unwrap_or("").to_owned(),
+            ));
+            copy.live_path = self.live_path.clone();
+            copy.key = self.key.clone();
+            copy.identity = self.identity;
+        }
+        drop(connection);
         Ok(Self {
             info: ProjectInfo {
                 name: name.to_owned(),
@@ -869,6 +1072,47 @@ impl ProjectStore {
             },
             ..copy
         })
+    }
+
+    pub(crate) fn compact_export(&self) -> Result<(), ProjectError> {
+        // Lock order matches reads: pools first, then writer. A reader can never
+        // retain the old inode after the replacement.
+        let mut readers = self.readers.write();
+        let mut history = self.history_readers.write();
+        let mut writer = self.connection.lock();
+        let live_path = self.live_path.read();
+        let path = &*live_path;
+        let encryption = self.key.read();
+        let mut staging = path.as_os_str().to_owned();
+        staging.push(".compact.partial");
+        let staging = PathBuf::from(staging);
+        export_database(&writer, &staging, encryption.0.as_str())?;
+        std::fs::File::open(&staging)?.sync_all()?;
+        writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        // Close all handles before replacing the database and its WAL identity.
+        *readers = ReaderPool {
+            connections: Vec::new(),
+            interrupts: Vec::new(),
+            next: AtomicUsize::new(0),
+        };
+        *history = ReaderPool {
+            connections: Vec::new(),
+            interrupts: Vec::new(),
+            next: AtomicUsize::new(0),
+        };
+        *writer = Connection::open_in_memory()?;
+        let published = std::fs::rename(&staging, path);
+        let key = (!encryption.0.is_empty()).then_some(encryption.0.as_str());
+        *writer = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        configure_connection(&writer, key, false)?;
+        *readers = ReaderPool::open(path, key)?;
+        *history = ReaderPool::open(path, key)?;
+        published?;
+        sync_parent(path)?;
+        Ok(())
     }
 
     pub fn save_schema_pack(&self, pack: &SchemaPack) -> Result<(), ProjectError> {
@@ -1154,7 +1398,26 @@ pub(crate) fn compile_query(query: &PacketQuery) -> Result<CompiledQuery, Projec
             ContentMatcher::compile(content).map(|matcher| (Arc::new(matcher), content.negate))
         })
         .transpose()?;
-    if let Some((_, negate)) = &matcher {
+    if let Some((compiled, negate)) = &matcher {
+        if let ContentMatcher::Terms {
+            terms,
+            scope: ContentScope::Equals,
+            ..
+        } = compiled.as_ref()
+        {
+            let sizes: Vec<Value> = terms
+                .iter()
+                .map(|term| match term {
+                    ContentTerm::Bytes(bytes) | ContentTerm::Range { start: bytes, .. } => {
+                        Value::from(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
+                    }
+                })
+                .collect();
+            let placeholders = vec!["?"; sizes.len()].join(",");
+            if !sizes.is_empty() && !*negate {
+                builder.push_owned(format!("size IN ({placeholders})"), sizes);
+            }
+        }
         let call = "payload_search(logical_bytes_zstd, size)";
         builder.push_owned(
             if *negate {
@@ -1203,7 +1466,7 @@ fn configure_connection(
             "PRAGMA foreign_keys=ON;
              PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA temp_store=MEMORY;
+             PRAGMA temp_store=FILE;
              PRAGMA busy_timeout=5000;",
         )?;
     }
@@ -1436,6 +1699,8 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (6, "CREATE TABLE IF NOT EXISTS workbench_documents(
         key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at_micros INTEGER NOT NULL
     );"),
+    (7, "CREATE TABLE IF NOT EXISTS findings(id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);"),
+    (8, "CREATE TABLE IF NOT EXISTS target_scope(pattern TEXT PRIMARY KEY, position INTEGER NOT NULL);"),
 ];
 
 /// Accumulates `WHERE` fragments alongside their bound values.
@@ -1560,7 +1825,7 @@ fn push_search(builder: &mut ClauseBuilder, search: &SearchTerm) -> Result<(), P
         let (comparison, pattern) = if search.case_sensitive {
             ("instr({column}, ?) > 0", text.to_owned())
         } else {
-            ("instr(LOWER({column}), ?) > 0", text.to_lowercase())
+            ("instr(LOWER({column}), ?) > 0", text.to_ascii_lowercase())
         };
         (
             SEARCHABLE_COLUMNS
@@ -1697,7 +1962,7 @@ impl ContentMatcher {
                         ContentTerm::Bytes(if query.case_sensitive {
                             line.as_bytes().to_vec()
                         } else {
-                            line.to_lowercase().into_bytes()
+                            line.to_ascii_lowercase().into_bytes()
                         })
                     })
                     .collect(),
@@ -3117,6 +3382,202 @@ mod tests {
     }
 
     #[test]
+    fn compact_export_preserves_encryption_and_reopens_readers() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("encrypted.mineburp");
+        let options = ProjectOptions {
+            passphrase: Some("secret".into()),
+            read_only: false,
+        };
+        let store = ProjectStore::create(&path, "Encrypted", options.clone()).unwrap();
+        let id = Uuid::new_v4();
+        store.save_connection(&snapshot(id)).unwrap();
+        store
+            .insert_packet(&packet(id, 1, b"secret bytes"))
+            .unwrap();
+        store.compact().unwrap();
+        assert_eq!(
+            store
+                .query_history_page(&PacketQuery {
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        assert!(ProjectStore::open(&path, ProjectOptions::default()).is_err());
+        assert_eq!(
+            ProjectStore::open(&path, options)
+                .unwrap()
+                .query_packets(None, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn newer_additive_schema_opens_read_only() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("newer.mineburp");
+        let store = ProjectStore::create(&path, "Newer", ProjectOptions::default()).unwrap();
+        store
+            .connection
+            .lock()
+            .pragma_update(None, "user_version", PROJECT_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(store);
+        assert!(ProjectStore::open(&path, ProjectOptions::default()).is_err());
+        let store = ProjectStore::open(
+            &path,
+            ProjectOptions {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.info().schema_version, PROJECT_SCHEMA_VERSION + 1);
+        assert!(store.query_packets(None, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_handoff_preserves_concurrent_and_stale_clone_writes() {
+        let directory = tempdir().unwrap();
+        let source = ProjectStore::create(
+            directory.path().join("source.mineburp"),
+            "Source",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        source.save_connection(&snapshot(id)).unwrap();
+        let stale = source.clone();
+        let writer = source.clone();
+        let task = std::thread::spawn(move || {
+            for sequence in 0..200 {
+                writer.insert_packet(&packet(id, sequence, b"x")).unwrap();
+            }
+        });
+        let copy = source
+            .save_as_and_handoff(
+                directory.path().join("saved.mineburp"),
+                "Saved",
+                ProjectOptions {
+                    passphrase: Some("handoff-key".into()),
+                    read_only: false,
+                },
+            )
+            .unwrap();
+        task.join().unwrap();
+        stale.insert_packet(&packet(id, 201, b"x")).unwrap();
+        stale.compact().unwrap();
+        assert!(
+            ProjectStore::open(
+                directory.path().join("saved.mineburp"),
+                ProjectOptions::default()
+            )
+            .is_err()
+        );
+        assert_eq!(copy.query_packets(None, 0, 500).unwrap().len(), 201);
+        assert_eq!(source.query_packets(None, 0, 500).unwrap().len(), 201);
+        assert_eq!(source.identity(), copy.identity());
+    }
+
+    #[test]
+    fn save_as_never_publishes_an_incomplete_destination() {
+        let directory = tempdir().unwrap();
+        let source = ProjectStore::create(
+            directory.path().join("source.mineburp"),
+            "Source",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let destination = directory.path().join("saved.mineburp");
+        std::fs::write(
+            directory.path().join("saved.mineburp.partial"),
+            b"interrupted",
+        )
+        .unwrap();
+        assert!(
+            source
+                .save_as(&destination, "Saved", ProjectOptions::default())
+                .is_err()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn ascii_fold_keeps_non_ascii_exact_case() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("text.mineburp"),
+            "Text",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        store.save_connection(&snapshot(id)).unwrap();
+        for text in ["Şehir", "Привет"] {
+            let mut row = packet(id, 1, text.as_bytes());
+            row.summary.name = Some(text.into());
+            store.insert_packet(&row).unwrap();
+            assert_eq!(
+                store
+                    .query_packets_filtered(&PacketQuery {
+                        search: Some(SearchTerm {
+                            text: text.into(),
+                            ..Default::default()
+                        }),
+                        limit: 10,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .query_packets_filtered(&PacketQuery {
+                        content: Some(ContentQuery {
+                            text: text.into(),
+                            scope: ContentScope::Equals,
+                            ..Default::default()
+                        }),
+                        limit: 10,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn history_cancel_leaves_ordinary_reads_running() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("cancel.mineburp"),
+            "Cancel",
+            ProjectOptions::default(),
+        )
+        .unwrap();
+        let reader = store.clone();
+        let (send, recv) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            reader.with_reader(|connection| {
+            send.send(()).unwrap();
+            connection.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n", [], |row| row.get::<_, i64>(0)).map_err(ProjectError::from)
+        })
+        });
+        recv.recv().unwrap();
+        store.interrupt_reads();
+        assert!(task.join().unwrap().is_ok());
+    }
+
+    #[test]
     fn save_as_copies_history_and_rekeys() {
         let directory = tempdir().unwrap();
         let source = ProjectStore::create(
@@ -3632,5 +4093,48 @@ mod tests {
         // The reader is fine afterwards.
         store.set_query_budget(DEFAULT_QUERY_BUDGET);
         assert!(!store.query_packets(None, 0, 10).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scope_migration_tests {
+    use super::*;
+    #[test]
+    fn v6_migrates_scope_and_preserves_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scope.mineburp");
+        let store = ProjectStore::create(&path, "scope", ProjectOptions::default()).unwrap();
+        store
+            .save_workbench_document("intruder", &serde_json::json!({"version":1}))
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .execute_batch("DROP TABLE target_scope; PRAGMA user_version=6;")
+            .unwrap();
+        drop(store);
+        let read_only = ProjectStore::open(
+            &path,
+            ProjectOptions {
+                read_only: true,
+                ..ProjectOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(read_only.target_scope().unwrap().is_empty());
+        drop(read_only);
+        let store = ProjectStore::open(&path, ProjectOptions::default()).unwrap();
+        assert_eq!(store.info().schema_version, 8);
+        assert!(store.target_scope().unwrap().is_empty());
+        store.set_target_scope(&["*.example.com".into()]).unwrap();
+        assert_eq!(store.target_scope().unwrap(), vec!["*.example.com"]);
+        assert!(store.workbench_document("intruder").unwrap().is_some());
+        let clone = store.clone();
+        store.close_for_exit().unwrap();
+        assert!(
+            clone.packet_count().is_err(),
+            "clones must lose the file handles"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

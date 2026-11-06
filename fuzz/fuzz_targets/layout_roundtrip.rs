@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mineburp_protocol::{encode_field, layout_logical};
+use mineburp_protocol::{encode_field_over, layout_logical};
 
 #[path = "common.rs"]
 mod common;
@@ -27,9 +27,14 @@ fuzz_target!(|input: (common::State, bool, u8, i32, &[u8])| {
         );
     }
     for span in &layout.fields {
-        let Ok(encoded) = encode_field(span.kind, &span.value) else {
+        let Ok(encoded) = encode_field_over(
+            span.kind,
+            &span.value,
+            Some(&logical[span.offset..span.offset + span.length]),
+        ) else {
             continue;
         };
+        assert_eq!(encoded, logical[span.offset..span.offset + span.length]);
         let mut spliced = logical[..span.offset].to_vec();
         spliced.extend_from_slice(&encoded);
         spliced.extend_from_slice(&logical[span.offset + span.length..]);

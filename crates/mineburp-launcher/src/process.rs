@@ -169,7 +169,20 @@ fn is_elevated() -> bool {
             })
             .is_some_and(|uid| uid == 0)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout == b"0\n")
+    }
+    #[cfg(windows)]
+    {
+        // WindowsPrincipal tests the current token, including UAC elevation.
+        std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"])
+            .output().is_ok_and(|output| output.status.success() && String::from_utf8_lossy(&output.stdout).trim().eq_ignore_ascii_case("true"))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }

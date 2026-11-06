@@ -1,0 +1,11 @@
+import { execFileSync } from 'node:child_process';
+import { copyFileSync, mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+const root = fileURLToPath(new URL('../', import.meta.url));
+const host = execFileSync('rustc', ['-vV'], { encoding: 'utf8' }).match(/^host: (.+)$/m)[1];
+const target = process.env.CARGO_BUILD_TARGET || host;
+if (!/^[a-zA-Z0-9_-]+$/.test(target)) throw new Error('Invalid target triple');
+execFileSync('cargo', ['build', '--locked', '--release', '-p', 'mineburp-mcp', '--target', target], { cwd: root, stdio: 'inherit' });
+const extension = target.includes('windows') ? '.exe' : '';
+mkdirSync(`${root}src-tauri/binaries`, { recursive: true });
+copyFileSync(`${root}target/${target}/release/mineburp-mcp${extension}`, `${root}src-tauri/binaries/mineburp-mcp-${target}${extension}`);

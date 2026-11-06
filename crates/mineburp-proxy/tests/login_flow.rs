@@ -234,6 +234,7 @@ enum LoginHold {
     SkipAuthentication,
 }
 
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 async fn login_through_the_proxy(
     should_authenticate: bool,
     provider: Arc<dyn SessionJoinProvider>,

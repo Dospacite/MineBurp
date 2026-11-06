@@ -1,6 +1,5 @@
 import { Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
 import { describe } from "../components/PacketFilterBar";
 import type {
   ConnectionSnapshot,
@@ -15,6 +14,7 @@ import { t } from "../i18n";
 import { desktop } from "../lib/desktop";
 import { formatBytes } from "../lib/format";
 import { formatAbsolute, formatSeconds } from "../lib/time";
+import { useTrafficAppend, useTrafficConnections } from "../lib/trafficStore";
 
 /** How often new traffic may re-run the statistics while the view is open. */
 const AUTO_REFRESH_MS = 5_000;
@@ -31,8 +31,8 @@ export function StatsView({
   project,
   filter,
   connectionId,
-  connections,
-  appendSignal,
+  connections: providedConnections,
+  appendSignal: providedAppendSignal,
   onApplyName,
   onApplyConnection,
   onError,
@@ -40,14 +40,18 @@ export function StatsView({
   project: ProjectInfo | null;
   filter: PacketFilter;
   connectionId: string | null;
-  connections: ConnectionSnapshot[];
-  appendSignal: number;
+  connections?: ConnectionSnapshot[];
+  appendSignal?: number;
   /** Narrows the history to one packet name and shows it. */
   onApplyName: (name: string) => void;
   /** Narrows the history to one connection and shows it. */
   onApplyConnection: (connectionId: string) => void;
   onError: (error: string) => void;
 }) {
+  const storedConnections = useTrafficConnections();
+  const connections = providedConnections ?? storedConnections;
+  const storeSignal = useTrafficAppend();
+  const appendSignal = providedAppendSignal ?? storeSignal;
   const [stats, setStats] = useState<TrafficStats | null>(null);
   const [loading, setLoading] = useState(false);
   const [metric, setMetric] = useState<Metric>("packets");

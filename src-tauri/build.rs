@@ -7,6 +7,7 @@
 //! in `src/lib.rs` keeps the three lists identical.
 
 const COMMANDS: &[&str] = &[
+    "findings",
     "replacement_rule_preview",
     "payload_generate",
     "decoder_transform",
@@ -17,6 +18,7 @@ const COMMANDS: &[&str] = &[
     "intruder_plan",
     "sequencer_analyze",
     "app_capabilities",
+    "setup_check",
     "decrypt_mode_status",
     "decrypt_mode_set",
     "capture_start",
@@ -26,8 +28,17 @@ const COMMANDS: &[&str] = &[
     "project_open",
     "project_save_as",
     "project_current",
+    "lab_listener_active",
+    "lab_listener_stop",
+    "lab_listener_start",
+    "project_scope_set",
+    "project_scope_get",
+    "project_recovered_save_as",
+    "project_recovered_delete",
+    "project_recovered_list",
     "project_checkpoint",
     "connections_query",
+    "connections_compare",
     "packets_query",
     "packets_export",
     "packets_export_pcapng",

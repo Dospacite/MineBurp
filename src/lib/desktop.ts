@@ -32,6 +32,7 @@ import type {
   ProjectInfo,
   ProtocolState,
   ProxyEvent,
+  RecoveredSession,
   RepeaterTab,
   ReplacementRule,
   SavedFilter,
@@ -87,7 +88,13 @@ export function filterArgs(query: PacketHistoryQuery) {
 }
 
 export const desktop = {
+  findings: <T = import("../domain/types").Finding[]>(
+    expectedPath: string,
+    action: string,
+    args: Record<string, unknown> = {},
+  ) => call<T>("findings", { expectedPath, action, args }),
   isAvailable: inTauri,
+  setupCheck: () => call<import("../domain/types").SetupCheck[]>("setup_check"),
   intruderPlan: (mode: AttackMode, lengths: number[]) =>
     call<Array<Array<number | null>>>("intruder_plan", { mode, lengths }),
   sequencerAnalyze: (samples: string[]) => call<SequenceAnalysis>("sequencer_analyze", { samples }),
@@ -112,13 +119,32 @@ export const desktop = {
   captureStats: () => call<CaptureStats>("capture_stats"),
   decryptMode: () => call<DecryptModeStatus>("decrypt_mode_status"),
   setDecryptMode: (enabled: boolean) => call<DecryptModeStatus>("decrypt_mode_set", { enabled }),
+  projectRecoveredList: () => call<RecoveredSession[]>("project_recovered_list"),
+  projectRecoveredDelete: (path: string) => call<void>("project_recovered_delete", { path }),
+  projectRecoveredSaveAs: (path: string, destination: string) =>
+    call<ProjectInfo>("project_recovered_save_as", { path, destination }),
+  projectScopeGet: () => call<string[]>("project_scope_get"),
+  projectScopeSet: (patterns: string[]) => call<void>("project_scope_set", { patterns }),
+  labListenerStart: (host: string, port: number, stayArmed: boolean) =>
+    call<[string, string]>("lab_listener_start", { host, port, stayArmed }),
+  labListenerActive: (id: string) => call<boolean>("lab_listener_active", { id }),
+  labListenerStop: (id: string) => call<void>("lab_listener_stop", { id }),
   projectCurrent: () => call<ProjectInfo | null>("project_current"),
   projectCreate: async (path: string, name: string, passphrase?: string) => {
     await flushProjectEditors();
     return call<ProjectInfo>("project_create", { path, name, passphrase: passphrase || null });
   },
   projectOpen: async (path: string, passphrase?: string) => {
-    await flushProjectEditors();
+    try {
+      await flushProjectEditors();
+    } catch (error) {
+      if (
+        !window.confirm(
+          `Could not save project edits: ${String(error)}. Open another project and discard them?`,
+        )
+      )
+        throw error;
+    }
     return call<ProjectInfo>("project_open", { path, passphrase: passphrase || null, readOnly: false });
   },
   /** Copies the open project (usually the temporary session) to a new file and switches to it. */
@@ -143,7 +169,13 @@ export const desktop = {
   setNetworkConditions: (conditions: NetworkConditions) =>
     call<NetworkConditions>("network_conditions_set", { conditions }),
   /** Proxy sessions and passively observed flows, as recorded in the project. */
-  connections: () => call<ConnectionSnapshot[]>("connections_query"),
+  compareConnections: (a: string, b: string, query: PacketHistoryQuery = {}) =>
+    call<import("../domain/types").ConnectionComparison>("connections_compare", {
+      a,
+      b,
+      filter: filterArgs(query),
+    }),
+  connections: (recent = false) => call<ConnectionSnapshot[]>("connections_query", { recent }),
   packets: (query: PacketHistoryQuery = {}) =>
     call<PacketSummary[]>("packets_query", { filter: filterArgs(query) }),
   /** Writes every packet matching the filter to a JSON file; resolves to the count written. */
@@ -231,7 +263,8 @@ export const desktop = {
   proxySessions: () => call<ConnectionSnapshot[]>("proxy_sessions"),
   /** The automatic replacement rules, in the order they are applied. */
   replacementRules: () => call<ReplacementRule[]>("replacement_rules_get"),
-  saveReplacementRules: (rules: ReplacementRule[]) => call<void>("replacement_rules_set", { rules }),
+  saveReplacementRules: (rules: ReplacementRule[], expectedPath?: string | null) =>
+    call<void>("replacement_rules_set", { rules, expectedPath }),
   /** Runs a rule's edits against one frame without sending anything. */
   replacementRulePreview: (
     rule: ReplacementRule,

@@ -21,6 +21,7 @@ mod packet;
 mod pcap;
 mod pipeline;
 mod reassembly;
+pub mod setup;
 mod synthetic;
 mod system_backend;
 

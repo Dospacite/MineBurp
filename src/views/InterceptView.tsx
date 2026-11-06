@@ -6,16 +6,11 @@ import { ExpressionInput } from "../components/ExpressionInput";
 import { FieldEditor } from "../components/FieldEditor";
 import { isNeutral, NetworkConditionsDialog } from "../components/NetworkConditionsDialog";
 import { Split } from "../components/Split";
-import type {
-  FieldSpan,
-  InterceptedPacket,
-  InterceptSettings,
-  NetworkConditions,
-  PacketLayout,
-} from "../domain/types";
+import type { InterceptedPacket, InterceptSettings, NetworkConditions } from "../domain/types";
+import { useFrameEditor } from "../hooks/useFrameEditor";
 import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
-import { base64ToBytes, desktop, formatHexInput, parseHex, tryParseHex } from "../lib/desktop";
+import { base64ToBytes, bytesToBase64, desktop, formatHexInput, parseHex, tryParseHex } from "../lib/desktop";
 
 export function InterceptView({
   settings,
@@ -23,7 +18,9 @@ export function InterceptView({
   pendingSignal,
   decryptEnabled,
   onError,
+  onRepeater,
 }: {
+  onRepeater?: (packet: import("../domain/types").PacketView) => void;
   settings: InterceptSettings | null;
   /**
    * Changes some settings and leaves the rest as the backend has them. A
@@ -38,14 +35,12 @@ export function InterceptView({
   const [queue, setQueue] = useState<InterceptedPacket[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [hex, setHex] = useState("");
-  const [layout, setLayout] = useState<PacketLayout | null>(null);
-  const [decoding, setDecoding] = useState(false);
+  const [retained, setRetained] = useState<InterceptedPacket | null>(null);
   const [busy, setBusy] = useState(false);
   const [expression, setExpression] = useState(settings?.expression ?? "");
   const [expressionError, setExpressionError] = useState<string | null>(null);
   /** The expression has been typed but not applied; settings updates leave it alone. */
   const expressionDirty = useRef(false);
-  const decode = useRef(0);
   const [networkOpen, setNetworkOpen] = useState(false);
   const [network, setNetwork] = useState<NetworkConditions | null>(null);
   const [autoForward, setAutoForward] = useState(secondsText(settings?.auto_forward_after_ms ?? null));
@@ -63,7 +58,8 @@ export function InterceptView({
       .catch((reason) => onError(message(reason)));
   }, [onError]);
 
-  const selected = queue.find((packet) => packet.id === selectedId) ?? null;
+  const selected = queue.find((packet) => packet.id === selectedId) ?? retained;
+  const vanished = selected !== null && !queue.some((packet) => packet.id === selected.id);
   const original = useMemo(
     () => (selected ? formatHexInput(base64ToBytes(selected.bytes_base64)) : ""),
     [selected],
@@ -86,66 +82,44 @@ export function InterceptView({
       .then((next) => {
         setQueue(next);
         // Stay on the frame being edited; otherwise move to the oldest one.
-        setSelectedId((current) =>
-          current !== null && next.some((packet) => packet.id === current) ? current : (next[0]?.id ?? null),
-        );
+        setSelectedId((current) => (current !== null ? current : (next[0]?.id ?? null)));
       })
       .catch((reason) => onError(message(reason)));
   }, [pendingSignal, onError]);
 
   // A newly selected frame starts from its captured bytes.
-  useEffect(() => setHex(original), [original]);
-
   useEffect(() => {
-    if (!selected || !desktop.isAvailable()) {
-      setLayout(null);
-      return undefined;
+    if (selected && selected.id !== retained?.id) {
+      setRetained(selected);
+      setHex(original);
     }
-    const requestId = ++decode.current;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        const parsed = tryParseHex(hex);
-        if (!parsed.bytes) {
-          if (requestId === decode.current) setLayout(null);
-          return;
-        }
-        const bytes = parsed.bytes;
-        setDecoding(true);
-        try {
-          const next = await desktop.packetLayout(
-            bytes,
-            selected.summary.state,
-            selected.summary.direction,
-            selected.summary.protocol_version,
-          );
-          if (requestId === decode.current) setLayout(next);
-        } catch {
-          if (requestId === decode.current) setLayout(null);
-        } finally {
-          if (requestId === decode.current) setDecoding(false);
-        }
-      })();
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [hex, selected]);
+  }, [selected, retained?.id, original]);
 
-  const commitField = useCallback(
-    async (field: FieldSpan, value: string | boolean) => {
-      try {
-        setHex(formatHexInput(await desktop.fieldEdit(parseHex(hex), field, value)));
-      } catch (reason) {
-        onError(message(reason));
-      }
-    },
-    [hex, onError],
+  const frame = useFrameEditor(
+    hex,
+    selected?.summary.state ?? "play",
+    selected?.summary.direction ?? "client_to_server",
+    selected?.summary.protocol_version ?? null,
+    selected?.id ?? null,
+    setHex,
+    onError,
   );
+  const { layout, decoding, commitField } = frame;
 
   const resolve = useCallback(
     async (action: "forward" | "drop") => {
-      if (!selected || busy) return;
+      if (!selected || busy || vanished) return;
+      try {
+        await frame.flush();
+      } catch {
+        return;
+      }
       setBusy(true);
       try {
-        const replacement = action === "forward" && edited ? parseHex(hex) : undefined;
+        const replacement =
+          action === "forward" && normalise(frame.latestHex()) !== normalise(original)
+            ? parseHex(frame.latestHex())
+            : undefined;
         await desktop.interceptResolve(selected.id, action, replacement);
       } catch (reason) {
         onError(message(reason));
@@ -153,7 +127,7 @@ export function InterceptView({
         setBusy(false);
       }
     },
-    [busy, edited, hex, onError, selected],
+    [busy, onError, selected, frame.latestHex, vanished, original, frame.flush],
   );
 
   async function forwardAll() {
@@ -198,6 +172,7 @@ export function InterceptView({
   // Ctrl/Cmd+Enter forwards from anywhere; Ctrl/Cmd+Backspace drops outside text fields.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (event.target instanceof Element && !event.target.closest(".intercept-view")) return;
       if (document.querySelector('[role="dialog"]')) return;
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       if (event.key === "Enter") {
@@ -350,7 +325,11 @@ export function InterceptView({
                 key={packet.id}
                 className={`flow-card ${packet.id === selectedId ? "selected" : ""}`}
                 aria-pressed={packet.id === selectedId}
-                onClick={() => setSelectedId(packet.id)}
+                onClick={() => {
+                  setRetained(packet);
+                  setHex(formatHexInput(base64ToBytes(packet.bytes_base64)));
+                  setSelectedId(packet.id);
+                }}
               >
                 <span className={`direction ${packet.summary.direction}`}>
                   {packet.summary.direction === "client_to_server" ? "C → S" : "S → C"}
@@ -379,6 +358,26 @@ export function InterceptView({
         <section className="repeater-editor intercept-editor">
           {selected ? (
             <>
+              {vanished && (
+                <div role="status">
+                  This frame was forwarded without these edits.
+                  <button
+                    type="button"
+                    className="button"
+                    disabled={!!hexError || !onRepeater}
+                    onClick={() =>
+                      onRepeater?.({
+                        summary: selected.summary,
+                        bytes_base64: bytesToBase64(parseHex(hex)),
+                        bytes_offset: 0,
+                        total_bytes: parseHex(hex).length,
+                      } as import("../domain/types").PacketView)
+                    }
+                  >
+                    Send to Repeater
+                  </button>
+                </div>
+              )}
               <div className="repeater-toolbar">
                 <span className="intercept-held">
                   {t("intercept.held", {
@@ -399,7 +398,7 @@ export function InterceptView({
                 <button
                   type="button"
                   className="button danger"
-                  disabled={busy}
+                  disabled={busy || vanished}
                   onClick={() => void resolve("drop")}
                   title={t("intercept.drop.shortcut")}
                 >
@@ -409,7 +408,7 @@ export function InterceptView({
                 <button
                   type="button"
                   className="button accent"
-                  disabled={busy}
+                  disabled={busy || vanished}
                   onClick={() => void resolve("forward")}
                   title={t("intercept.forward.shortcut")}
                 >

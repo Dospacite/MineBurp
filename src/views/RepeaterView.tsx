@@ -1,24 +1,25 @@
 import { Loader2, Plus, Redo2, Save, Send, Undo2, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
-
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { FieldEditor } from "../components/FieldEditor";
+import { addToFinding } from "../components/FindingPicker";
 import { Split } from "../components/Split";
 import type {
   ConnectionSnapshot,
   Direction,
-  FieldSpan,
-  PacketLayout,
   PacketView,
   ProtocolState,
   RepeaterEditHistory,
   RepeaterTab,
 } from "../domain/types";
+import { useFrameEditor } from "../hooks/useFrameEditor";
 import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
 import { base64ToBytes, desktop, formatHexInput, parseHex, readPayload, tryParseHex } from "../lib/desktop";
 import { initialHistory, namedRevision, recordEdit, redoEdit, undoEdit } from "../lib/editHistory";
 import { newId } from "../lib/ids";
+import { registerProjectEditor } from "../lib/projectWrites";
+import { useTrafficConnections } from "../lib/trafficStore";
 
 const STATES: ProtocolState[] = ["handshake", "status", "login", "configuration", "play"];
 
@@ -125,8 +126,8 @@ function blankTab(index: number, connectionId: string): RepeaterTabState {
  * "Send to Repeater", and always in a tab of its own: selecting a row no
  * longer rewrites whatever the operator was composing.
  */
-export function RepeaterView({
-  sessions,
+export const RepeaterView = memo(function RepeaterView({
+  sessions: providedConnections,
   request,
   onRequestHandled,
   visible = true,
@@ -134,47 +135,68 @@ export function RepeaterView({
   projectKey,
 }: {
   projectKey?: string | null;
-  sessions: ConnectionSnapshot[];
+  sessions?: ConnectionSnapshot[];
   request: RepeaterRequest | null;
   onRequestHandled: (nonce: number) => void;
   /** Whether the view is on screen; keyboard shortcuts only apply then. */
   visible?: boolean;
   onError: (error: string) => void;
 }) {
+  const storedConnections = useTrafficConnections();
+  const sessions = providedConnections ?? storedConnections;
   const live = sessions.filter((session) => session.status === "active" && session.state !== "opaque");
-  const [tabs, setTabs] = useState<RepeaterTabState[]>([]);
+  const [tabs, renderTabs] = useState<RepeaterTabState[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [layout, setLayout] = useState<{ layout: PacketLayout; hex: string } | null>(null);
-  const [decoding, setDecoding] = useState(false);
+
   const [revisionName, setRevisionName] = useState("");
   const [showOriginal, setShowOriginal] = useState(false);
-  const decode = useRef(0);
   const counter = useRef(1);
   const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
+  const setTabs = useCallback(
+    (update: RepeaterTabState[] | ((tabs: RepeaterTabState[]) => RepeaterTabState[])) => {
+      const next = typeof update === "function" ? update(tabsRef.current) : update;
+      tabsRef.current = next;
+      renderTabs(next);
+    },
+    [],
+  );
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
 
   const active = tabs.find((tab) => tab.id === activeId) ?? tabs[0] ?? null;
+  const activeIdentity = useRef(active?.id);
+  activeIdentity.current = active?.id;
   const session = sessions.find((item) => item.id === active?.connectionId);
   const protocolVersion = active?.protocolVersion ?? session?.protocol_version ?? null;
-  const parsed = active ? tryParseHex(active.hex) : null;
+  const parseInput = active?.hex;
+  const parsed = useMemo(() => (parseInput === undefined ? null : tryParseHex(parseInput)), [parseInput]);
 
-  const patchTab = useCallback((id: string, patch: Partial<RepeaterTabState>) => {
-    setTabs((current) =>
-      current.map((tab) =>
+  useEffect(() => {
+    const open = (event: Event) => {
+      const id = (event as CustomEvent<string>).detail;
+      if (tabsRef.current.some((tab) => tab.id === id)) setActiveId(id);
+    };
+    window.addEventListener("finding-repeater", open);
+    return () => window.removeEventListener("finding-repeater", open);
+  }, []);
+  const patchTab = useCallback(
+    (id: string, patch: Partial<RepeaterTabState>, typing = false) => {
+      const next = tabsRef.current.map((tab) =>
         tab.id === id
           ? {
               ...tab,
               ...patch,
               history:
                 patch.history ??
-                (patch.hex === undefined ? tab.history : recordEdit(tab.history, tab.hex, patch.hex)),
+                (patch.hex === undefined ? tab.history : recordEdit(tab.history, tab.hex, patch.hex, typing)),
             }
           : tab,
-      ),
-    );
-  }, []);
+      );
+      tabsRef.current = next;
+      setTabs(next);
+    },
+    [setTabs],
+  );
 
   const loadFull = useCallback(
     async (id: string, packetId: number, expectedHex?: string) => {
@@ -197,7 +219,7 @@ export function RepeaterView({
         onError(message(reason));
       }
     },
-    [onError, patchTab],
+    [onError, patchTab, setTabs],
   );
 
   // Saved tabs join whatever is already open — including a tab a request
@@ -224,7 +246,7 @@ export function RepeaterView({
     return () => {
       live = false;
     };
-  }, [onError, projectKey]);
+  }, [onError, projectKey, setTabs]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: each request is handled once, by nonce.
   useEffect(() => {
@@ -241,64 +263,53 @@ export function RepeaterView({
     if (active && !active.connectionId && live[0]) patchTab(active.id, { connectionId: live[0].id });
   }, [active, live, patchTab]);
 
-  // The decode follows the bytes of the active tab: typing hex, editing a
-  // field, or switching state all end up here, so the editors cannot disagree.
-  const activeHex = active?.hex ?? "";
-  const activeState = active?.state ?? "play";
-  const activeDirection = active?.direction ?? "client_to_server";
-  useEffect(() => {
-    const requestId = ++decode.current;
-    if (!desktop.isAvailable()) return undefined;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        const result = tryParseHex(activeHex);
-        if (!result.bytes || result.bytes.length === 0) {
-          if (requestId === decode.current) setLayout(null);
-          return;
-        }
-        setDecoding(true);
-        try {
-          const next = await desktop.packetLayout(
-            result.bytes,
-            activeState,
-            activeDirection,
-            protocolVersion,
-          );
-          if (requestId === decode.current) setLayout({ layout: next, hex: activeHex });
-        } catch {
-          if (requestId === decode.current) setLayout(null);
-        } finally {
-          if (requestId === decode.current) setDecoding(false);
-        }
-      })();
-    }, 180);
-    return () => window.clearTimeout(timer);
-  }, [activeDirection, activeHex, activeState, protocolVersion]);
-
-  // A layout decoded from older bytes would splice an edit at the wrong offset.
-  const currentLayout = layout && layout.hex === activeHex ? layout.layout : null;
-
-  const commitField = useCallback(
-    async (field: FieldSpan, value: string | boolean) => {
-      const tab = tabsRef.current.find((item) => item.id === active?.id);
-      if (!tab) return;
-      if (!layout || layout.hex !== tab.hex) {
-        onError(t("repeater.decode-pending"));
-        return;
-      }
-      try {
-        const edited = await desktop.fieldEdit(parseHex(tab.hex), field, value);
-        if (tabsRef.current.find((t) => t.id === tab.id)?.hex !== tab.hex) return;
-        patchTab(tab.id, { hex: formatHexInput(edited), dirty: true });
-      } catch (reason) {
-        onError(message(reason));
+  const frame = useFrameEditor(
+    active?.hex ?? "",
+    active?.state ?? "play",
+    active?.direction ?? "client_to_server",
+    protocolVersion,
+    active?.id ?? null,
+    (hex) => {
+      if (active) {
+        patchTab(active.id, { hex, dirty: true });
       }
     },
-    [active?.id, layout, onError, patchTab],
+    onError,
+  );
+  const { layout: currentLayout, decoding, commitField } = frame;
+
+  useEffect(
+    () =>
+      registerProjectEditor(async () => {
+        await frame.flush();
+        for (const tab of tabsRef.current.filter((tab) => tab.dirty)) {
+          if (tab.truncated || tab.loadingFull)
+            throw new Error("Load the full Repeater frame before saving.");
+          await desktop.repeaterTabSave({
+            id: tab.id,
+            name: tab.name,
+            connection_id: tab.connectionId,
+            direction: tab.direction,
+            state: tab.state,
+            protocol_version: tab.protocolVersion,
+            logical_bytes: Array.from(parseHex(tab.hex)),
+            decoded: null,
+            edit_history: tab.history,
+          });
+        }
+      }),
+    [frame.flush],
   );
 
   const send = useCallback(async () => {
-    const tab = tabsRef.current.find((item) => item.id === active?.id);
+    const identity = activeIdentity.current;
+    try {
+      await frame.flush();
+    } catch {
+      return;
+    }
+    if (activeIdentity.current !== identity) return;
+    const tab = tabsRef.current.find((item) => item.id === identity);
     if (!tab) return;
     const record = (attempt: Attempt) =>
       setTabs((current) =>
@@ -307,7 +318,7 @@ export function RepeaterView({
         ),
       );
     try {
-      const bytes = parseHex(tab.hex);
+      const bytes = parseHex(frame.latestHex());
       await desktop.repeaterSend(tab.connectionId, tab.direction, bytes);
       record({ at: Date.now(), bytes: bytes.length, ok: true, result: t("repeater.sent") });
     } catch (reason) {
@@ -315,9 +326,16 @@ export function RepeaterView({
       record({ at: Date.now(), bytes: 0, ok: false, result: error });
       onError(error);
     }
-  }, [active?.id, onError]);
+  }, [onError, frame.latestHex, frame.flush, setTabs]);
 
   const save = useCallback(async () => {
+    const identity = activeIdentity.current;
+    try {
+      await frame.flush();
+    } catch {
+      return;
+    }
+    if (activeIdentity.current !== identity) return;
     const tab = tabsRef.current.find((item) => item.id === active?.id);
     if (!tab) return;
     try {
@@ -356,7 +374,7 @@ export function RepeaterView({
     } catch (reason) {
       onError(message(reason));
     }
-  }, [active?.id, onError]);
+  }, [active?.id, onError, setTabs, frame.flush]);
 
   async function closeTab(tab: RepeaterTabState) {
     setTabs((current) => current.filter((item) => item.id !== tab.id));
@@ -393,6 +411,13 @@ export function RepeaterView({
   useEffect(() => {
     if (!visible) return undefined;
     const onKey = (event: KeyboardEvent) => {
+      if (event.target instanceof Element && !event.target.closest(".repeater-view")) return;
+      if (
+        (event.key.toLowerCase() === "z" || event.key.toLowerCase() === "y") &&
+        event.target instanceof Element &&
+        event.target.matches("input, textarea:not(.hex-editor)")
+      )
+        return;
       if (document.querySelector('[role="dialog"]')) return;
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       if (event.key === "Enter") {
@@ -423,6 +448,23 @@ export function RepeaterView({
             <button
               type="button"
               role="tab"
+              id={`tab-${tab.id}`}
+              aria-controls="repeater-panel"
+              tabIndex={tab.id === active?.id ? 0 : -1}
+              onKeyDown={(event) => {
+                const index = tabs.indexOf(tab);
+                const next =
+                  event.key === "ArrowRight"
+                    ? tabs[(index + 1) % tabs.length]
+                    : event.key === "ArrowLeft"
+                      ? tabs[(index + tabs.length - 1) % tabs.length]
+                      : null;
+                if (next) {
+                  event.preventDefault();
+                  setActiveId(next.id);
+                  document.getElementById(`tab-${next.id}`)?.focus();
+                }
+              }}
               aria-selected={tab.id === active?.id}
               onClick={() => setActiveId(tab.id)}
               title={tab.name}
@@ -457,8 +499,19 @@ export function RepeaterView({
           minimum={220}
           className="repeater-layout"
         >
-          <section className="repeater-editor">
+          <section
+            className="repeater-editor"
+            role="tabpanel"
+            id="repeater-panel"
+            aria-labelledby={`tab-${active.id}`}
+          >
             <div className="repeater-toolbar">
+              <button
+                type="button"
+                onClick={() => active && addToFinding([{ kind: "repeater", id: active.id }])}
+              >
+                {t("findings.add")}
+              </button>
               <label>
                 {t("repeater.connection")}
                 <select
@@ -679,7 +732,7 @@ export function RepeaterView({
                   spellCheck={false}
                   value={active.hex}
                   onChange={(event) =>
-                    patchTab(active.id, { hex: event.target.value, truncated: false, dirty: true })
+                    patchTab(active.id, { hex: event.target.value, truncated: false, dirty: true }, true)
                   }
                   placeholder="00 0f 6d 69 6e 65 63 72 61 66 74 3a 62 72 61 6e 64"
                 />
@@ -710,4 +763,4 @@ export function RepeaterView({
       )}
     </section>
   );
-}
+});

@@ -22,8 +22,10 @@ import { CommandPalette, type PaletteCommand } from "./components/CommandPalette
 import { type DecoderRequest, DecoderSidebar } from "./components/DecoderSidebar";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ErrorLog } from "./components/ErrorLog";
+import { FindingPicker } from "./components/FindingPicker";
 import type { PacketActions } from "./components/PacketHistory";
 import { ProjectControl } from "./components/ProjectControl";
+import { openSetup, SetupPanel } from "./components/SetupPanel";
 import { Toast } from "./components/Toast";
 import type { PacketView, SavedFilter, View } from "./domain/types";
 import { message, useMineBurp } from "./hooks/useMineBurp";
@@ -38,6 +40,7 @@ import { type SelectionActions, SelectionActionsContext } from "./lib/selectionA
 import { TRAFFIC_PRESETS, trafficPreset } from "./lib/trafficPresets";
 import { ChannelExplorerView } from "./views/ChannelExplorerView";
 import { type CompareSlots, CompareView } from "./views/CompareView";
+import { FindingsView } from "./views/FindingsView";
 import { InstancesView } from "./views/InstancesView";
 import { InterceptView } from "./views/InterceptView";
 import { IntruderView, type ResearchRequest } from "./views/IntruderView";
@@ -60,6 +63,7 @@ const navigation: Array<{ id: View; labelKey: Parameters<typeof t>[0]; icon: typ
   { id: "stats", labelKey: "app.view.stats", icon: BarChart3 },
   { id: "intruder", labelKey: "app.view.intruder", icon: Crosshair },
   { id: "sequencer", labelKey: "app.view.sequencer", icon: Fingerprint },
+  { id: "findings", labelKey: "app.view.findings", icon: ScrollText },
   { id: "channels", labelKey: "app.view.channels", icon: Network },
 ];
 
@@ -87,11 +91,23 @@ export function App() {
   useEffect(() => {
     void projectPath;
     setCompare({ a: null, b: null });
+    setRepeaterRequest(null);
+    setRuleRequest(null);
     setIntruderRequest(null);
     setSequencerRequest(null);
     annotationStore.reset();
   }, [projectPath]);
 
+  useEffect(() => {
+    const open = (event: Event) => {
+      setView("repeater");
+      window.dispatchEvent(
+        new CustomEvent("finding-repeater", { detail: (event as CustomEvent<string>).detail }),
+      );
+    };
+    window.addEventListener("finding-open-repeater", open);
+    return () => window.removeEventListener("finding-open-repeater", open);
+  }, []);
   const { packetFilter, setPacketFilter, setConnectionId } = workbench;
   const applyName = useCallback(
     (name: string) => {
@@ -252,6 +268,7 @@ export function App() {
     };
   }, [paletteOpen, setError]);
   const paletteCommands: PaletteCommand[] = [
+    { id: "setup", label: "Open Setup", keywords: "capture dumpcap agent assistance", run: openSetup },
     ...navigation.map((item) => ({
       id: `view-${item.id}`,
       label: t(item.labelKey),
@@ -334,6 +351,10 @@ export function App() {
             .catch((error) => {
               closing = false;
               setError(message(error));
+              if (
+                globalThis.confirm(`Could not save project edits: ${message(error)}. Close and discard them?`)
+              )
+                void window.destroy();
             });
         });
         if (disposed) unsubscribe();
@@ -472,11 +493,26 @@ export function App() {
 
         <div className={`workbench-body ${decoderOpen ? "decoder-open" : ""}`}>
           <div className="workspace">
+            <FindingPicker key={projectPath} projectKey={projectPath} onError={setError} />
+            {view === "findings" && (
+              <FindingsView
+                key={projectPath}
+                projectKey={projectPath}
+                onError={setError}
+                onPacket={(id) => {
+                  setView("traffic");
+                  setTimeout(
+                    () => window.dispatchEvent(new CustomEvent("finding-packet", { detail: id })),
+                    0,
+                  );
+                }}
+              />
+            )}
             <div className="view-host" hidden={view !== "intruder"}>
               <ErrorBoundary>
                 <IntruderView
+                  key={projectPath}
                   request={intruderRequest}
-                  sessions={workbench.connections}
                   projectKey={projectPath}
                   onError={workbench.setError}
                 />
@@ -485,6 +521,7 @@ export function App() {
             <div className="view-host" hidden={view !== "sequencer"}>
               <ErrorBoundary>
                 <SequencerView
+                  key={projectPath}
                   request={sequencerRequest}
                   projectKey={projectPath}
                   onError={workbench.setError}
@@ -495,7 +532,7 @@ export function App() {
             <div className="view-host" hidden={view !== "repeater"}>
               <ErrorBoundary>
                 <RepeaterView
-                  sessions={workbench.connections}
+                  key={projectPath}
                   projectKey={projectPath}
                   request={repeaterRequest}
                   onRequestHandled={onRepeaterHandled}
@@ -507,9 +544,9 @@ export function App() {
             {view === "traffic" && (
               <ErrorBoundary>
                 <TrafficView
+                  key={projectPath}
                   capabilities={workbench.capabilities}
                   project={workbench.project}
-                  connections={workbench.connections}
                   selectedPacket={workbench.selectedPacket}
                   selectedPacketId={workbench.selectedPacketId}
                   filter={workbench.packetFilter}
@@ -518,7 +555,6 @@ export function App() {
                   onConnectionChange={workbench.setConnectionId}
                   decryptMode={workbench.decryptMode}
                   captureStatus={workbench.captureStatus}
-                  appendSignal={workbench.appendSignal}
                   onSelectPacket={workbench.selectPacket}
                   onDecryptModeChange={workbench.setDecryptMode}
                   onOpenRepeater={openInRepeater}
@@ -532,6 +568,7 @@ export function App() {
             {view === "channels" && (
               <ErrorBoundary>
                 <ChannelExplorerView
+                  key={projectPath}
                   filter={workbench.packetFilter}
                   connectionId={workbench.connectionId}
                   projectKey={projectPath}
@@ -547,11 +584,10 @@ export function App() {
             {view === "stats" && (
               <ErrorBoundary>
                 <StatsView
+                  key={projectPath}
                   project={workbench.project}
                   filter={workbench.packetFilter}
                   connectionId={workbench.connectionId}
-                  connections={workbench.connections}
-                  appendSignal={workbench.appendSignal}
                   onApplyName={applyName}
                   onApplyConnection={applyConnection}
                   onError={workbench.setError}
@@ -561,6 +597,8 @@ export function App() {
             {view === "intercept" && (
               <ErrorBoundary>
                 <InterceptView
+                  key={projectPath}
+                  onRepeater={openInRepeater}
                   settings={workbench.interceptSettings}
                   onSettingsPatch={workbench.patchInterceptSettings}
                   pendingSignal={workbench.interceptSignal}
@@ -572,6 +610,8 @@ export function App() {
             {view === "replace" && (
               <ErrorBoundary>
                 <ReplaceView
+                  key={projectPath}
+                  projectKey={projectPath}
                   seed={workbench.selectedPacket}
                   request={ruleRequest}
                   onRequestHandled={onRuleHandled}
@@ -581,7 +621,7 @@ export function App() {
             )}
             {view === "schemas" && (
               <ErrorBoundary>
-                <SchemasView onError={workbench.setError} />
+                <SchemasView key={projectPath} onError={workbench.setError} />
               </ErrorBoundary>
             )}
             {view === "instances" && (
@@ -592,6 +632,13 @@ export function App() {
             {view === "compare" && (
               <ErrorBoundary>
                 <CompareView
+                  key={projectPath}
+                  filter={workbench.packetFilter}
+                  onTraffic={(packet) => {
+                    setConnectionId(packet.connection_id);
+                    void workbench.selectPacket(packet.id);
+                    setView("traffic");
+                  }}
                   slots={compare}
                   onSwap={() => setCompare(({ a, b }) => ({ a: b, b: a }))}
                   onClear={() => setCompare({ a: null, b: null })}
@@ -608,6 +655,7 @@ export function App() {
             onError={setError}
           />
         </div>
+        <SetupPanel banner />
         {paletteOpen && <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} />}
         {logOpen && (
           <ErrorLog

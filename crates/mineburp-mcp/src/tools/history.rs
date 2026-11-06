@@ -108,9 +108,13 @@ pub fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "connections",
-            description: "Connections in the project plus live decrypted sessions (marked LIVE), busiest first. `close` ends a live session.",
+            description: "Connections in the project plus live decrypted sessions (marked LIVE), busiest first. `close` ends a live session. action=compare with a,b aligns recorded sessions; filter scopes both sides, limit bounds text differences, format=json returns rows and per-name counts.",
             schema: object(
                 &[
+                    ("action", string("list or compare")),
+                    ("a", string("connection A id")),
+                    ("b", string("connection B id")),
+                    ("filter", filter_ref()),
                     ("limit", integer("default 50")),
                     ("live", boolean("only live sessions")),
                     (
@@ -190,8 +194,11 @@ pub fn tools() -> Vec<Tool> {
     ]
 }
 
-pub async fn status(ctx: &Ctx<'_>) -> ToolResult {
+pub async fn status(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
     let host = ctx.host;
+    if args.str("format") == Some("json") {
+        return Ok(json!({"mode":host.mode(),"temporary":host.project_is_temporary(),"project":host.project().map(|store| json!({"name":store.info().name,"path":store.info().path})),"sessions":host.proxy().map(|proxy| proxy.sessions())}).to_string());
+    }
     let mut out = format!("mode: {}", host.mode());
     match host.project() {
         Some(store) => {
@@ -263,6 +270,15 @@ pub async fn status(ctx: &Ctx<'_>) -> ToolResult {
         let _ = write!(out, "\nclient assist: {summary}");
     }
     if let Some(proxy) = host.proxy() {
+        let scope = proxy.target_scope();
+        if !scope.is_empty() {
+            let _ = write!(
+                out,
+                "\ntarget scope: {} ({} out-of-scope routes refused; the agent connected those directly)",
+                scope.join(", "),
+                proxy.out_of_scope_refusals()
+            );
+        }
         let sessions = proxy.sessions();
         let _ = write!(out, "\nlive sessions: {}", sessions.len());
         for session in sessions.iter().take(8) {
@@ -368,6 +384,9 @@ pub async fn packets(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
         });
     }
     // The store returns newest first; read oldest → newest.
+    if args.str("format") == Some("json") {
+        return serde_json::to_string(&rows).map_err(|error| error.to_string());
+    }
     let mut rows = rows;
     rows.reverse();
     let connections: std::collections::HashSet<Uuid> =
@@ -461,6 +480,9 @@ pub async fn packet(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
     })
     .await?;
     let window = window.ok_or_else(|| format!("packet #{id} does not exist"))?;
+    if args.str("format") == Some("json") {
+        return Ok(json!({"summary":window.summary,"annotation":annotation,"hex":hex::encode(&window.bytes),"offset":window.offset,"total_bytes":window.total_bytes}).to_string());
+    }
     let summary = &window.summary;
     let mut out = render::packet_line(summary, true);
     let _ = write!(
@@ -600,6 +622,52 @@ pub fn annotation_line(annotation: &PacketAnnotation) -> String {
 }
 
 pub async fn connections(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
+    if args.str("action") == Some("compare") {
+        let a = ctx
+            .resolve_connection(args.str("a").ok_or("a is required")?)
+            .await?;
+        let b = ctx
+            .resolve_connection(args.str("b").ok_or("b is required")?)
+            .await?;
+        let filter = args
+            .0
+            .get("filter")
+            .map(|v| v.as_object().ok_or("filter must be an object"))
+            .transpose()?
+            .cloned()
+            .unwrap_or_default();
+        let query = ctx.query(&filter, 500).await?;
+        let store = ctx.project()?;
+        let result =
+            super::blocking(move || crate::ops::compare_connections(&store, a, b, &query)).await?;
+        if args.str("format") == Some("json") {
+            return serde_json::to_string(&result).map_err(|e| e.to_string());
+        }
+        let mut out = format!(
+            "{} aligned rows, {} differences",
+            result.rows.len(),
+            result.rows.iter().filter(|r| r.kind != "identical").count()
+        );
+        for row in result
+            .rows
+            .iter()
+            .filter(|r| r.kind != "identical")
+            .take(args.usize("limit").unwrap_or(20).min(100))
+        {
+            use std::fmt::Write as _;
+            let _ = write!(
+                out,
+                "\n{} A={:?} B={:?} delta={} offset={:?}",
+                row.kind,
+                row.a.as_ref().map(|p| p.id),
+                row.b.as_ref().map(|p| p.id),
+                row.size_delta,
+                row.first_difference
+            );
+        }
+        return Ok(out);
+    }
+
     if let Some(close) = args.str("close") {
         let id = ctx.resolve_connection(close).await?;
         ctx.proxy()?
@@ -615,6 +683,10 @@ pub async fn connections(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
         .into_iter()
         .filter(|(_, live)| !live_only || *live)
         .collect();
+    if args.str("format") == Some("json") {
+        return serde_json::to_string(&rows[..rows.len().min(limit)])
+            .map_err(|error| error.to_string());
+    }
     if rows.is_empty() {
         return Ok(if live_only {
             "no live sessions".into()
@@ -657,6 +729,9 @@ pub async fn stats(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
             .map_err(|error| error.to_string())
     })
     .await?;
+    if args.str("format") == Some("json") {
+        return serde_json::to_string(&stats).map_err(|error| error.to_string());
+    }
     if stats.total_packets == 0 {
         return Ok("no packets match".into());
     }

@@ -1,5 +1,8 @@
 # Client assistance
 
+
+Use **Setup** in Instances or the command palette to diagnose prerequisites. Stale instance arguments show **Reconfigure**; restart the client after updating them. Traffic warns while Decrypt is enabled with no connected agent, since the client can connect directly without inspection.
+
 Automatic traffic capture does not require Microsoft login, an Entra application, or a Java agent. Client assistance becomes necessary when the opt-in **Decrypt connections** mode terminates an online-mode Minecraft connection. Minecraft continues to authenticate through its normal launcher. A small Java agent observes Authlib's existing session join and can ask that same in-process Authlib service to join a different upstream server hash.
 
 This works for vanilla and for Fabric, Quilt, Forge, and NeoForge because authentication reaches the same Authlib boundary before loader-specific login and plugin-channel traffic begins.
@@ -75,3 +78,16 @@ The Java agent is fail-open: any instrumentation, configuration, or broker error
 ## Optional direct OAuth
 
 A distributor with its own approved public-client registration may compile with `MINEBURP_MICROSOFT_CLIENT_ID`. That enables an advanced direct sign-in panel and injects `mineburp-auth` as the same `SessionJoinProvider` contract. No client secret is used or bundled. This is optional and is not required for vanilla or modded clients using launcher assistance.
+
+The desktop copies its bundled agent to
+`app_data_dir/agent/mineburp-agent-<sha256-prefix>.jar` before generating launcher
+arguments. This path survives AppImage unmounts and changes only when the agent
+bytes change. Instance descriptors expose `client_assist_stale` when the stored
+argument differs from the current argument; configuring the instance again
+replaces arguments recorded in MineBurp's managed state.
+
+Prism and MultiMC require `OverrideJavaArgs=true`. When enabling an instance
+that used global JVM arguments, MineBurp copies those arguments into the
+instance before appending its agent. Removal restores the original override
+flag and instance arguments, including absent keys. Official profiles without
+`javaArgs` receive the launcher's default JVM flags; removal deletes that key.

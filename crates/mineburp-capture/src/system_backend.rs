@@ -44,7 +44,7 @@ struct Inner {
     /// The running capture, if any. Held for the whole of `start` and `stop`
     /// so two concurrent starts cannot both launch dumpcap.
     running: Mutex<Option<Running>>,
-    probe: Mutex<Option<(Instant, bool)>>,
+    probe: Mutex<Option<(Instant, crate::setup::DumpcapCheck)>>,
 }
 
 #[derive(Debug)]
@@ -91,7 +91,8 @@ impl Default for SystemCapture {
 #[async_trait]
 impl SideCapture for SystemCapture {
     fn capabilities(&self) -> CaptureCapabilities {
-        let dumpcap = self.inner.dumpcap_available();
+        let probe = self.inner.dumpcap_probe();
+        let dumpcap = probe == crate::setup::DumpcapCheck::Ready;
         let attribution = MinecraftFlowFilter::supported();
         let available = dumpcap && attribution;
         CaptureCapabilities {
@@ -105,10 +106,7 @@ impl SideCapture for SystemCapture {
                         .into(),
                 )
             } else if !dumpcap {
-                Some(
-                    "dumpcap is unavailable or cannot enumerate capture interfaces; install Wireshark/dumpcap and grant capture permission"
-                        .into(),
-                )
+                probe.reason().map(str::to_owned)
             } else {
                 None
             },
@@ -147,21 +145,19 @@ impl SideCapture for SystemCapture {
 
 impl Inner {
     fn dumpcap_available(&self) -> bool {
+        self.dumpcap_probe() == crate::setup::DumpcapCheck::Ready
+    }
+
+    fn dumpcap_probe(&self) -> crate::setup::DumpcapCheck {
         let mut probe = self.probe.lock();
-        if let Some((at, available)) = *probe
+        if let Some((at, result)) = *probe
             && at.elapsed() < PROBE_TTL
         {
-            return available;
+            return result;
         }
-        let available = Command::new("dumpcap")
-            .arg("-D")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        *probe = Some((Instant::now(), available));
-        available
+        let result = crate::setup::probe_dumpcap();
+        *probe = Some((Instant::now(), result));
+        result
     }
 
     fn start(self: &Arc<Self>) -> Result<(), CaptureError> {

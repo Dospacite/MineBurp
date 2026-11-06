@@ -14,6 +14,7 @@
 //! normalisation is an empty list's element type, which the text cannot
 //! carry and the game ignores.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 const MAX_DEPTH: usize = 64;
@@ -104,11 +105,41 @@ fn write_root(root: &Root) -> Result<Vec<u8>, String> {
 /// name is written as a `"name": value` prefix. A lone `TAG_End` (an absent
 /// optional value) renders as empty text. Returns `None` when the bytes are
 /// not exactly one NBT value or would not survive the round trip.
+fn text_work(tag: &Tag, budget: &mut usize) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
+    match tag {
+        Tag::List(items) => {
+            let entries: usize = items
+                .iter()
+                .map(|item| match item {
+                    Tag::Compound(entries) => entries.len(),
+                    _ => 0,
+                })
+                .sum();
+            *budget = budget.checked_sub(entries.saturating_mul(items.len()))?;
+            for item in items {
+                text_work(item, budget)?;
+            }
+        }
+        Tag::Compound(entries) => {
+            for (_, value) in entries {
+                text_work(value, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
 pub(crate) fn to_text(bytes: &[u8], named: bool) -> Option<String> {
+    if bytes.len() > 262_144 {
+        return None;
+    }
     let root = read_root(bytes, named)?;
     let Some(value) = &root.value else {
         return Some(String::new());
     };
+    text_work(value, &mut 100_000)?;
     let mut text = String::new();
     if let Some(name) = root.name.as_deref().filter(|name| !name.is_empty()) {
         write_quoted(&mut text, name);
@@ -127,6 +158,9 @@ pub(crate) fn from_text(
     named: bool,
     original: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
+    if text.len() > 1_048_576 {
+        return Err("NBT text budget exceeded".into());
+    }
     let template = original.and_then(|bytes| read_root(bytes, named));
     let mut parser = Parser { text, position: 0 };
     parser.whitespace();
@@ -692,6 +726,7 @@ impl Parser<'_> {
     fn compound(&mut self, depth: usize) -> Result<Loose, String> {
         self.position += 1;
         let mut entries: Vec<(String, Loose)> = Vec::new();
+        let mut names = HashSet::new();
         loop {
             self.whitespace();
             if self.peek() == Some('}') {
@@ -707,7 +742,7 @@ impl Parser<'_> {
                 }
                 token
             };
-            if entries.iter().any(|(existing, _)| *existing == key) {
+            if !names.insert(key.clone()) {
                 return Err(self.error(&format!("key `{key}` appears twice")));
             }
             self.expect(':')?;
@@ -783,7 +818,7 @@ fn bare_value(token: &str) -> Result<Loose, String> {
     if let Some(suffix) = token.chars().last()
         && token.len() > 1
     {
-        let body = &token[..token.len() - 1];
+        let body = &token[..token.len() - suffix.len_utf8()];
         if numeric(body) || special(body).is_some() {
             let tag = match suffix.to_ascii_lowercase() {
                 'b' => Some(
@@ -927,12 +962,13 @@ fn inferred_element(items: &[Loose]) -> Option<Tag> {
 /// Every key the compounds of a list hold, typed by the first that has it.
 fn sibling_keys(items: &[Tag]) -> Option<Tag> {
     let mut keys: Vec<(String, Tag)> = Vec::new();
+    let mut names = HashSet::new();
     for item in items {
         let Tag::Compound(entries) = item else {
             return None;
         };
         for (key, value) in entries {
-            if !keys.iter().any(|(name, _)| name == key) {
+            if names.insert(key.clone()) {
                 keys.push((key.clone(), value.clone()));
             }
         }
@@ -966,13 +1002,11 @@ fn resolve(loose: Loose, template: Option<&Tag>) -> Result<Tag, String> {
                 Some(Tag::Compound(entries)) => entries.as_slice(),
                 _ => &[],
             };
+            let known: HashMap<_, _> = known.iter().map(|(k, v)| (k.as_str(), v)).collect();
             entries
                 .into_iter()
                 .map(|(key, value)| {
-                    let template = known
-                        .iter()
-                        .find(|(name, _)| *name == key)
-                        .map(|(_, value)| value);
+                    let template = known.get(key.as_str()).copied();
                     let value = resolve(value, template)
                         .map_err(|error| format!("{error} (in `{key}`)"))?;
                     Ok((key, value))
@@ -984,6 +1018,10 @@ fn resolve(loose: Loose, template: Option<&Tag>) -> Result<Tag, String> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "list template selection and homogeneous array conversion"
+)]
 fn resolve_list(items: Vec<Loose>, template: Option<&Tag>) -> Result<Tag, String> {
     let originals = match template {
         Some(Tag::List(values)) => values.as_slice(),
@@ -1002,26 +1040,41 @@ fn resolve_list(items: Vec<Loose>, template: Option<&Tag>) -> Result<Tag, String
     // typed by the item it replaces, and a key that item lacks by the first
     // sibling that has it, so `"bold": 0` stays a byte wherever it is added.
     let siblings = sibling_keys(originals);
+    let shared: HashMap<&str, &Tag> = match &siblings {
+        Some(Tag::Compound(entries)) => entries.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        _ => HashMap::new(),
+    };
+    // Bound template expansion before allocating per-item indexes.
+    if shared.len().saturating_mul(items.len()) > 100_000 {
+        return Err("NBT template work budget exceeded".into());
+    }
     let values: Vec<Tag> = items
         .into_iter()
         .enumerate()
         .map(|(index, item)| {
             let own = originals.get(index).or(element.as_ref());
-            let merged = match (own, &siblings) {
-                (Some(Tag::Compound(entries)), Some(Tag::Compound(shared))) => {
-                    let mut entries = entries.clone();
-                    for (key, value) in shared {
-                        if !entries.iter().any(|(name, _)| name == key) {
-                            entries.push((key.clone(), value.clone()));
-                        }
+            if let Loose::Compound(entries) = item {
+                let own: HashMap<&str, &Tag> = match own {
+                    Some(Tag::Compound(entries)) => {
+                        entries.iter().map(|(k, v)| (k.as_str(), v)).collect()
                     }
-                    Some(Tag::Compound(entries))
-                }
-                (None, Some(shared)) => Some(shared.clone()),
-                _ => None,
-            };
-            resolve(item, merged.as_ref().or(own))
-                .map_err(|error| format!("{error} (in item {index})"))
+                    _ => HashMap::new(),
+                };
+                entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let template = own
+                            .get(key.as_str())
+                            .or_else(|| shared.get(key.as_str()))
+                            .copied();
+                        Ok((key, resolve(value, template)?))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .map(Tag::Compound)
+            } else {
+                resolve(item, own)
+            }
+            .map_err(|error| format!("{error} (in item {index})"))
         })
         .collect::<Result<_, _>>()?;
     let wanted = match template {
@@ -1084,6 +1137,20 @@ fn resolve_list(items: Vec<Loose>, template: Option<&Tag>) -> Result<Tag, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hostile_sibling_templates_have_bounded_work() {
+        let items = (0..20_000)
+            .map(|i| Tag::Compound(vec![(format!("k{i}"), Tag::Byte(1))]))
+            .collect();
+        let bytes = write_root(&Root {
+            name: None,
+            value: Some(Tag::Compound(vec![("x".into(), Tag::List(items))])),
+        })
+        .unwrap();
+        let start = std::time::Instant::now();
+        assert!(to_text(&bytes, false).is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     fn compound(entries: &[(&str, Tag)]) -> Vec<u8> {
         let mut bytes = vec![10];

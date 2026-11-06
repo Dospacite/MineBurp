@@ -18,6 +18,10 @@ const MAX_REGISTRY_SCAN: i64 = 200_000;
 pub fn tools() -> Vec<Tool> {
     let frame_properties = || {
         vec![
+            (
+                "hex_limit",
+                super::integer("maximum output bytes, default 512, maximum 65536"),
+            ),
             ("hex", string("logical frame hex: packet-id VarInt + body")),
             (
                 "packet",
@@ -178,9 +182,11 @@ pub async fn rewrite(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
     if edits.is_empty() {
         return Err("give `edits` or `set`".into());
     }
+    let hex_limit = args.usize("hex_limit").unwrap_or(512).min(65536);
     let with_fields = args.flag("fields");
     blocking(move || {
         let rewritten = apply(&frame, &edits)?;
+        let changes = render::changed_ranges(&frame.bytes, &rewritten);
         let before = frame.bytes.len();
         let after = Frame {
             bytes: rewritten,
@@ -190,8 +196,9 @@ pub async fn rewrite(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
             "{} edit(s): {before}B → {}B\nhex: {}\n",
             edits.len(),
             after.bytes.len(),
-            render::hex(&after.bytes, 0, false)
+            render::capped_hex(&after.bytes, hex_limit)
         );
+        out.push_str(&changes);
         out.push_str(&describe(
             &after,
             TreeLimits::default(),

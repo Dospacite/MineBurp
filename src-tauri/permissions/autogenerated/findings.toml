@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-findings"
+description = "Enables the findings command without any pre-configured scope."
+commands.allow = ["findings"]
+
+[[permission]]
+identifier = "deny-findings"
+description = "Denies the findings command without any pre-configured scope."
+commands.deny = ["findings"]

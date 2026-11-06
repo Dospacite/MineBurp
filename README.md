@@ -6,6 +6,8 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 
 ## What is implemented
 
+- **Findings**: severity/status tracking, Markdown descriptions and reproduction steps, evidence links, tags, and Markdown/HTML reports.
+
 - **Minecraft Decoder** in a right sidebar, **Channel explorer** across the filtered capture, Ctrl/Cmd+K **command palette**, packet selection actions, bounded payload generators, Repeater undo/redo and named revisions, custom decoded-field history columns, and traffic presets. Intruder and Sequencer work saves in the project. See [workbench tools](docs/WORKBENCH.md).
 - **Automatic blockers** in Replace: enabled drop rules discard matched decoded packets before rewriting and Intercept, record the original as `dropped`, and do not advance protocol state.
 
@@ -33,7 +35,7 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 - **Traffic statistics** for any filter: packets and bytes per direction over time, the busiest packet names by count and by bytes, the busiest connections, and a size histogram.
 - **pcapng export and import**. Export writes decrypted packets as one synthetic TCP stream per connection, with each packet named in a comment, and `tools/wireshark/mineburp.lua` dissects it in Wireshark. Import reads pcap or pcapng files into a project through the same reassembly as live capture, then splits each TCP stream into Minecraft packets — one row per packet with its state, id and name — following the handshake, compression, login and configuration the way the proxy does. Encrypted traffic (after an online-mode login) cannot be decrypted from a capture and is kept as labelled raw rows; a capture that starts mid-connection is synchronised by searching for frame boundaries, optionally with a protocol version you give it. Re-importing a MineBurp pcapng export restores the packets, states and names it was written with.
 - History maintenance: delete the packets a filter matches and compact the project file.
-- **MCP server** (`mineburp-mcp`): 19 context-efficient tools that let an MCP client such as Claude Code query and decode history, rewrite frames, manage rules, and drive Intercept and the Repeater. It bridges to the running app over a private Unix socket, or works directly on a `.mineburp` file when the app is closed. See [docs/MCP.md](docs/MCP.md).
+- **MCP server** (`mineburp-mcp`): 20 context-efficient tools that let an MCP client such as Claude Code query and decode history, rewrite frames, manage rules, and drive Intercept and the Repeater. It bridges to the running app over a private Unix socket, or works directly on a `.mineburp` file when the app is closed. See [docs/MCP.md](docs/MCP.md).
 - Advanced packet filtering: traffic source, direction, protocol phase, and result sets; packet-name show/hide lists; payload size bounds; free-text search with regex, case-sensitive, and negative options; a filter expression language (`state == play && size > 256 && name ~ chat`) shared with replace rules; and payload content search by literal text, hex byte sequence, or regular expression, scoped to packets that contain the term, are exactly it, start with it, or end with it — each of which can be negated. A content search takes one term per line and matches any of them, and a hex term may be an inclusive range (`0c-0f`, `0100-01ff`), so hiding a handful of frames is one filter rather than one per frame. All of it runs in SQLite against the whole capture, not against the rows on screen.
 
 ## Repository layout
@@ -130,16 +132,49 @@ with what it reads as instead, rather than renamed.
 
 ## First run
 
+Open **Setup** from Instances or the command palette to check capture permissions, procfs, the agent JAR, broker, launcher configuration, and connected agents. A banner appears while required checks fail. Checks enumerate interfaces without starting capture and time out after two seconds.
+
+
+### Passive observation
+
 1. Start MineBurp. The **Traffic** view starts system capture automatically and records into a temporary project, so nothing is lost before you decide where to keep it.
 2. Choose **Save as** in the project menu to keep the session: it copies everything captured so far into a `.mineburp` file (with an optional passphrase) and keeps recording there. The temporary project is deleted on exit.
 3. Launch Minecraft from its normal launcher or from **Instances**, then connect to any server normally.
 4. Pick a connection in **Traffic** and select a packet to inspect its endpoints, decoded fields, and payload bytes. No MineBurp listener, target, PID, Java agent, or Microsoft sign-in is required.
 
-Passive observation cannot modify a connection, and encrypted application payloads remain encrypted. To inspect an encrypted Minecraft connection, configure client assistance for the instance in **Instances**, enable **Decrypt connections** in **Traffic**, then launch the instance and connect normally. MineBurp keeps this mode off by default. It routes only connections initiated through Minecraft's own network stack and fails open to the original target if the agent or broker is unavailable.
+Passive observation cannot modify a connection, and encrypted application payloads remain encrypted.
+
+### Active testing with decryption
+
+1. Save a project for your authorized assessment.
+2. Configure client assistance for the instance in **Instances**.
+3. Enable **Decrypt connections** in **Traffic**, launch that instance, and connect to your authorized server normally.
+4. Find a plugin channel, hold a matching packet in **Intercept**, then edit or send it to **Repeater**. Follow the [active testing tutorial](docs/TUTORIAL.md) for a disposable lab example.
+
+MineBurp keeps this mode off by default. It routes only connections initiated through Minecraft's own network stack and fails open to the original target if the agent or broker is unavailable.
 
 Decrypt mode uses an authenticated client-side route adapter instead of silently changing host `nftables`/TUN rules or requiring the desktop app to run as root. Separate TLS traffic from mods and launchers remains outside that route; modern signed chat and integrity-sensitive mod/plugin packets are marked as unsafe to alter in the inspector.
 
 See [docs/CLIENT_ASSISTANCE.md](docs/CLIENT_ASSISTANCE.md) for launcher-specific setup, the local protocol, and its security boundary.
+
+### Recovery, target scope, and lab listeners
+
+The project menu lists recovered sessions after an interrupted run, with packet
+counts and modification dates. Open one, save a copy with Save as, or delete it
+with confirmation. Recovery files stay in the private application data directory.
+
+Use Authorized target scope in the project menu to allow exact hosts,
+`*.example.com` subdomains, or IPv4/IPv6 CIDRs, optionally restricted to a port.
+Use brackets around IPv6 patterns when specifying a port. Empty scope preserves
+unrestricted behavior. Outside-scope agent connections continue directly;
+Repeater, Intercept and replacement rules skip those connections. Traffic
+marks connections outside scope and counts refused agent routes under the
+Decrypt switch.
+
+Traffic's Lab listener panel creates a loopback address for a headless offline
+lab client without a Java agent. Stay armed accepts repeated connections until
+stopped or idle for 60 seconds, with at most eight concurrent clients. Scope
+applies to the configured target.
 
 ## Optional direct Microsoft login
 

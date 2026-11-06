@@ -36,6 +36,7 @@ import { ColumnSettings } from "./ColumnSettings";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { ConversationList } from "./ConversationList";
 import { EmptyState } from "./EmptyState";
+import { addToFinding } from "./FindingPicker";
 import { GoToPacketDialog } from "./GoToPacketDialog";
 import { PacketFilterBar } from "./PacketFilterBar";
 import { COPY_LIMIT, type CopyFormat, renderCopy } from "./PacketInspector";
@@ -526,6 +527,13 @@ export function PacketHistory({
     [applyWindow, fail, onError, onNotice, onSelect, project, queueReveal],
   );
 
+  useEffect(() => {
+    const jump = (event: Event) => {
+      void goToPacket((event as CustomEvent<number>).detail);
+    };
+    window.addEventListener("finding-packet", jump);
+    return () => window.removeEventListener("finding-packet", jump);
+  }, [goToPacket]);
   /** Leaves a jumped-to window for the live end of the history. */
   const backToLive = useCallback(() => {
     setDetached(false);
@@ -551,8 +559,9 @@ export function PacketHistory({
   // Annotations are fetched for loaded rows only, in batches, and cached.
   useEffect(() => {
     if (packets.length === 0 || !desktop.isAvailable()) return;
+    void annotations;
     annotationStore.ensure(packets.map((packet) => packet.id)).catch(fail);
-  }, [fail, packets]);
+  }, [fail, packets, annotations]);
 
   // A different project's timestamps are a different clock.
   useEffect(() => {
@@ -666,6 +675,7 @@ export function PacketHistory({
           icon: <Send size={13} />,
           onSelect: () => actions.sendToRepeater(packet.id),
         },
+        { label: t("findings.add"), onSelect: () => addToFinding([{ kind: "packet", id: packet.id }]) },
         ...(actions.sendToIntruder
           ? [{ label: t("menu.intruder"), onSelect: () => actions.sendToIntruder?.(packet.id) }]
           : []),
@@ -777,31 +787,45 @@ export function PacketHistory({
     return items;
   }
 
-  if (!project) {
-    return <EmptyState title={t("traffic.no-project.title")} detail={t("history.no-project.detail")} />;
-  }
-
-  const footer = (
-    <div className="history-footer">
-      <button type="button" className="button" disabled={!hasMore || loading} onClick={() => void loadMore()}>
-        {oldestFirst
-          ? hasMore
-            ? t("history.load-newer")
-            : t("history.end-of-history")
-          : hasMore
-            ? t("history.load-older")
-            : t("history.start-of-history")}
-      </button>
-    </div>
+  const footer = useMemo(
+    () => (
+      <div className="history-footer">
+        <button
+          type="button"
+          className="button"
+          disabled={!hasMore || loading}
+          onClick={() => void loadMore()}
+        >
+          {oldestFirst
+            ? hasMore
+              ? t("history.load-newer")
+              : t("history.end-of-history")
+            : hasMore
+              ? t("history.load-older")
+              : t("history.start-of-history")}
+        </button>
+      </div>
+    ),
+    [hasMore, loading, loadMore, oldestFirst],
   );
   // Scrolling away from the newest row pauses following, so reading older
   // traffic is never interrupted by arriving packets.
   // Oldest first, new rows land below the operator and never move what they
   // are reading, so there is nothing to pause.
-  const onScrollStateChange = (atTop: boolean) => {
-    if (!oldestFirst && !atTop && followingRef.current) setFollowing(false);
-  };
-  const toggleOrder = () => updateSettings({ ...settings, oldestFirst: !oldestFirst });
+  const onScrollStateChange = useCallback(
+    (atTop: boolean) => {
+      if (!oldestFirst && !atTop && followingRef.current) setFollowing(false);
+    },
+    [oldestFirst],
+  );
+  const toggleOrder = useCallback(
+    () => updateSettings({ ...settings, oldestFirst: !oldestFirst }),
+    [updateSettings, settings, oldestFirst],
+  );
+
+  if (!project) {
+    return <EmptyState title={t("traffic.no-project.title")} detail={t("history.no-project.detail")} />;
+  }
 
   return (
     <section className="packet-history" aria-label={t("history.title")} ref={section}>

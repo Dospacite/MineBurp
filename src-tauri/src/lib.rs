@@ -2,6 +2,7 @@ mod capture_project;
 mod commands;
 #[cfg(all(feature = "desktop-runtime", unix))]
 mod mcp;
+mod setup;
 mod state;
 
 #[cfg(feature = "desktop-runtime")]
@@ -19,6 +20,10 @@ use tauri::{Emitter, Manager};
 const LIVE_FLUSH: Duration = Duration::from_millis(140);
 
 #[cfg(feature = "desktop-runtime")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "most of the body is the generate_handler! command list"
+)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -27,6 +32,7 @@ pub fn run() {
             commands::replacement_rule_preview,
             commands::payload_generate,
             commands::decoder_transform,
+            commands::findings,
             commands::workbench_document_get,
             commands::workbench_document_save,
             commands::channel_stats,
@@ -34,6 +40,7 @@ pub fn run() {
             commands::intruder_plan,
             commands::sequencer_analyze,
             commands::app_capabilities,
+            commands::setup_check,
             commands::decrypt_mode_status,
             commands::decrypt_mode_set,
             commands::capture_start,
@@ -43,8 +50,17 @@ pub fn run() {
             commands::project_open,
             commands::project_save_as,
             commands::project_current,
+            commands::lab_listener_active,
+            commands::lab_listener_stop,
+            commands::lab_listener_start,
+            commands::project_scope_set,
+            commands::project_scope_get,
+            commands::project_recovered_save_as,
+            commands::project_recovered_delete,
+            commands::project_recovered_list,
             commands::project_checkpoint,
             commands::connections_query,
+            commands::connections_compare,
             commands::packets_query,
             commands::packets_export,
             commands::packets_export_pcapng,
@@ -103,9 +119,17 @@ pub fn run() {
             // directory with abandoned captures.
             #[cfg(unix)]
             mcp::stop();
-            handle
-                .state::<state::DesktopState>()
-                .discard_temporary_project();
+            let state = handle.state::<state::DesktopState>();
+            // Windows refuses to delete a file any handle still holds, so the
+            // capture writer and live sessions stop before the project closes.
+            let capture = state.capture.clone();
+            let _ = tauri::async_runtime::block_on(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), capture.stop()).await
+            });
+            for session in state.proxy.sessions() {
+                let _ = state.proxy.stop_session(session.id);
+            }
+            state.discard_temporary_project();
         }
     });
 }
@@ -124,6 +148,34 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         bundled_agent
     } else {
         development_agent
+    };
+    let agent_path = if agent_path.is_file() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        let bytes = std::fs::read(&agent_path)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let directory = app.path().app_data_dir()?.join("agent");
+        std::fs::create_dir_all(&directory)?;
+        let destination = directory.join(format!("mineburp-agent-{}.jar", &digest[..16]));
+        if !destination.is_file() || std::fs::read(&destination)? != bytes {
+            let temporary = directory.join(format!(".agent-{}.tmp", uuid::Uuid::new_v4()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+            }
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &destination)?;
+        }
+        destination
+    } else {
+        agent_path
     };
     let agent_config_path = app
         .path()

@@ -20,6 +20,7 @@ cursors; `after` with `wait_ms` waits for new traffic.";
 /// One MCP server bound to one host.
 pub struct McpServer {
     host: Arc<dyn Host>,
+    socket: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -27,13 +28,20 @@ impl std::fmt::Debug for McpServer {
         formatter
             .debug_struct("McpServer")
             .field("mode", &self.host.mode())
+            .field("socket", &self.socket)
             .finish()
     }
 }
 
 impl McpServer {
     pub fn new(host: Arc<dyn Host>) -> Self {
-        Self { host }
+        Self { host, socket: None }
+    }
+
+    #[must_use]
+    pub fn with_socket(mut self, path: std::path::PathBuf) -> Self {
+        self.socket = Some(path);
+        self
     }
 
     pub fn instructions(&self) -> String {
@@ -73,7 +81,43 @@ impl McpServer {
     }
 
     /// Runs one tool and wraps its text as an MCP tool result.
-    pub async fn call(&self, name: &str, arguments: Value) -> Value {
+    pub async fn call(&self, name: &str, mut arguments: Value) -> Value {
+        if let Some(variable) = arguments.get("passphrase_env").and_then(Value::as_str) {
+            match std::env::var(variable) {
+                Ok(value) => {
+                    arguments
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("passphrase".into(), Value::String(value));
+                    arguments.as_object_mut().unwrap().remove("passphrase_env");
+                }
+                Err(_) => {
+                    return json!({"content":[{"type":"text","text":format!("environment variable `{variable}` is not set")}],"isError":true});
+                }
+            }
+        }
+        #[cfg(unix)]
+        if let Some(path) = &self.socket {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+            if let Ok(mut stream) = tokio::net::UnixStream::connect(path).await {
+                let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+                let mut bytes = serde_json::to_vec(&request).unwrap();
+                bytes.push(b'\n');
+                // Once submitted, never replay a possibly destructive call offline.
+                let response = async {
+                    stream.write_all(&bytes).await?;
+                    let mut line = String::new();
+                    BufReader::new(stream)
+                        .take(16 * 1024 * 1024)
+                        .read_line(&mut line)
+                        .await?;
+                    let value: Value = serde_json::from_str(&line)?;
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(value["result"].clone())
+                }
+                .await;
+                return response.unwrap_or_else(|error| json!({"content":[{"type":"text","text":format!("desktop connection failed: {error}; call outcome unknown")}],"isError":true}));
+            }
+        }
         let result = tools::dispatch(self.host.as_ref(), name, arguments).await;
         let (text, is_error) = match result {
             Ok(text) => (text, false),

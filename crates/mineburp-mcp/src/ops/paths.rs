@@ -20,6 +20,8 @@ pub enum PathPurpose {
     ExistingProject,
     /// A JSON export, created or replaced.
     ExportJson,
+    ExportMarkdown,
+    ExportHtml,
     /// A pcapng export, created or replaced.
     ExportPcap,
     /// A pcap or pcapng file to read.
@@ -31,6 +33,8 @@ impl PathPurpose {
         match self {
             Self::NewProject | Self::ExistingProject => &["mineburp"],
             Self::ExportJson => &["json"],
+            Self::ExportMarkdown => &["md"],
+            Self::ExportHtml => &["html"],
             Self::ExportPcap => &["pcapng"],
             Self::ImportCapture => &["pcap", "pcapng", "cap", "dmp"],
         }
@@ -40,6 +44,8 @@ impl PathPurpose {
         match self {
             Self::NewProject | Self::ExistingProject => "a MineBurp project (.mineburp)",
             Self::ExportJson => "a JSON file (.json)",
+            Self::ExportMarkdown => "a Markdown file (.md)",
+            Self::ExportHtml => "an HTML file (.html)",
             Self::ExportPcap => "a pcapng file (.pcapng)",
             Self::ImportCapture => "a capture file (.pcap or .pcapng)",
         }
@@ -76,11 +82,20 @@ pub fn validate_path(
                 return Err(format!("{} is not a file", path.display()));
             }
         }
-        PathPurpose::NewProject | PathPurpose::ExportJson | PathPurpose::ExportPcap => {
+        PathPurpose::NewProject
+        | PathPurpose::ExportJson
+        | PathPurpose::ExportPcap
+        | PathPurpose::ExportMarkdown
+        | PathPurpose::ExportHtml => {
             let parent = path
                 .parent()
                 .filter(|parent| parent.is_dir())
                 .ok_or_else(|| "the destination folder does not exist".to_owned())?;
+            if std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err("destination must not be a symbolic link".into());
+            }
             if path.is_dir() {
                 return Err(format!("{} is a folder", path.display()));
             }

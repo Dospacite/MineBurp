@@ -150,6 +150,8 @@ pub enum ProxyError {
     NetworkConditions(#[from] NetworkConditionsError),
     #[error("too many private routes were requested; try again shortly")]
     RouteLimit,
+    #[error("target is outside the authorized project scope")]
+    OutOfScope,
 }
 
 /// A replacement rule with its selector already parsed.
@@ -264,12 +266,15 @@ struct HoldIo<'a> {
     /// Frames read behind a held frame, processed in order once it is decided.
     pending: &'a mut VecDeque<PacketFrame>,
     pending_bytes: usize,
+    classification_blocked: bool,
     closed: bool,
 }
 
 impl HoldIo<'_> {
     fn can_read(&self) -> bool {
-        !self.closed && self.pending_bytes + self.buffer.len() < HELD_BACKLOG_BYTES
+        !self.closed
+            && !self.classification_blocked
+            && self.pending_bytes + self.buffer.len() < HELD_BACKLOG_BYTES
     }
 
     async fn read_more(&mut self) -> Result<(), ProxyError> {
@@ -372,7 +377,11 @@ fn is_state_transition(
     packet_id: Option<i32>,
     protocol: Option<i32>,
 ) -> bool {
-    transition_name(state, direction, packet_id, protocol).is_some()
+    matches!((state, direction, packet_id),
+        (ProtocolState::Login, Direction::ServerToClient, Some(2)) if protocol.is_some_and(|p| p < 764))
+        || matches!((state, direction, packet_id),
+        (ProtocolState::Login, Direction::ClientToServer, Some(3)) if protocol.is_some_and(|p| p >= 764))
+        || transition_name(state, direction, packet_id, protocol).is_some()
 }
 
 /// A held frame after which buffered bytes need a different decoder.
@@ -395,6 +404,10 @@ fn changes_stream_encoding(
 
 #[derive(Debug, Clone)]
 pub struct ProxyService {
+    labs: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
+    lab_clients: Arc<Semaphore>,
+    scope: Arc<RwLock<Vec<String>>>,
+    out_of_scope_refusals: Arc<AtomicU64>,
     registry: Arc<PacketRegistry>,
     project: Arc<RwLock<Option<ProjectStore>>>,
     sessions: Arc<RwLock<HashMap<ConnectionId, SessionHandle>>>,
@@ -425,10 +438,17 @@ impl ProxyService {
             project: Arc::clone(&project),
             events: events.clone(),
             pending: Mutex::new(Vec::new()),
+            lifecycle: Mutex::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
+            wake: tokio::sync::Notify::new(),
             dirty: Mutex::new(HashMap::new()),
             flusher_started: AtomicBool::new(false),
         });
         let service = Self {
+            labs: Arc::new(Mutex::new(HashMap::new())),
+            lab_clients: Arc::new(Semaphore::new(8)),
+            scope: Arc::new(RwLock::new(Vec::new())),
+            out_of_scope_refusals: Arc::new(AtomicU64::new(0)),
             registry: Arc::new(PacketRegistry::bundled()),
             project,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -446,8 +466,7 @@ impl ProxyService {
         service
     }
 
-    /// Starts the timer that commits batches which have not reached
-    /// [`INSERT_BATCH_LIMIT`].
+    /// Starts the worker that commits bounded batches on notification or a timer.
     ///
     /// Construction can happen outside a Tokio runtime, notably in Tauri's
     /// synchronous setup callback. Such callers must invoke this once from
@@ -471,6 +490,7 @@ impl ProxyService {
                 let Some(queue) = ticker_queue.upgrade() else {
                     break;
                 };
+                tokio::select! { () = queue.wake.notified() => {}, _ = ticker.tick() => {} }
                 queue.flush().await;
             }
         });
@@ -491,7 +511,116 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Loopback-only lab entry point, backed by the same one-use session plumbing.
+    pub async fn start_lab_listener(
+        &self,
+        target: Target,
+        stay_armed: bool,
+    ) -> Result<(Uuid, String), ProxyError> {
+        self.start_lab_with_timeout(target, stay_armed, Duration::from_mins(1))
+            .await
+    }
+
+    async fn start_lab_with_timeout(
+        &self,
+        target: Target,
+        stay_armed: bool,
+        idle: Duration,
+    ) -> Result<(Uuid, String), ProxyError> {
+        if !self.target_in_scope(&target) {
+            return Err(ProxyError::OutOfScope);
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?.to_string();
+        let id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        {
+            let mut labs = self.labs.lock();
+            if labs.len() >= 8 {
+                return Err(ProxyError::RouteLimit);
+            }
+            labs.insert(id, cancel.clone());
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let permits = service.lab_clients.clone();
+            loop {
+                let accepted = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    result = tokio::time::timeout(idle, listener.accept()) => match result { Ok(Ok(pair)) => pair, _ => break },
+                };
+                if !service.target_in_scope(&target) {
+                    break;
+                }
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let Ok(route) = service
+                    .start_session(SessionOptions::new(target.clone()))
+                    .await
+                else {
+                    break;
+                };
+                let service = service.clone();
+                let child_cancel = cancel.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let mut client = accepted.0;
+                    if let Ok(mut upstream) = TcpStream::connect(&route.listener_address).await {
+                        tokio::select! {
+                            () = child_cancel.cancelled() => {},
+                            _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {},
+                        }
+                    }
+                    let _ = service.stop_session(route.id);
+                });
+                if !stay_armed {
+                    break;
+                }
+            }
+            service.labs.lock().remove(&id);
+        });
+        Ok((id, address))
+    }
+
+    pub fn lab_listener_active(&self, id: Uuid) -> bool {
+        self.labs.lock().contains_key(&id)
+    }
+
+    pub fn stop_lab_listener(&self, id: Uuid) {
+        if let Some(cancel) = self.labs.lock().remove(&id) {
+            cancel.cancel();
+        }
+    }
+
+    pub fn target_scope(&self) -> Vec<String> {
+        self.scope.read().clone()
+    }
+    pub fn set_target_scope(&self, patterns: Vec<String>) -> Result<(), String> {
+        mineburp_core::scope::validate(&patterns)?;
+        *self.scope.write() = patterns;
+        self.forward_all_intercepted();
+        Ok(())
+    }
+    /// Routes refused because their target was outside the project scope.
+    #[must_use]
+    pub fn out_of_scope_refusals(&self) -> u64 {
+        self.out_of_scope_refusals.load(Ordering::Relaxed)
+    }
+    pub fn target_in_scope(&self, target: &Target) -> bool {
+        mineburp_core::scope::contains(&self.scope.read(), target)
+    }
+    fn connection_in_scope(&self, id: ConnectionId) -> bool {
+        self.sessions
+            .read()
+            .get(&id)
+            .is_some_and(|handle| self.target_in_scope(&handle.snapshot.read().target))
+    }
+
     pub fn set_project(&self, project: Option<ProjectStore>) {
+        for (_, cancel) in self.labs.lock().drain() {
+            cancel.cancel();
+        }
         *self.project.write() = project;
     }
 
@@ -666,6 +795,9 @@ impl ProxyService {
         direction: Direction,
         io: &mut HoldIo<'_>,
     ) -> Result<(), ProxyError> {
+        if io.classification_blocked {
+            return Ok(());
+        }
         while let Some(frame) = io.codec.try_decode(io.buffer)? {
             let (state, protocol) = {
                 let snapshot = handle.snapshot.read();
@@ -685,8 +817,14 @@ impl ProxyService {
                 self.forward_unchanged(handle, direction, &frame, io.writer)
                     .await?;
             } else {
-                io.pending_bytes += frame.body.len() + 1;
+                let barrier = is_state_transition(state, direction, Some(frame.id), protocol)
+                    || changes_stream_encoding(state, direction, Some(frame.id));
+                io.pending_bytes += frame.body.len() + 64;
                 io.pending.push_back(frame);
+                if barrier {
+                    io.classification_blocked = true;
+                    break;
+                }
             }
         }
         Ok(())
@@ -710,20 +848,46 @@ impl ProxyService {
             state,
             encrypted,
         );
-        if self.should_block(&detail.summary) {
+        if self.connection_in_scope(detail.summary.connection_id)
+            && self.should_block(&detail.summary)
+        {
             detail.summary.disposition = Disposition::Dropped;
             detail.summary.sequence = handle.next_sequence();
             self.record_packet(detail).await;
             self.queue.mark_dirty(handle);
             return Ok(());
         }
+        let mut outbound = frame.clone();
+        if let Some(bytes) = self
+            .connection_in_scope(detail.summary.connection_id)
+            .then(|| self.rewrite(&detail, state, direction))
+            .flatten()
+        {
+            match PacketFrame::from_logical_bytes(bytes) {
+                Ok(replaced) => {
+                    outbound = replaced;
+                    detail = self.make_detail(
+                        handle,
+                        direction,
+                        &outbound,
+                        Disposition::Edited,
+                        state,
+                        encrypted,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "a replacement rule produced an unusable frame");
+                }
+            }
+        }
         detail.summary.sequence = handle.next_sequence();
         self.record_packet(detail).await;
+        self.queue.mark_dirty(handle);
         let mut codec = FrameCodec::default();
         codec.set_compression_threshold(*handle.compression_threshold.read());
         writer
             .send(
-                codec.encode(frame)?,
+                codec.encode(&outbound)?,
                 outbound_cipher(handle, direction).is_active(),
             )
             .await
@@ -733,6 +897,17 @@ impl ProxyService {
         &self,
         options: SessionOptions,
     ) -> Result<ConnectionSnapshot, ProxyError> {
+        if !self.target_in_scope(&options.target) {
+            self.out_of_scope_refusals.fetch_add(1, Ordering::Relaxed);
+            let _ = self.events.send(ProxyEvent::Error {
+                connection_id: Uuid::nil(),
+                message: format!(
+                    "Route to {}:{} refused: target is outside the authorized project scope",
+                    options.target.host, options.target.port
+                ),
+            });
+            return Err(ProxyError::OutOfScope);
+        }
         let listener = TcpListener::bind(("127.0.0.1", options.listen_port.unwrap_or(0))).await?;
         let listener_address = listener.local_addr()?.to_string();
         let id = Uuid::new_v4();
@@ -774,7 +949,12 @@ impl ProxyService {
             .sessions
             .read()
             .values()
-            .filter(|handle| handle.snapshot.read().status == ConnectionStatus::Listening)
+            .filter(|handle| {
+                matches!(
+                    handle.snapshot.read().status,
+                    ConnectionStatus::Listening | ConnectionStatus::Connecting
+                )
+            })
             .count();
         if waiting >= MAX_PENDING_ROUTES {
             return Err(ProxyError::RouteLimit);
@@ -848,6 +1028,9 @@ impl ProxyService {
             .get(&connection_id)
             .cloned()
             .ok_or(ProxyError::UnknownConnection(connection_id))?;
+        if !self.target_in_scope(&handle.snapshot.read().target) {
+            return Err(ProxyError::OutOfScope);
+        }
         // Compression and encryption are both settled during login, and only
         // from configuration onwards does neither change under an injected
         // frame — before that, the framing chosen here could be stale by the
@@ -882,6 +1065,7 @@ impl ProxyService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_session(
         &self,
         listener: TcpListener,
@@ -891,12 +1075,25 @@ impl ProxyService {
         let accept = tokio::time::timeout(options.accept_timeout, listener.accept());
         let (client, _) = tokio::select! {
             accepted = accept => accepted.map_err(|_| ProxyError::ClientRouteTimedOut)??,
-            () = handle.cancel.cancelled() => return Ok(()),
+            () = handle.cancel.cancelled() => {
+                update_snapshot(&handle, |snapshot| snapshot.status = ConnectionStatus::Closed);
+                self.publish_snapshot(&handle).await;
+                return Ok(());
+            },
         };
         update_snapshot(&handle, |snapshot| {
             snapshot.status = ConnectionStatus::Connecting;
         });
-        let server = TcpStream::connect(options.target.authority()).await?;
+        let server = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(options.target.authority())) => {
+                result.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream connect timed out"))??
+            }
+            () = handle.cancel.cancelled() => {
+                update_snapshot(&handle, |snapshot| snapshot.status = ConnectionStatus::Closed);
+                self.publish_snapshot(&handle).await;
+                return Ok(());
+            }
+        };
         update_snapshot(&handle, |snapshot| {
             snapshot.status = ConnectionStatus::Active;
         });
@@ -984,6 +1181,7 @@ impl ProxyService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn reader_loop(&self, context: ReaderContext) -> Result<(), ProxyError> {
         let ReaderContext {
             mut reader,
@@ -997,6 +1195,7 @@ impl ProxyService {
         let mut buffer = BytesMut::with_capacity(SOCKET_BUFFER_CAPACITY);
         // Frames read while an earlier one was held, still to be processed.
         let mut backlog: VecDeque<PacketFrame> = VecDeque::new();
+        let mut pending_bytes = 0;
         let mut closed = false;
         loop {
             if handle.cancel.is_cancelled() {
@@ -1027,14 +1226,25 @@ impl ProxyService {
             codec.set_compression_threshold(*handle.compression_threshold.read());
             loop {
                 let frame = match backlog.pop_front() {
-                    Some(frame) => frame,
+                    Some(frame) => {
+                        pending_bytes -= frame.body.len() + 64;
+                        frame
+                    }
                     None => match codec.try_decode(&mut buffer)? {
                         Some(frame) => frame,
                         None => break,
                     },
                 };
                 let read_cipher = inbound_cipher(&handle, direction);
-                let pending_bytes = backlog.iter().map(|frame| frame.body.len() + 1).sum();
+                let classification_blocked = backlog.back().is_some_and(|frame| {
+                    let snapshot = handle.snapshot.read();
+                    is_state_transition(
+                        snapshot.state,
+                        direction,
+                        Some(frame.id),
+                        snapshot.protocol_version,
+                    ) || changes_stream_encoding(snapshot.state, direction, Some(frame.id))
+                });
                 let mut io = HoldIo {
                     reader: &mut reader,
                     buffer: &mut buffer,
@@ -1043,6 +1253,7 @@ impl ProxyService {
                     writer: &writer,
                     pending: &mut backlog,
                     pending_bytes,
+                    classification_blocked,
                     closed,
                 };
                 let cipher_started = self
@@ -1056,6 +1267,7 @@ impl ProxyService {
                     )
                     .await?;
                 closed = io.closed;
+                pending_bytes = io.pending_bytes;
                 if cipher_started && !buffer.is_empty() {
                     // Whatever followed the encryption response in the same read
                     // was copied into the buffer before this link had a cipher,
@@ -1213,7 +1425,9 @@ impl ProxyService {
             state,
             input_encrypted,
         );
-        if self.should_block(&detail.summary) {
+        if self.connection_in_scope(detail.summary.connection_id)
+            && self.should_block(&detail.summary)
+        {
             detail.summary.disposition = Disposition::Dropped;
             detail.summary.sequence = handle.next_sequence();
             self.record_packet(detail).await;
@@ -1222,7 +1436,11 @@ impl ProxyService {
         }
         // A rule that rewrites a packet has already decided what goes on the
         // wire, and the recorded row is what was actually sent.
-        if let Some(bytes) = self.rewrite(&detail, state, direction) {
+        if let Some(bytes) = self
+            .connection_in_scope(detail.summary.connection_id)
+            .then(|| self.rewrite(&detail, state, direction))
+            .flatten()
+        {
             match PacketFrame::from_logical_bytes(bytes) {
                 Ok(replaced) => {
                     outbound = replaced;
@@ -1242,7 +1460,9 @@ impl ProxyService {
         }
         // Intercept sees the frame as the rules left it, and what it forwards
         // is what gets recorded.
-        if self.interceptor.should_hold(&detail.summary) {
+        if self.connection_in_scope(detail.summary.connection_id)
+            && self.interceptor.should_hold(&detail.summary)
+        {
             match self.await_intercept(handle, direction, &detail, io).await? {
                 InterceptDecision::Forward => {}
                 InterceptDecision::Replace(bytes) => {
@@ -1428,6 +1648,7 @@ impl ProxyService {
                     changed |= next != frame;
                     frame = next;
                 }
+                Err(mineburp_protocol::RewriteError::UnknownField(_)) => {}
                 Err(error) => {
                     tracing::warn!(rule = %rule.name, %error, "replacement rule skipped");
                 }
@@ -1600,12 +1821,14 @@ impl ProxyService {
         }
     }
 
-    /// Persists and publishes a snapshot now, for lifecycle changes the UI
-    /// should see at once. Per-packet counters go through the flush ticker.
+    /// Publishes lifecycle changes immediately and queues their persistence.
+    /// Per-packet counters go through the flush ticker.
+    #[allow(clippy::unused_async)]
     async fn publish_snapshot(&self, handle: &SessionHandle) {
         handle.snapshot_dirty.store(false, Ordering::Release);
         let snapshot = handle.snapshot.read().clone();
-        self.queue.persist_snapshot(snapshot).await;
+        let _ = self.events.send(ProxyEvent::Connection(snapshot.clone()));
+        self.queue.lifecycle.lock().insert(snapshot.id, snapshot);
     }
 
     async fn fail_session(&self, id: ConnectionId, message: String) {
@@ -1634,6 +1857,9 @@ struct PersistenceQueue {
     project: Arc<RwLock<Option<ProjectStore>>>,
     events: broadcast::Sender<ProxyEvent>,
     pending: Mutex<Vec<PacketDetail>>,
+    lifecycle: Mutex<HashMap<ConnectionId, ConnectionSnapshot>>,
+    dropped: AtomicU64,
+    wake: tokio::sync::Notify,
     /// Sessions whose snapshot changed since the last flush.
     dirty: Mutex<HashMap<ConnectionId, DirtySnapshot>>,
     flusher_started: AtomicBool,
@@ -1663,6 +1889,7 @@ impl PersistenceQueue {
         for (_, (snapshot, flag)) in dirty {
             flag.store(false, Ordering::Release);
             let snapshot = snapshot.read().clone();
+            let _ = self.events.send(ProxyEvent::Connection(snapshot.clone()));
             self.persist_snapshot(snapshot).await;
         }
     }
@@ -1688,16 +1915,24 @@ impl PersistenceQueue {
                 });
             }
         }
-        let _ = self.events.send(ProxyEvent::Connection(snapshot));
     }
+    #[allow(clippy::unused_async)]
     async fn push(&self, detail: PacketDetail) {
-        let flush_now = {
-            let mut pending = self.pending.lock();
-            pending.push(detail);
-            pending.len() >= INSERT_BATCH_LIMIT
-        };
-        if flush_now {
-            self.flush().await;
+        let mut pending = self.pending.lock();
+        let bytes: usize = pending.iter().map(|row| row.logical_bytes.len() + 64).sum();
+        if pending.len() >= INSERT_BATCH_LIMIT
+            || bytes.saturating_add(detail.logical_bytes.len() + 64) > 32 * 1024 * 1024
+        {
+            let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = self.events.send(ProxyEvent::Error {
+                connection_id: detail.summary.connection_id,
+                message: format!("project persistence queue full: {count} packet rows dropped"),
+            });
+            return;
+        }
+        pending.push(detail);
+        if pending.len() >= INSERT_BATCH_LIMIT {
+            self.wake.notify_one();
         }
     }
 
@@ -1708,7 +1943,15 @@ impl PersistenceQueue {
     /// sessions behind it, and the operator sees the error either way.
     async fn flush(&self) {
         self.flush_packets().await;
+        self.flush_lifecycle().await;
         self.flush_snapshots().await;
+    }
+
+    async fn flush_lifecycle(&self) {
+        let lifecycle = std::mem::take(&mut *self.lifecycle.lock());
+        for snapshot in lifecycle.into_values() {
+            self.persist_snapshot(snapshot).await;
+        }
     }
 
     async fn flush_packets(&self) {
@@ -1716,6 +1959,7 @@ impl PersistenceQueue {
         if batch.is_empty() {
             return;
         }
+        self.flush_lifecycle().await;
         let Some(project) = self.project.read().clone() else {
             return;
         };
@@ -1758,11 +2002,16 @@ impl PersistenceQueue {
 #[async_trait::async_trait]
 impl TransparentRouteProvider for ProxyService {
     async fn open_transparent_route(&self, target: TransparentTarget) -> Result<u16, String> {
-        self.admit_route().map_err(|error| error.to_string())?;
-        let mut options = SessionOptions::new(Target {
+        let target = Target {
             host: target.host,
             port: target.port,
-        });
+        };
+        // Out-of-scope requests are refused before they spend route budget;
+        // the agent fails open and connects directly, uninspected.
+        if self.target_in_scope(&target) {
+            self.admit_route().map_err(|error| error.to_string())?;
+        }
+        let mut options = SessionOptions::new(target);
         options.preserve_client_address = true;
         let snapshot = self
             .start_session(options)
@@ -1969,6 +2218,80 @@ mod tests {
 
     fn state_of(handle: &SessionHandle) -> ProtocolState {
         handle.snapshot.read().state
+    }
+
+    #[tokio::test]
+    async fn queued_transitions_leave_following_bytes_raw() {
+        for (state, packet_id) in [
+            (ProtocolState::Login, 3),
+            (ProtocolState::Configuration, 3),
+            (ProtocolState::Login, 2),
+        ] {
+            let service = ProxyService::new();
+            let handle = handle(767);
+            handle.snapshot.write().state = state;
+            if packet_id == 2 {
+                handle.snapshot.write().protocol_version = Some(763);
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (_server, _) = listener.accept().await.unwrap();
+            let (mut reader, _) = tokio::io::split(client);
+            let codec = FrameCodec::default();
+            let mut buffer =
+                BytesMut::from(codec.encode(&frame(packet_id, &[0])).unwrap().as_ref());
+            // These bytes must not be decoded with the old compression setting.
+            let following = [0xff, 0xff, 0xff, 0xff, 0x7f];
+            buffer.extend_from_slice(&following);
+            let (writer, _) = WriterSender::channel();
+            let mut pending = VecDeque::new();
+            let mut io = HoldIo {
+                reader: &mut reader,
+                buffer: &mut buffer,
+                codec: &codec,
+                read_cipher: inbound_cipher(&handle, Direction::ServerToClient),
+                writer: &writer,
+                pending: &mut pending,
+                pending_bytes: 0,
+                classification_blocked: false,
+                closed: false,
+            };
+            service
+                .drain_held_backlog(&handle, Direction::ServerToClient, &mut io)
+                .await
+                .unwrap();
+            assert!(io.classification_blocked);
+            assert_eq!(io.pending.len(), 1);
+            assert_eq!(io.buffer.as_ref(), following);
+            service
+                .drain_held_backlog(&handle, Direction::ServerToClient, &mut io)
+                .await
+                .unwrap();
+            assert_eq!(io.buffer.as_ref(), following);
+        }
+    }
+
+    #[test]
+    fn login_boundaries_stop_prefetch() {
+        assert!(is_state_transition(
+            ProtocolState::Login,
+            Direction::ServerToClient,
+            Some(2),
+            Some(763)
+        ));
+        assert!(is_state_transition(
+            ProtocolState::Login,
+            Direction::ClientToServer,
+            Some(3),
+            Some(764)
+        ));
+        assert!(changes_stream_encoding(
+            ProtocolState::Login,
+            Direction::ServerToClient,
+            Some(3)
+        ));
     }
 
     #[test]
@@ -2290,5 +2613,183 @@ mod tests {
             service.admit_route().expect("within the limit");
         }
         assert!(matches!(service.admit_route(), Err(ProxyError::RouteLimit)));
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[tokio::test]
+    async fn scope_refuses_routes_and_repeater_and_skips_rules() {
+        let service = ProxyService::new();
+        service
+            .set_target_scope(vec!["allowed.example".into()])
+            .unwrap();
+        let target = Target {
+            host: "outside.example".into(),
+            port: 25565,
+        };
+        assert!(matches!(
+            service.start_session(SessionOptions::new(target)).await,
+            Err(ProxyError::OutOfScope)
+        ));
+        let route = service
+            .start_session(SessionOptions::new(Target {
+                host: "allowed.example".into(),
+                port: 25565,
+            }))
+            .await
+            .unwrap();
+        service
+            .set_target_scope(vec!["other.example".into()])
+            .unwrap();
+        assert!(matches!(
+            service
+                .repeater_send(route.id, Direction::ClientToServer, Bytes::new())
+                .await,
+            Err(ProxyError::OutOfScope)
+        ));
+        service.stop_session(route.id).unwrap();
+        assert!(!service.connection_in_scope(Uuid::new_v4()));
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_agent_routes_are_refused_and_counted() {
+        let service = ProxyService::new();
+        let mut events = service.subscribe();
+        service.set_target_scope(vec!["10.0.0.0/8".into()]).unwrap();
+        let refused = service
+            .open_transparent_route(TransparentTarget {
+                host: "192.0.2.1".into(),
+                port: 25565,
+            })
+            .await;
+        assert!(refused.unwrap_err().contains("scope"));
+        assert_eq!(service.out_of_scope_refusals(), 1);
+        assert!(service.sessions().is_empty());
+        let mut reported = false;
+        while let Ok(event) = events.try_recv() {
+            reported |= matches!(
+                event,
+                ProxyEvent::Error { ref message, .. } if message.contains("192.0.2.1:25565")
+            );
+        }
+        assert!(reported, "the refusal is reported as an event");
+        assert!(
+            service
+                .open_transparent_route(TransparentTarget {
+                    host: "10.1.2.3".into(),
+                    port: 25565,
+                })
+                .await
+                .is_ok()
+        );
+        assert_eq!(service.out_of_scope_refusals(), 1);
+    }
+
+    #[tokio::test]
+    async fn lab_listener_respects_scope() {
+        let service = ProxyService::new();
+        service
+            .set_target_scope(vec!["allowed.example".into()])
+            .unwrap();
+        assert!(matches!(
+            service
+                .start_lab_listener(
+                    Target {
+                        host: "127.0.0.1".into(),
+                        port: 9,
+                    },
+                    false,
+                )
+                .await,
+            Err(ProxyError::OutOfScope)
+        ));
+        assert!(service.labs.lock().is_empty());
+    }
+    #[tokio::test]
+    async fn lab_rejects_clients_when_all_eight_slots_are_busy() {
+        let service = ProxyService::new();
+        let budget = service
+            .lab_clients
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        let (id, address) = service
+            .start_lab_listener(
+                Target {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut byte = [0];
+        let size = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(size, 0);
+        assert!(service.sessions().is_empty());
+        drop(budget);
+        service.stop_lab_listener(id);
+    }
+
+    #[tokio::test]
+    async fn lab_idle_timeout_closes_listener() {
+        let service = ProxyService::new();
+        let (id, address) = service
+            .start_lab_with_timeout(
+                Target {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                },
+                true,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!service.lab_listener_active(id));
+        assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lab_stays_armed_and_stops() {
+        let service = ProxyService::new();
+        let target = Target {
+            host: "127.0.0.1".into(),
+            port: 9,
+        };
+        let (id, address) = service
+            .start_lab_listener(target.clone(), true)
+            .await
+            .unwrap();
+        let first = TcpStream::connect(&address).await.unwrap();
+        let second = TcpStream::connect(&address).await.unwrap();
+        drop((first, second));
+        service.stop_lab_listener(id);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(TcpStream::connect(&address).await.is_err());
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(
+                service
+                    .start_lab_listener(target.clone(), true)
+                    .await
+                    .unwrap()
+                    .0,
+            );
+        }
+        assert!(matches!(
+            service.start_lab_listener(target, true).await,
+            Err(ProxyError::RouteLimit)
+        ));
+        for id in ids {
+            service.stop_lab_listener(id);
+        }
     }
 }

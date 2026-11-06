@@ -44,7 +44,7 @@ Capture is a pipeline of three threads so that no stage can stall the one before
 
 `src-tauri` is deliberately thin. Commands translate serializable input, call one service, and translate errors. Long database operations use the blocking pool. Events carry proxy and capture updates to the UI.
 
-It also opens a *temporary project* at startup, before capture begins, in a `sessions` directory under the app's data directory that only the current user can enter — the file holds decrypted traffic, and the shared system temporary directory would let other local users read it. Each scratch file carries its process id; a later start removes files whose process is gone, so a crash does not leave captures behind. A project is the only place captured packets live, so without one the proxy's decrypted packets were assigned an id and discarded and passive capture had nowhere to go. Creating or opening a real project replaces the temporary one and deletes it; so does exiting. The temporary state is reported to the UI so it is never presented as saved work.
+It also opens a *temporary project* at startup, before capture begins, in a `sessions` directory under the app's data directory that only the current user can enter — the file holds decrypted traffic, and the shared system temporary directory would let other local users read it. Each scratch file carries its process id; a later start moves files whose process is gone, together with their WAL sidecars, into the private `sessions/recovered` directory. `project_current` includes a `recovered_projects` array of absolute paths which the UI can offer through the existing project-open flow. Recovery files remain until the operator removes them. A project is the only place captured packets live, so without one the proxy's decrypted packets were assigned an id and discarded and passive capture had nowhere to go. Creating or opening a real project replaces the temporary one and deletes it; so does exiting. The temporary state is reported to the UI so it is never presented as saved work.
 
 While a proxy session is running, the desktop capture writer drops passively captured frames on that session's loopback port. Those frames are the ciphertext half of a stream the proxy is already recording in the clear, and keeping them meant every decrypted packet had an unreadable duplicate in the history.
 
@@ -78,7 +78,7 @@ Registry ids are named the same way: derived, never written. Items, entity types
 
 Shape identification has a floor that no amount of decoder work raises: a body carries only so much evidence. A one-byte body holding `0` or `1` is byte-for-byte an arm swing, a client command, a container close, and a movement-input bitmask — no validator can separate them, so without a table they stay unnamed. That floor also decides how overlaps are settled between decoders that *do* validate. Two rules apply, and both are about who loses the tie rather than who wins it: a decoder's evidence must be more than the body's length (an eight-byte body is not a keep alive unless the long inside it also reads like a clock or a counter), and where two shapes genuinely coincide, the overlap goes to the packet that is orders of magnitude more common and the rarer one gives up the ambiguous slice. Mining progress and a relative entity move are both a `VarInt` id and nine bytes, separated only by a last byte that is a crack stage in one reading and an on-ground flag in the other, so stages 0 and 1 are simply not claimed. Passively captured plaintext frames are always named by shape, because a frame from an unknown state read through the play table would be named as whatever play packet shares its id.
 
-Naming a row is cheaper than decoding it. `inspect::identify_packet` is a table lookup where a table exists — chunk, registry, and map payloads are named for free — and only otherwise runs shape identification, which skips bodies over 4 KiB: walking their NBT once per packet is exactly the work capture must not do. The description interpreter never runs while capturing.
+Naming a row is cheaper than decoding it. `inspect::identify_packet` is a table lookup where a table exists — chunk, registry, and map payloads are named for free — and only otherwise runs shape identification, which skips bodies over 4 KiB: walking their NBT once per packet is exactly the work capture must not do. The description interpreter never runs during live capture. The file importer alone uses bounded definition decoding to validate candidate frame boundaries in mid-connection streams; this probe runs in `minecraft_stream`, which is only called by the importer. Its NBT text conversion has byte and template-work limits and falls back to hex.
 
 `layout` answers a different question than `inspect`: not what a packet says but *where each value lives*. It walks a frame the inspector has already named into typed spans with byte offsets, which is what lets the Repeater and the replacement rules re-encode one value and splice it back in. A hand-written walker that accounts for the whole frame is preferred, because replacement rules already refer to its field names; otherwise the description interpreter's spans are used, named by path (`data[0].player.name`), so every field of every described packet is editable. `rewrite` builds on it: a field edit rewrites its own length prefix, so resizing a string leaves a frame that still decodes.
 
@@ -124,17 +124,17 @@ Four invariants hold the feature together:
 
 - Rewrite edits never run on handshake or login frames. The proxy rewrites those itself — the handshake address, the key exchange, compression — and a rule there would undo that work or desynchronise the framing.
 
-- A rule that fails is reported and skipped, never fatal. An unknown field name or a bad pattern must not disconnect the game an operator is testing.
+- A rule that fails is reported and skipped, never fatal. An absent field makes a rule inapplicable without a warning. A bad pattern must not disconnect the game an operator is testing.
 - The recorded row is what went on the wire. A rewritten packet is re-derived from the frame that was actually sent and recorded as `edited`, so the history stays a record of the connection rather than of intent.
 - Field edits go through `layout`, so a resized value rewrites its own length prefix. Byte-level edits do exactly what they are told; that is what makes them useful where no decoder reaches, and why they can leave a frame the client will reject.
 
 ## Intercept
 
-Intercept holds selected status, configuration and play frames for the operator
+Intercept holds selected handshake, status, login, configuration and play frames for the operator
 to forward, edit, or drop. A held frame blocks only its own direction of its own
 connection, and three rules stop a hold from costing the session:
 
-- Keep-alives and pings, recognised by id from the version's table, are forwarded at once even while an earlier frame in the same direction is held. The reader keeps draining its socket during a hold; everything else waits behind the held frame in order, up to a bounded backlog. A frame that changes the protocol state is never overtaken, because what follows it is read in the state it moves to.
+- Keep-alives and pings, recognised by id from the version's table, are forwarded at once even while an earlier frame in the same direction is held. The reader keeps draining its socket during a hold; everything else waits behind the held frame in order, up to a bounded backlog. Held backlogs charge 64 bytes per frame in addition to payload bytes and maintain a running byte total. A queued frame that changes protocol state or stream encoding stops further decoding until released. A frame that changes the protocol state is never overtaken, because what follows it is read in the state it moves to.
 - An optional deadline forwards a held frame unchanged; the UI shows the countdown.
 - A held entry is released however its wait ends — a verdict, the deadline, the session closing, or the task being aborted.
 
@@ -151,7 +151,7 @@ to frames written from then on, on open connections too.
 Capture rates outrun both the webview and SQLite if either is fed per packet:
 
 - Capture and proxy writers both persist to the project and publish only a coalesced append *count* to the webview. Nothing is mirrored into an in-memory ring: a ring bounded by frame count aged rows out of the operator's reach under real Minecraft load, and payloads travelling over IPC per packet is what made the view unusable in the first place.
-- The project writer commits captured frames in batched transactions.
+- The project writer commits captured frames in batched transactions. Proxy readers enqueue without waiting for SQLite. The persistence queue holds at most 64 frames and 32 MiB, with one bounded batch in flight; overflow drops rows and reports the cumulative drop count. Summary events retain database-assigned row ids after insertion.
 - Packet tables render only the rows on screen; row height is fixed so the window is arithmetic.
 - The history appends from a keyset cursor and never replaces loaded rows on a timer.
 - Statistics, export, and deletion compile the same filter as the history and run in SQLite; export walks matching rows a page at a time, oldest first, and never loads a capture into memory.
@@ -161,7 +161,7 @@ Capture rates outrun both the webview and SQLite if either is fed per packet:
 - Each accepted client creates one session handle and four tasks: two readers and two writers.
 - Socket writers are single-owner tasks behind channels bounded by frame count and by bytes, preserving byte order and applying encryption in one place.
 - When either side closes, the other reader stops and both writers deliver what is already queued — a server's disconnect reason, typically — before a short deadline ends the session. A closed session leaves the live table; its last snapshot is in the project.
-- The connection snapshot is saved on the persistence ticker, not per packet, and lifecycle changes are saved at once. A failed save is reported as an error event and never ends the session.
+- The connection snapshot is saved on the persistence ticker, not per packet, and lifecycle changes are published immediately and saved in the background. A failed save is reported as an error event and never ends the session.
 - The proxy's state machine follows the frames it forwarded, not the ones that arrived, and moves between configuration and play only on the four transition packets named by the version's table.
 - Repeater injects only in configuration or play, after compression and encryption are settled.
 - Client and server links have independent stateful ciphers.
@@ -210,3 +210,15 @@ Payload generation is transport-independent integer/string work in
 `mineburp-core::research`. Channel explorer reuses the project's compiled filters
 for full-capture SQL aggregation. Custom history columns decode only mounted rows
 through bounded batch commands; decoding never moves into capture-time work.
+
+Live Save As uses `ProjectStore::save_as_and_handoff`: the source writer remains locked through export to a private `.partial` file, metadata initialization, sync, publication, and replacement of the shared writer connection. Existing store clones therefore persist subsequent batches to the saved database. Passive flow identity survives the handoff. Ordinary `save_as` remains a snapshot copy. Desktop history pages use `query_history_page`; `interrupt_reads` affects that reader class only, leaving exports and analysis alone. Export ops default to refusing existing targets; `export_json_with_overwrite` and `export_pcapng_with_overwrite` accept an explicit overwrite boolean and still reject symlinks.
+
+Project migration 8 adds the ordered target scope allowlist. Migration 7 is a
+placeholder on this branch and must be replaced by the findings migration at
+integration. Scope parsing lives in core; project storage validates writes;
+proxy policy gates route creation, Repeater, rules, and Intercept. The desktop
+adds scope status to connection views without changing persisted snapshots.
+Recovery metadata is read on the blocking pool and deletion requires a direct,
+non-symlink child of the private recovered directory. Exit cleanup replaces
+shared SQLite readers and writer with memory handles before deleting scratch
+files, so surviving capture and proxy clones cannot keep a Windows file open.

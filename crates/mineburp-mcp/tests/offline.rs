@@ -328,3 +328,123 @@ async fn edits_annotates_and_manages_project_state() {
         .await;
     assert!(item.contains("diamond_sword"), "{item}");
 }
+
+#[tokio::test]
+async fn semantically_empty_delete_filters_require_confirmation() {
+    let session = Session::new();
+    for filter in [json!({"expr":""}), json!({"states":[]})] {
+        let error = session
+            .err(
+                "project",
+                json!({"action":"delete_packets","filter":filter}),
+            )
+            .await;
+        assert!(error.contains("confirm=true"), "{error}");
+    }
+    let text = session.ok("packets", json!({"format":"json"})).await;
+    let rows: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn compares_connections_and_filters_in_database() {
+    let session = Session::new();
+    let id = "abcdef01-0000-0000-0000-000000000001";
+    let result = session
+        .ok(
+            "connections",
+            json!({"action":"compare","a":id,"b":id,"format":"json"}),
+        )
+        .await;
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(result["rows"][0]["kind"], "identical");
+    let result = session
+        .ok(
+            "connections",
+            json!({"action":"compare","a":id,"b":id,"filter":{"states":["login"]},"format":"json"}),
+        )
+        .await;
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(result["names"][0]["a"], 1);
+    assert_eq!(result["names"][0]["differ"], 0);
+    let text = session
+        .ok("connections", json!({"action":"compare","a":id,"b":id}))
+        .await;
+    assert!(text.contains("0 differences"));
+}
+
+#[test]
+fn connection_comparison_classifies_payloads_and_missing_packets() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProjectStore::create(
+        directory.path().join("compare.mineburp"),
+        "Compare",
+        ProjectOptions::default(),
+    )
+    .unwrap();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    for id in [a, b] {
+        store.save_connection(&connection(id)).unwrap();
+    }
+    store
+        .insert_packets(&[
+            packet(a, 0, ProtocolState::Login, "hello", "0102"),
+            packet(a, 1, ProtocolState::Login, "extra", "03"),
+            packet(b, 2, ProtocolState::Login, "hello", "0104ff"),
+        ])
+        .unwrap();
+    let result = mineburp_mcp::ops::compare_connections(
+        &store,
+        a,
+        b,
+        &mineburp_project::PacketQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0].kind, "changed");
+    assert_eq!(result.rows[0].size_delta, 1);
+    assert_eq!(result.rows[0].first_difference, Some(1));
+    assert_eq!(result.rows[1].kind, "only_a");
+    assert_eq!(
+        result
+            .names
+            .iter()
+            .find(|n| n.name == "hello")
+            .unwrap()
+            .differ,
+        1
+    );
+}
+
+#[tokio::test]
+async fn project_scope_round_trip_and_validation() {
+    let session = Session::new();
+    assert_eq!(session.ok("project", json!({"action":"scope"})).await, "[]");
+    let patterns = json!(["*.example.com:25565", "10.0.0.0/8", "[2001:db8::/32]:25565"]);
+    let result = session
+        .ok("project", json!({"action":"scope", "patterns":patterns}))
+        .await;
+    assert_eq!(serde_json::from_str::<Value>(&result).unwrap(), patterns);
+    assert_eq!(
+        session.ok("project", json!({"action":"scope"})).await,
+        result
+    );
+    assert!(
+        session
+            .err(
+                "project",
+                json!({"action":"scope", "patterns":["10.0.0.0/99"]})
+            )
+            .await
+            .contains("CIDR")
+    );
+    assert_eq!(
+        session
+            .ok("project", json!({"action":"scope", "patterns":[]}))
+            .await,
+        "[]"
+    );
+}

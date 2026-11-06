@@ -66,3 +66,40 @@ Enabled blockers run against the incoming decoded packet before replacement edit
 Blocking is available during handshake, status, login, configuration, and play. Replacement editing still excludes handshake and login. A blocker can prevent login or completion of a phase. Preview evaluates the selector and shows the drop verdict without affecting live traffic. Rule persistence is backward-compatible: rules without an action continue to rewrite.
 
 The MCP `rules` tool accepts `behavior="drop"` on add/update, and previews drop rules against a stored packet. Existing clients default to rewrite.
+
+## Compare
+
+Send two history packets to Compare slots A and B using the packet actions.
+Compare shows their bytes and decoded fields side by side. Byte alignment tracks
+insertions and deletions, so a longer string does not make every following byte
+look changed. Large inputs fall back to positional comparison, indicated in the
+view. Only the leading 1 MiB of each packet is read; a truncation notice means
+the comparison does not cover the complete payload.
+
+Fields show changed values and fields absent from either side. Clear **Only
+changed** to include equal fields. Swap A/B to reverse the comparison, or clear
+the slots to choose another pair. Comparing packets sends no traffic.
+
+Choose **Connections** in Compare to align two recorded sessions. A and B default
+to the two most recently recorded connections. Enable **Apply Traffic filter** to
+scope both sequences with the current Traffic predicates; the connection picker
+overrides the filter's connection selection. Compare takes a snapshot when run;
+refresh by pressing Compare again.
+
+Sequences align independently in each direction by state and packet name. Rows
+show identical payloads, changed bytes with B-minus-A size and first differing
+offset, or packets present only on one side. Hide identical rows or choose a
+direction. F7 / Shift+F7 and n / p navigate differences. Selecting a changed pair
+opens the packet byte/field diff. **Show in Traffic** opens that connection.
+The name table counts packets in A and B and changed/unmatched alignment rows.
+
+Comparison reads database pages with the history read budget/cancellation and
+runs on the blocking pool. It allows 20,000 packets per connection, 1,024 sequence
+edits per direction and 30 seconds of work. Narrow the filter if a limit is hit.
+Payload equality checks complete bytes in 256 KiB windows; packet detail still
+uses its existing leading-1-MiB display limit. Direction groups are separate,
+so cross-direction timing is not compared.
+
+## Findings
+
+Use Findings to group evidence under a title, severity, status, Markdown description and reproduction steps. Add captured packets, Repeater tabs and Replace rules through Add to finding. Filter the list by severity or status, edit tags, and export Markdown or self-contained HTML with bounded packet decodes and hex. Packet references survive history deletion and reports mark missing packets. MCP export can also write a pcapng containing linked packets.

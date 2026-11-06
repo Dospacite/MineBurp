@@ -36,6 +36,11 @@ try {
       throw new Error(`Authlib transformer did not capture ${expected}`);
     }
   }
+  if (honest.joinResults.filter((result) => result === "OK").length !== 2
+    || honest.joinResults.filter((result) => result === "ERR").length !== 2
+    || honest.readyHashes.size !== 2) {
+    throw new Error("JOIN did not run once per credential or hooked its own join");
+  }
   // Exactly two: Minecraft's named and obfuscated connects. Unrelated Netty
   // callers, including a mod client started from Minecraft code, must not
   // even ask for a route.
@@ -75,6 +80,7 @@ async function startBroker({ key, routePort, unsupported = false }) {
     readyHashes: new Set(),
     routeRequests: [],
     authFailures: 0,
+    joinResults: [],
   };
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
@@ -117,7 +123,14 @@ async function startBroker({ key, routePort, unsupported = false }) {
           record.routeRequests.push(`${decode(fields[1])}:${fields[2]}`);
           socket.write(`ROUTE_OK\t${routePort}\n`);
         } else if (stage === "session" && fields[0] === "READY" && fields.length === 3) {
-          record.readyHashes.add(decode(fields[1]));
+          const hash = decode(fields[1]);
+          record.readyHashes.add(hash);
+          const request = hash === "legacy-hash" ? "00000000-0000-0000-0000-000000000002" : "00000000-0000-0000-0000-000000000003";
+          socket.write(`JOIN\t${request}\t${fields[1]}\t${Buffer.from("upstream-" + hash).toString("base64url")}\n`);
+          // A credential is one-use. A repeated request must fail.
+          socket.write(`JOIN\t00000000-0000-0000-0000-000000000004\t${fields[1]}\t${fields[1]}\n`);
+        } else if (stage === "session" && fields[0] === "RESULT") {
+          record.joinResults.push(fields[2]);
         }
       }
     });

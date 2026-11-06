@@ -72,6 +72,10 @@ pub fn tools() -> Vec<Tool> {
                         "auto_forward_ms",
                         integer("forward held frames after this long; 0 = never"),
                     ),
+                    (
+                        "hex_limit",
+                        super::integer("maximum output bytes, default 512, maximum 65536"),
+                    ),
                     ("hex", string("forward: replacement frame")),
                     ("edits", edits_ref()),
                     ("set", set_schema()),
@@ -116,6 +120,10 @@ pub fn tools() -> Vec<Tool> {
                     (
                         "dir",
                         choice(&["c2s", "s2c"], "default: the source packet's, else c2s"),
+                    ),
+                    (
+                        "hex_limit",
+                        super::integer("maximum output bytes, default 512, maximum 65536"),
                     ),
                     ("hex", string("logical frame hex")),
                     ("packet", integer("history id to resend/edit")),
@@ -312,13 +320,14 @@ pub async fn intercept(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
             let held = find_held(&proxy, args.u64("id").ok_or("`id` is required")?)?;
             let frame = held_frame(&held);
             let mut out = held_line(&held, now_micros());
+            let hex_limit = args.usize("hex_limit").unwrap_or(512).min(65536);
             let decoded = blocking(move || {
                 let insight =
                     inspect_logical(frame.state, frame.direction, &frame.bytes, frame.protocol);
                 Ok(format!(
                     "{}\nhex: {}",
                     render::insight(&insight, TreeLimits::default(), None),
-                    render::hex(&frame.bytes, 0, false)
+                    render::capped_hex(&frame.bytes, hex_limit)
                 ))
             })
             .await?;

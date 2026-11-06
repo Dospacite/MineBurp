@@ -106,6 +106,71 @@ pub fn layout_logical(
     layout
 }
 
+/// Looks up a rule field without running the complete display layout.
+pub(crate) fn lookup_field(
+    state: ProtocolState,
+    direction: Direction,
+    logical: &[u8],
+    protocol: Option<i32>,
+    target: &str,
+) -> PacketLayout {
+    let mut builder = Builder::new(logical);
+    builder.target = Some(target.to_owned());
+    let Some(id) = builder.var_int("packet id") else {
+        return builder.finish(None);
+    };
+    let prefix = builder.reader.position();
+    let body = &logical[prefix..];
+    let name = resolve_name(state, direction, id, body, protocol);
+    if let Some(name) = &name {
+        walk(&mut builder, name, state, direction, protocol);
+    }
+    builder
+        .fields
+        .retain(|field| crate::rewrite::normalise(&field.name) == target);
+    if builder.fields.is_empty()
+        && let Some(decoded) =
+            protodef::decode_packet_until(state, direction, id, body, protocol, Some(target))
+    {
+        builder.fields = decoded
+            .spans
+            .into_iter()
+            .map(|mut span| {
+                span.offset += prefix;
+                span
+            })
+            .collect();
+    }
+    for field in &mut builder.fields {
+        let bytes = &logical[field.offset..field.offset + field.length];
+        field.value = match field.kind {
+            FieldKind::Bytes => Value::String(to_hex(bytes)),
+            FieldKind::PrefixedNbt => {
+                let mut reader = Reader::new(bytes);
+                Value::String(
+                    reader
+                        .byte_array()
+                        .and_then(|nbt| crate::nbt_text::to_text(nbt, false))
+                        .unwrap_or_default(),
+                )
+            }
+            FieldKind::Nbt | FieldKind::NamedNbt => {
+                if let Some(text) =
+                    crate::nbt_text::to_text(bytes, field.kind == FieldKind::NamedNbt)
+                {
+                    Value::String(text)
+                } else {
+                    field.kind = FieldKind::Bytes;
+                    Value::String(to_hex(bytes))
+                }
+            }
+            _ => field.value.clone(),
+        };
+        exact_in_javascript(field);
+    }
+    builder.finish(name)
+}
+
 /// The largest integer a JavaScript number holds exactly (2^53 - 1).
 const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
@@ -249,6 +314,14 @@ pub fn encode_field_over(
     value: &Value,
     original: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
+    // Preserve noncanonical VarInt prefixes and NBT list element tags when
+    // an operator re-encodes the value without changing it.
+    if let Some(bytes) = original {
+        let unchanged = unchanged_field(kind, value, bytes);
+        if unchanged {
+            return Ok(bytes.to_vec());
+        }
+    }
     let integer = |bits: u32, signed: bool| -> Result<i64, String> {
         let number = match value {
             Value::Number(number) => number.as_i64().ok_or("value is not a whole number")?,
@@ -341,6 +414,48 @@ pub fn encode_field_over(
     })
 }
 
+fn unchanged_field(kind: FieldKind, value: &Value, bytes: &[u8]) -> bool {
+    let mut reader = Reader::new(bytes);
+    match kind {
+        FieldKind::VarInt => {
+            reader
+                .var_i32()
+                .is_some_and(|old| parse_i64(value).ok() == Some(i64::from(old)))
+                && reader.remaining() == 0
+        }
+        FieldKind::VarLong => {
+            reader
+                .var_i64()
+                .is_some_and(|old| parse_i64(value).ok() == Some(old))
+                && reader.remaining() == 0
+        }
+        FieldKind::String => {
+            reader
+                .string(262_144)
+                .is_some_and(|old| value.as_str() == Some(old.as_str()))
+                && reader.remaining() == 0
+        }
+        FieldKind::PrefixedBytes => {
+            reader
+                .byte_array()
+                .is_some_and(|old| parse_hex(value).is_ok_and(|new| new == old))
+                && reader.remaining() == 0
+        }
+        FieldKind::Nbt | FieldKind::NamedNbt => {
+            crate::nbt_text::to_text(bytes, kind == FieldKind::NamedNbt)
+                .is_some_and(|old| value.as_str() == Some(old.as_str()))
+        }
+        FieldKind::PrefixedNbt => {
+            reader
+                .byte_array()
+                .and_then(|nbt| crate::nbt_text::to_text(nbt, false))
+                .is_some_and(|old| value.as_str() == Some(old.as_str()))
+                && reader.remaining() == 0
+        }
+        _ => false,
+    }
+}
+
 /// The three NBT kinds: JSON text written back with the replaced bytes as
 /// the type template, behind a fresh length prefix for `PrefixedNbt`.
 fn encode_nbt(kind: FieldKind, value: &Value, original: Option<&[u8]>) -> Result<Vec<u8>, String> {
@@ -413,16 +528,7 @@ fn parse_hex(value: &Value) -> Result<Vec<u8>, String> {
     let Value::String(text) = value else {
         return Err("value is not hex".into());
     };
-    let digits: String = text.chars().filter(char::is_ascii_hexdigit).collect();
-    if !digits.len().is_multiple_of(2) {
-        return Err("hex needs complete byte pairs".into());
-    }
-    (0..digits.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&digits[index..index + 2], 16).map_err(|error| error.to_string())
-        })
-        .collect()
+    crate::rewrite::parse_hex(text).map_err(|error| error.to_string())
 }
 
 // --- walkers ---
@@ -465,7 +571,12 @@ fn walk(
         "login_disconnect" | "text_component" | "system_chat" => {
             // Components are NBT or JSON; the JSON form is a plain string and
             // the NBT form is left as bytes.
-            if builder.peek_string().is_some() {
+            if protocol_version.is_some_and(|version| version >= 765) {
+                builder.component_nbt("component");
+            } else if builder
+                .peek_string()
+                .is_some_and(|text| serde_json::from_str::<Value>(&text).is_ok())
+            {
                 builder.string("component");
             }
         }
@@ -776,6 +887,7 @@ fn walk(
 
 struct Builder<'a> {
     reader: Reader<'a>,
+    target: Option<String>,
     fields: Vec<FieldSpan>,
     /// Set once a read fails: everything after it is raw bytes.
     stopped: bool,
@@ -785,6 +897,7 @@ impl<'a> Builder<'a> {
     fn new(input: &'a [u8]) -> Self {
         Self {
             reader: Reader::new(input),
+            target: None,
             fields: Vec::new(),
             stopped: false,
         }
@@ -822,6 +935,13 @@ impl<'a> Builder<'a> {
             return None;
         };
         self.reader = probe;
+        let wanted = self
+            .target
+            .as_ref()
+            .is_none_or(|target| crate::rewrite::normalise(name) == *target);
+        if !wanted {
+            return Some(value);
+        }
         self.fields.push(FieldSpan {
             name: name.to_owned(),
             kind,
@@ -829,6 +949,9 @@ impl<'a> Builder<'a> {
             length: self.reader.position() - offset,
             value: to_value(value.clone()),
         });
+        if self.target.is_some() {
+            self.stopped = true;
+        }
         Some(value)
     }
 
@@ -891,6 +1014,42 @@ impl<'a> Builder<'a> {
         );
     }
 
+    fn component_nbt(&mut self, name: &str) {
+        if self.stopped {
+            return;
+        }
+        let offset = self.reader.position();
+        let Some(length) = crate::nbt::skip_nbt(self.reader.rest(), false) else {
+            self.stopped = true;
+            return;
+        };
+        let Some(bytes) = self.reader.take(length) else {
+            return;
+        };
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| crate::rewrite::normalise(name) != *target)
+        {
+            return;
+        }
+        let text = crate::nbt_text::to_text(bytes, false);
+        self.fields.push(FieldSpan {
+            name: name.into(),
+            offset,
+            length,
+            kind: if text.is_some() {
+                FieldKind::Nbt
+            } else {
+                FieldKind::Bytes
+            },
+            value: Value::String(text.unwrap_or_else(|| to_hex(bytes))),
+        });
+        if self.target.is_some() {
+            self.stopped = true;
+        }
+    }
+
     /// A `VarInt`-prefixed byte array. The span covers the prefix as well as the
     /// payload, so an edit that changes the length rewrites both.
     fn length_prefixed(&mut self, name: &str) {
@@ -904,6 +1063,13 @@ impl<'a> Builder<'a> {
             return;
         };
         self.reader = probe;
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| crate::rewrite::normalise(name) != *target)
+        {
+            return;
+        }
         self.fields.push(FieldSpan {
             name: name.to_owned(),
             kind: FieldKind::PrefixedBytes,
@@ -921,6 +1087,29 @@ impl<'a> Builder<'a> {
         }
         let offset = self.reader.position();
         let mut probe = self.reader.clone();
+        if self.target.is_some() {
+            let Some(bytes) = probe.byte_array() else {
+                self.stopped = true;
+                return;
+            };
+            let _ = bytes;
+            self.reader = probe;
+            if self
+                .target
+                .as_ref()
+                .is_some_and(|target| crate::rewrite::normalise(name) == *target)
+            {
+                self.fields.push(FieldSpan {
+                    name: name.into(),
+                    kind: FieldKind::PrefixedNbt,
+                    offset,
+                    length: self.reader.position() - offset,
+                    value: Value::Null,
+                });
+                self.stopped = true;
+            }
+            return;
+        }
         let text = probe
             .byte_array()
             .filter(|nbt| nbt.len() <= MAX_NBT_TEXT_BYTES)
@@ -942,7 +1131,18 @@ impl<'a> Builder<'a> {
 
     /// Whatever is left, as one hex field.
     fn bytes(&mut self, name: &str) {
+        if self.stopped {
+            return;
+        }
         let rest = self.reader.rest();
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| crate::rewrite::normalise(name) != *target)
+        {
+            let _ = self.reader.take(rest.len());
+            return;
+        }
         if rest.is_empty() {
             return;
         }
@@ -1199,7 +1399,7 @@ mod tests {
         edited
     }
 
-    /// A captured AuthMe form submission (1.21.11).
+    /// A captured `AuthMe` form submission (1.21.11).
     const CLICK_ACTION: &str = "081e617574686d653a7072656a6f696e2d72656769737465722f7375626d69741b0a080007636f6e6669726d000008000870617373776f7264000000";
 
     #[test]
@@ -1277,6 +1477,72 @@ mod tests {
         assert_eq!(
             encode_field(FieldKind::F32, &json!("1.5")).unwrap(),
             1.5_f32.to_be_bytes().to_vec()
+        );
+    }
+}
+
+#[cfg(test)]
+mod component_regression {
+    use super::*;
+    #[test]
+    fn table_only_modern_components_are_nbt() {
+        let id = crate::PacketRegistry::packet_id(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            "system_chat",
+            Some(776),
+        )
+        .unwrap();
+        let mut logical = crate::encode_var_i32(id);
+        logical.extend_from_slice(&[10, 8, 0, 4, b't', b'e', b'x', b't', 0, 1, b'x', 0, 0]);
+        let layout = layout_logical(
+            ProtocolState::Play,
+            Direction::ServerToClient,
+            &logical,
+            Some(776),
+        );
+        let component = layout
+            .fields
+            .iter()
+            .find(|f| f.name == "component")
+            .unwrap();
+        assert_eq!(component.kind, FieldKind::Nbt);
+    }
+
+    #[test]
+    fn field_lookup_stops_before_a_large_tail() {
+        let mut logical = crate::encode_var_i32(0);
+        logical.extend(crate::encode_var_i32(767));
+        logical.extend(crate::encode_var_i32(9));
+        logical.extend_from_slice(b"localhost");
+        logical.extend_from_slice(&25565_u16.to_be_bytes());
+        logical.extend(crate::encode_var_i32(2));
+        logical.resize(1_000_000, 0xff);
+        let layout = lookup_field(
+            ProtocolState::Handshake,
+            Direction::ClientToServer,
+            &logical,
+            Some(767),
+            "server_address",
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].value, "localhost");
+        let missing = lookup_field(
+            ProtocolState::Handshake,
+            Direction::ClientToServer,
+            &logical,
+            Some(767),
+            "absent",
+        );
+        assert!(missing.fields.is_empty());
+    }
+
+    #[test]
+    fn hex_edits_reject_garbage() {
+        assert!(encode_field(FieldKind::Bytes, &Value::String("ab!cd".into())).is_err());
+        assert_eq!(
+            encode_field(FieldKind::Bytes, &Value::String("0xAB cd".into())).unwrap(),
+            [0xab, 0xcd]
         );
     }
 }

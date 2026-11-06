@@ -16,7 +16,6 @@ Any client that launches stdio servers takes the same command:
 { "mcpServers": { "mineburp": { "command": "/path/to/mineburp-mcp" } } }
 ```
 
-OMP reads this repository's `.omp/mcp.json`, which registers `./target/release/mineburp-mcp` as the `mineburp` server, so a session started in this checkout has the tools without further setup. Elsewhere, add the same entry to `~/.omp/agent/mcp.json` and run `/mcp reload`.
 
 `mineburp-mcp` picks its mode at startup:
 
@@ -34,10 +33,11 @@ When an MCP client changes something the UI shows — intercept settings, rules,
 
 ## Tools
 
-19 tools. Related actions share one tool through an `action` argument, so the tool list costs a session about 4k tokens.
+20 tools. Related actions share one tool through an `action` argument, so the tool list costs a session about 4k tokens.
 
 | Tool | Purpose |
 | --- | --- |
+| `findings` | Assessment findings: list/get/create/update/delete/add_evidence/remove_evidence/export; `format: "json"` for structured output |
 | `status` | One-call overview: mode, project, capture, decrypt mode, live sessions, intercept queue, rules, shaping |
 | `packets` | Filtered history, one line per packet, with `before`/`after` cursors; `wait_ms` waits for new traffic; `summaries` adds decoded one-liners |
 | `packet` | One packet: metadata, annotation, decode (schema packs too), editable `layout`, hex window; `path` drills into large decodes |
@@ -94,6 +94,51 @@ accepts one client. Close sessions with `connections close=...`. At most 16
 explicit routes can wait for clients at once. Offline-mode lab servers need no
 Java agent. Online-mode upstream servers still require client assistance.
 
-The small client in `test-projects/runtime-client` creates this route itself and
+The optional, local client in `test-projects/runtime-client` (not shipped in this repository) creates this route itself and
 handles Fabric configuration pings and teleport acknowledgments. See its README
 for the memory limits and interactive request format.
+
+Read-only `status`, `packets`, `packet`, `connections`, and `stats` accept
+`format: "json"`. The content text then contains JSON: packet lists and
+connections are arrays; packet detail includes summary, annotation, a bounded
+hex window, offset and total_bytes. Status and statistics are objects.
+
+`rewrite`, `rules` preview, and `intercept` show accept `hex_limit` in bytes
+(default 512, maximum 65536). Long output is capped and reports the bytes shown
+and total; increase the limit to inspect more. Rewrites and rule previews also
+report changed byte ranges as half-open offsets, capped at 32 ranges.
+
+Replacing a temporary project containing packets through `project` open,
+create, or save_as requires `discard: true`. Use Save As to preserve a session.
+The stdio server reconnects to the desktop socket per tool call and uses offline
+mode when it cannot connect. `passphrase_env` is resolved by the stdio process
+before forwarding the value over the private socket.
+
+The desktop `replacement_rules_set` command accepts optional `expectedPath`.
+When supplied, it must equal the current project path. Rule expressions are
+validated and saved before the live proxy applies them. MCP rule edits hold a
+mutex for the project throughout the read, modification, save, and apply steps.
+
+`findings` uses full finding documents for create/update, UUID `id` for get/delete, and `evidence: {kind, id}` for evidence actions. Kinds are `packet`, `connection`, `repeater`, and `rule`. Export takes absolute `path`, `reportFormat: "markdown" | "html"`, optional `pcapPath`, and `overwrite`. Missing history references remain in reports.
+
+### Connection comparison
+
+`connections action="compare" a="<connection id>" b="<connection id>"` aligns
+recorded packet sequences per direction. Optional `filter` accepts the same
+filter object as `packets` (including `expr`, `dir`, `states`, and content search).
+Text returns the row/difference totals and first 20 differences; `limit` bounds
+that list to at most 100. `format="json"` returns all bounded alignment rows and
+per-name counts, including packet summaries, `kind`, `size_delta` (B minus A),
+and `first_difference` (byte offset or null). This action sends no traffic.
+The limits are 20,000 packets per side, 1,024 edits per direction and a 30-second
+comparison budget. Limit errors suggest narrowing the filter.
+
+The `project` tool accepts `action="scope"` to show the project's target allowlist.
+Pass `patterns=["*.example.com:25565", "10.0.0.0/8", "[2001:db8::/32]:25565"]`
+to replace it. An empty array restores unrestricted operation. Exact hostnames
+are case insensitive; wildcard patterns match subdomains only. CIDRs match
+literal IP targets without DNS resolution. Scope applies to routes, Repeater,
+Intercept, and replacement rules in the running app. Out-of-scope route requests
+fail so the Java agent can connect directly. With a scope set, `status` lists
+the patterns and the number of refused routes. `route` refuses out-of-scope
+targets.

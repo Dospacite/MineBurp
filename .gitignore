@@ -20,3 +20,6 @@
 
 # Local agent workspace
 /.omp/
+
+/.claude/
+/src-tauri/binaries/

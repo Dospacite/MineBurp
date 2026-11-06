@@ -65,3 +65,16 @@ it("traffic presets are independent and explicit", () => {
   expect(quiet.expression).not.toContain("name ~ move ||");
   expect(trafficPreset("all").expression).toBe("");
 });
+
+it("coalesces typing until a pause without coalescing explicit edits", async () => {
+  const { initialHistory, recordEdit, undoEdit } = await import("./editHistory");
+  const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+  let history = recordEdit(initialHistory("00"), "00", "01", true);
+  now.mockReturnValue(1100);
+  history = recordEdit(history, "01", "02", true);
+  expect(undoEdit(history, "02")?.hex).toBe("00");
+  now.mockReturnValue(2000);
+  history = recordEdit(history, "02", "03", true);
+  expect(undoEdit(history, "03")?.hex).toBe("02");
+  now.mockRestore();
+});

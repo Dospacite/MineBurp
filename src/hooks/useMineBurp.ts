@@ -11,7 +11,9 @@ import type {
   ProjectInfo,
 } from "../domain/types";
 import { EMPTY_FILTER } from "../domain/types";
+import { annotationStore } from "../lib/annotations";
 import { desktop, subscription } from "../lib/desktop";
+import { notifyTrafficAppend, publishConnections } from "../lib/trafficStore";
 
 /** Cadence for session/project polling — unrelated to traffic volume. */
 const STATUS_POLL_MS = 2_000;
@@ -72,7 +74,7 @@ export function useMineBurp() {
    * flows passive capture observed. The proxy's own list covers only the
    * former, which left passively captured traffic impossible to filter to.
    */
-  const [connections, setConnections] = useState<ConnectionSnapshot[]>([]);
+
   const [selectedPacket, setSelectedPacket] = useState<PacketView | null>(null);
   /**
    * The id of the row that was clicked.
@@ -94,7 +96,7 @@ export function useMineBurp() {
   const [connectionId, setConnectionId] = useState<string | null>(null);
   const [decryptMode, setDecryptModeState] = useState<DecryptModeStatus | null>(null);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("starting");
-  const [appendSignal, setAppendSignal] = useState(0);
+
   const [interceptSettings, setInterceptSettingsState] = useState<InterceptSettings | null>(null);
   /** How many frames Intercept is holding; the view refetches the queue when it changes. */
   const [interceptPending, setInterceptPending] = useState(0);
@@ -149,12 +151,18 @@ export function useMineBurp() {
   }, []);
   const markLogRead = useCallback(() => setUnreadErrors(0), []);
 
+  const refreshing = useRef(false);
   const refresh = useCallback(async () => {
-    if (!desktop.isAvailable()) return;
+    if (refreshing.current) return;
+    refreshing.current = true;
+    if (!desktop.isAvailable()) {
+      refreshing.current = false;
+      return;
+    }
     try {
       const [current, stored, live, currentDecryptMode] = await Promise.all([
         desktop.projectCurrent(),
-        desktop.connections().catch(() => [] as ConnectionSnapshot[]),
+        desktop.connections(),
         desktop.proxySessions(),
         desktop.decryptMode(),
       ]);
@@ -166,10 +174,12 @@ export function useMineBurp() {
       // identity twice a second, re-running downstream effects — including the
       // history reload that made the packet table appear to reset.
       setProject((previous) => (same(previous, current) ? previous : current));
-      setConnections((previous) => (same(previous, currentConnections) ? previous : currentConnections));
+      publishConnections(currentConnections);
       setDecryptModeState((previous) => (same(previous, currentDecryptMode) ? previous : currentDecryptMode));
     } catch (reason) {
       setError(message(reason));
+    } finally {
+      refreshing.current = false;
     }
   }, [setError]);
 
@@ -239,7 +249,7 @@ export function useMineBurp() {
     );
     // Both writers coalesce their own appends in the backend, so this fires a
     // handful of times a second rather than once per packet.
-    const stopAppends = subscription(desktop.onPacketsAppended(() => setAppendSignal((value) => value + 1)));
+    const stopAppends = subscription(desktop.onPacketsAppended(() => notifyTrafficAppend()));
     // An MCP client acted on the app: pull what it may have changed. Intercept
     // settings must be refetched before the next UI patch builds on them, or
     // that patch would quietly revert the agent's change.
@@ -254,7 +264,8 @@ export function useMineBurp() {
             })
             .catch((reason) => setError(message(reason)));
         }
-        if (topic === "packets" || topic === "annotations") setAppendSignal((value) => value + 1);
+        if (topic === "annotations") annotationStore.reset();
+        if (topic === "packets" || topic === "annotations") notifyTrafficAppend();
         void refresh();
       }),
     );
@@ -336,7 +347,6 @@ export function useMineBurp() {
     project,
     setProject,
     capabilities,
-    connections,
     selectedPacket,
     selectedPacketId,
     selectPacket,
@@ -347,7 +357,6 @@ export function useMineBurp() {
     decryptMode,
     setDecryptMode,
     captureStatus,
-    appendSignal,
     interceptSettings,
     patchInterceptSettings,
     interceptPending,

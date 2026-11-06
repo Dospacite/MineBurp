@@ -109,6 +109,8 @@ impl Default for DecodeContext {
 pub enum SchemaError {
     #[error("schema pack id, name, and version are required")]
     InvalidManifest,
+    #[error("invalid schema: {0}")]
+    InvalidDefinition(String),
     #[error("duplicate schema name `{0}`")]
     DuplicateSchema(String),
     #[error("duplicate field `{0}`")]
@@ -143,6 +145,14 @@ impl SchemaPack {
         for schema in &self.schemas {
             if !names.insert(schema.name.as_str()) {
                 return Err(SchemaError::DuplicateSchema(schema.name.clone()));
+            }
+            if let (Some(min), Some(max)) =
+                (schema.matcher.protocol_min, schema.matcher.protocol_max)
+                && min > max
+            {
+                return Err(SchemaError::InvalidDefinition(
+                    "protocol_min exceeds protocol_max".into(),
+                ));
             }
             validate_fields(&schema.fields, 0)?;
         }
@@ -188,15 +198,50 @@ fn validate_fields(fields: &[FieldDefinition], depth: usize) -> Result<(), Schem
         return Err(SchemaError::TooDeep);
     }
     let mut names = HashSet::new();
+    let mut integers = HashSet::new();
     for field in fields {
         if !names.insert(field.name.as_str()) {
             return Err(SchemaError::DuplicateField(field.name.clone()));
         }
-        match &field.kind {
-            TypeDefinition::Struct { fields } => validate_fields(fields, depth + 1)?,
-            TypeDefinition::Array { item, .. } => validate_type(item, depth + 1)?,
-            _ => {}
+        if let TypeDefinition::Array {
+            count_field: Some(name),
+            ..
+        } = &field.kind
+            && !integers.contains(name.as_str())
+        {
+            return Err(SchemaError::InvalidCountField(name.clone()));
         }
+        validate_counts(&field.kind, &integers)?;
+        validate_type(&field.kind, depth + 1)?;
+        if matches!(
+            field.kind,
+            TypeDefinition::U8
+                | TypeDefinition::I8
+                | TypeDefinition::U16Be
+                | TypeDefinition::I16Be
+                | TypeDefinition::U32Be
+                | TypeDefinition::I32Be
+                | TypeDefinition::I64Be
+                | TypeDefinition::VarInt
+                | TypeDefinition::VarLong
+        ) {
+            integers.insert(field.name.as_str());
+        }
+    }
+    Ok(())
+}
+
+fn validate_counts(kind: &TypeDefinition, integers: &HashSet<&str>) -> Result<(), SchemaError> {
+    if let TypeDefinition::Array {
+        count_field, item, ..
+    } = kind
+    {
+        if let Some(name) = count_field
+            && !integers.contains(name.as_str())
+        {
+            return Err(SchemaError::InvalidCountField(name.clone()));
+        }
+        validate_counts(item, integers)?;
     }
     Ok(())
 }
@@ -206,6 +251,16 @@ fn validate_type(kind: &TypeDefinition, depth: usize) -> Result<(), SchemaError>
         return Err(SchemaError::TooDeep);
     }
     match kind {
+        TypeDefinition::Array {
+            count: None,
+            count_field: None,
+            ..
+        } => Err(SchemaError::InvalidDefinition(
+            "array requires count or count_field".into(),
+        )),
+        TypeDefinition::Bytes { length: None, rest } if *rest != Some(true) => Err(
+            SchemaError::InvalidDefinition("bytes requires length or rest: true".into()),
+        ),
         TypeDefinition::Struct { fields } => validate_fields(fields, depth + 1),
         TypeDefinition::Array { item, .. } => validate_type(item, depth + 1),
         _ => Ok(()),
@@ -564,5 +619,34 @@ mod tests {
             Err(SchemaError::BudgetExceeded)
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod validation_regression {
+    use super::*;
+    #[test]
+    fn reversed_protocol_range_is_rejected() {
+        let pack: SchemaPack = serde_json::from_value(serde_json::json!({
+            "manifest":{"id":"test","name":"test","version":"1"},
+            "schemas":[{"name":"test","match":{"state":"play","direction":"client_to_server","protocol_min":776,"protocol_max":765},"fields":[]}]
+        })).unwrap();
+        assert!(matches!(
+            pack.validate(),
+            Err(SchemaError::InvalidDefinition(_))
+        ));
+    }
+
+    #[test]
+    fn impossible_layouts_are_rejected() {
+        for fields in [
+            serde_json::json!([{"name":"x","type":"array","item":{"type":"u8"}}]),
+            serde_json::json!([{"name":"x","type":"bytes"}]),
+            serde_json::json!([{"name":"x","type":"array","count_field":"later","item":{"type":"u8"}},{"name":"later","type":"u8"}]),
+            serde_json::json!([{"name":"n","type":"bool"},{"name":"x","type":"array","count_field":"n","item":{"type":"u8"}}]),
+        ] {
+            let fields: Vec<FieldDefinition> = serde_json::from_value(fields).unwrap();
+            assert!(validate_fields(&fields, 0).is_err());
+        }
     }
 }

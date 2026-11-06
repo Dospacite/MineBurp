@@ -1,0 +1,31 @@
+name: Refresh packet tables
+on:
+  schedule:
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate with downloads enabled
+        run: cargo run --locked -p mineburp-packet-table --
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/packet-tables
+          title: 'Update generated packet tables'
+          commit-message: 'chore: regenerate packet tables'
+          body: 'Weekly regeneration using upstream artifacts with offline mode disabled. Review protocol data before merging.'
+          add-paths: crates/mineburp-protocol/data/

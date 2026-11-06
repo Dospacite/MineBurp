@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { FieldSpan } from "../domain/types";
 import { message } from "../hooks/useMineBurp";
 import { useDocumentField, useProjectDocument } from "../hooks/useProjectDocument";
@@ -9,7 +9,7 @@ import { registerProjectPreparation } from "../lib/projectWrites";
 import { EMPTY_SEQUENCER, isSequencerDocument } from "../lib/researchDocuments";
 import type { ResearchRequest } from "./IntruderView";
 
-export function SequencerView({
+function SequencerViewImpl({
   request,
   projectKey,
   onError,
@@ -329,3 +329,5 @@ export function SequencerView({
     </section>
   );
 }
+
+export const SequencerView = memo(SequencerViewImpl);

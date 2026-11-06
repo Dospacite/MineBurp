@@ -1,4 +1,5 @@
 export type View =
+  | "findings"
   | "traffic"
   | "intercept"
   | "repeater"
@@ -47,6 +48,7 @@ export type ConnectionStatus =
 export type LoaderKind = "vanilla" | "fabric" | "quilt" | "forge" | "neo_forge" | "unknown";
 
 export interface ConnectionSnapshot {
+  in_scope?: boolean;
   id: string;
   target: Target;
   listener_address: string;
@@ -236,6 +238,7 @@ export interface InstanceDescriptor {
   loader: LoaderKind;
   icon_path: string | null;
   supports_agent_configuration: boolean;
+  client_assist_stale?: boolean;
   client_assist_configured: boolean;
 }
 
@@ -279,10 +282,21 @@ export interface AppCapabilities {
   protocol_max: number;
 }
 
+/** An abandoned temporary session kept in the private recovered directory. */
+export interface RecoveredSession {
+  path: string;
+  /** Null when the file could not be opened; it can still be deleted. */
+  packets: number | null;
+  modified_millis: number;
+}
+
 export interface DecryptModeStatus {
   enabled: boolean;
   route_adapter: string;
   active_sessions: number;
+  /** Agent routes refused because their target was outside the project scope. */
+  out_of_scope_refusals?: number;
+  scope_restricted?: boolean;
 }
 
 /**
@@ -609,3 +623,40 @@ export type PayloadGenerator =
   | { kind: "boundaries"; bits: number; signed: boolean }
   | { kind: "lengths"; start: number; end: number; step: number; unit: string }
   | { kind: "values"; values: string[] };
+
+export interface SetupCheck {
+  id: string;
+  status: "pass" | "warn" | "fail";
+  required: boolean;
+  detail: string;
+  hint: string;
+}
+
+export type FindingSeverity = "info" | "low" | "medium" | "high" | "critical";
+export type FindingStatus = "open" | "confirmed" | "false_positive" | "fixed";
+export type FindingEvidence =
+  | { kind: "packet"; id: number }
+  | { kind: "connection" | "repeater" | "rule"; id: string };
+export interface Finding {
+  id: string;
+  title: string;
+  severity: FindingSeverity;
+  status: FindingStatus;
+  description: string;
+  reproductionSteps: string;
+  createdAtMicros: number;
+  updatedAtMicros: number;
+  evidence: FindingEvidence[];
+  tags: string[];
+}
+
+export interface ConnectionComparison {
+  rows: {
+    a: PacketSummary | null;
+    b: PacketSummary | null;
+    kind: "identical" | "changed" | "only_a" | "only_b";
+    size_delta: number;
+    first_difference: number | null;
+  }[];
+  names: { name: string; a: number; b: number; differ: number }[];
+}
