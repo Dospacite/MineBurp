@@ -79,3 +79,23 @@ the comparison does not cover the complete payload.
 Fields show changed values and fields absent from either side. Clear **Only
 changed** to include equal fields. Swap A/B to reverse the comparison, or clear
 the slots to choose another pair. Comparing packets sends no traffic.
+
+Choose **Connections** in Compare to align two recorded sessions. A and B default
+to the two most recently recorded connections. Enable **Apply Traffic filter** to
+scope both sequences with the current Traffic predicates; the connection picker
+overrides the filter's connection selection. Compare takes a snapshot when run;
+refresh by pressing Compare again.
+
+Sequences align independently in each direction by state and packet name. Rows
+show identical payloads, changed bytes with B-minus-A size and first differing
+offset, or packets present only on one side. Hide identical rows or choose a
+direction. F7 / Shift+F7 and n / p navigate differences. Selecting a changed pair
+opens the packet byte/field diff. **Show in Traffic** opens that connection.
+The name table counts packets in A and B and changed/unmatched alignment rows.
+
+Comparison reads database pages with the history read budget/cancellation and
+runs on the blocking pool. It allows 20,000 packets per connection, 1,024 sequence
+edits per direction and 30 seconds of work. Narrow the filter if a limit is hit.
+Payload equality checks complete bytes in 256 KiB windows; packet detail still
+uses its existing leading-1-MiB display limit. Direction groups are separate,
+so cross-direction timing is not compared.

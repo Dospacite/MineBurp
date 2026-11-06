@@ -602,6 +602,13 @@ export function App() {
             {view === "compare" && (
               <ErrorBoundary>
                 <CompareView
+                  key={projectPath}
+                  filter={workbench.packetFilter}
+                  onTraffic={(packet) => {
+                    setConnectionId(packet.connection_id);
+                    void workbench.selectPacket(packet.id);
+                    setView("traffic");
+                  }}
                   slots={compare}
                   onSwap={() => setCompare(({ a, b }) => ({ a: b, b: a }))}
                   onClear={() => setCompare({ a: null, b: null })}

@@ -117,3 +117,15 @@ The desktop `replacement_rules_set` command accepts optional `expectedPath`.
 When supplied, it must equal the current project path. Rule expressions are
 validated and saved before the live proxy applies them. MCP rule edits hold a
 mutex for the project throughout the read, modification, save, and apply steps.
+
+### Connection comparison
+
+`connections action="compare" a="<connection id>" b="<connection id>"` aligns
+recorded packet sequences per direction. Optional `filter` accepts the same
+filter object as `packets` (including `expr`, `dir`, `states`, and content search).
+Text returns the row/difference totals and first 20 differences; `limit` bounds
+that list to at most 100. `format="json"` returns all bounded alignment rows and
+per-name counts, including packet summaries, `kind`, `size_delta` (B minus A),
+and `first_difference` (byte offset or null). This action sends no traffic.
+The limits are 20,000 packets per side, 1,024 edits per direction and a 30-second
+comparison budget. Limit errors suggest narrowing the filter.

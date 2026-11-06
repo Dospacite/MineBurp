@@ -2,11 +2,12 @@ import { ArrowLeftRight, Loader2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { EmptyState } from "../components/EmptyState";
-import type { PacketView } from "../domain/types";
+import type { PacketHistoryQuery, PacketSummary, PacketView } from "../domain/types";
 import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
 import { desktop, readPayload } from "../lib/desktop";
 import { changedBytes, type DiffRun, diffBytes, diffFields, SEQUENCE_DIFF_LIMIT } from "../lib/diff";
+import { ConnectionCompare } from "./ConnectionCompare";
 
 /** Bytes compared at most; larger packets compare their leading part. */
 const COMPARE_LIMIT = 1024 * 1024;
@@ -29,7 +30,7 @@ interface Side {
  * the decode. The byte diff aligns insertions — a longer string, a grown
  * VarInt — instead of reporting every byte after them as different.
  */
-export function CompareView({
+export function PacketCompareView({
   slots,
   onSwap,
   onClear,
@@ -282,5 +283,41 @@ function ByteDiff({ runs, a, b }: { runs: DiffRun[]; a: Uint8Array; b: Uint8Arra
         </li>
       ))}
     </ol>
+  );
+}
+
+export function CompareView(
+  props: Parameters<typeof PacketCompareView>[0] & {
+    filter?: PacketHistoryQuery;
+    onTraffic?: (packet: PacketSummary) => void;
+  },
+) {
+  const [mode, setMode] = useState("packets");
+  return (
+    <div className="compare-view">
+      <nav className="compare-header" aria-label={t("compare.mode")}>
+        <button
+          type="button"
+          className="button"
+          aria-pressed={mode === "packets"}
+          onClick={() => setMode("packets")}
+        >
+          {t("compare.packets")}
+        </button>
+        <button
+          type="button"
+          className="button"
+          aria-pressed={mode === "connections"}
+          onClick={() => setMode("connections")}
+        >
+          {t("compare.connections")}
+        </button>
+      </nav>
+      {mode === "packets" ? (
+        <PacketCompareView {...props} />
+      ) : (
+        <ConnectionCompare filter={props.filter ?? {}} onTraffic={props.onTraffic} onError={props.onError} />
+      )}
+    </div>
   );
 }

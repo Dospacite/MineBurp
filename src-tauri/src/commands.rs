@@ -236,13 +236,20 @@ pub fn project_current(state: State<'_, DesktopState>) -> Option<ProjectView> {
 #[tauri::command]
 pub async fn connections_query(
     state: State<'_, DesktopState>,
+    recent: Option<bool>,
 ) -> CommandResult<Vec<ConnectionSnapshot>> {
     const CONNECTION_LIMIT: usize = 200;
     let store = current_project(&state)?;
-    tauri::async_runtime::spawn_blocking(move || store.list_connections(CONNECTION_LIMIT))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        if recent.unwrap_or(false) {
+            store.recent_connections(CONNECTION_LIMIT)
+        } else {
+            store.list_connections(CONNECTION_LIMIT)
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1457,4 +1464,18 @@ pub async fn replacement_rule_preview(
         )
     })
     .await
+}
+
+#[tauri::command]
+pub async fn connections_compare(
+    state: State<'_, DesktopState>,
+    a: Uuid,
+    b: Uuid,
+    filter: Option<PacketFilterInput>,
+) -> CommandResult<ops::ConnectionComparison> {
+    let store = current_project(&state)?;
+    let query = filter.unwrap_or_default().into_query()?;
+    tauri::async_runtime::spawn_blocking(move || ops::compare_connections(&store, a, b, &query))
+        .await
+        .map_err(|e| e.to_string())?
 }

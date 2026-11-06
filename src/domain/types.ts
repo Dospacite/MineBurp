@@ -610,3 +610,14 @@ export type PayloadGenerator =
   | { kind: "boundaries"; bits: number; signed: boolean }
   | { kind: "lengths"; start: number; end: number; step: number; unit: string }
   | { kind: "values"; values: string[] };
+
+export interface ConnectionComparison {
+  rows: {
+    a: PacketSummary | null;
+    b: PacketSummary | null;
+    kind: "identical" | "changed" | "only_a" | "only_b";
+    size_delta: number;
+    first_difference: number | null;
+  }[];
+  names: { name: string; a: number; b: number; differ: number }[];
+}

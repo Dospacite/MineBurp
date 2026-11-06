@@ -45,6 +45,7 @@ pub fn run() {
             commands::project_current,
             commands::project_checkpoint,
             commands::connections_query,
+            commands::connections_compare,
             commands::packets_query,
             commands::packets_export,
             commands::packets_export_pcapng,

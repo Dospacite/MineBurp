@@ -152,7 +152,13 @@ export const desktop = {
   setNetworkConditions: (conditions: NetworkConditions) =>
     call<NetworkConditions>("network_conditions_set", { conditions }),
   /** Proxy sessions and passively observed flows, as recorded in the project. */
-  connections: () => call<ConnectionSnapshot[]>("connections_query"),
+  compareConnections: (a: string, b: string, query: PacketHistoryQuery = {}) =>
+    call<import("../domain/types").ConnectionComparison>("connections_compare", {
+      a,
+      b,
+      filter: filterArgs(query),
+    }),
+  connections: (recent = false) => call<ConnectionSnapshot[]>("connections_query", { recent }),
   packets: (query: PacketHistoryQuery = {}) =>
     call<PacketSummary[]>("packets_query", { filter: filterArgs(query) }),
   /** Writes every packet matching the filter to a JSON file; resolves to the count written. */
