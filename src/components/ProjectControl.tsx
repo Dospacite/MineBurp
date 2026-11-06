@@ -1,7 +1,7 @@
 import { Clock, FolderOpen, Loader2, LockKeyhole, Plus, Save, X } from "lucide-react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
-import type { ProjectInfo } from "../domain/types";
+import type { ProjectInfo, RecoveredSession } from "../domain/types";
 import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
 import { desktop } from "../lib/desktop";
@@ -26,6 +26,52 @@ export function ProjectControl({
   const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState<RecentProject[]>(recentProjects);
+  const [recovered, setRecovered] = useState<RecoveredSession[]>([]);
+  const [scope, setScope] = useState("");
+  const [deleting, setDeleting] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    void desktop
+      .projectScopeGet()
+      .then((patterns) => {
+        if (active) setScope(patterns.join("\n"));
+      })
+      .catch((reason) => {
+        if (active) onError(message(reason));
+      });
+    void desktop
+      .projectRecoveredList()
+      .then((entries) => {
+        if (active) setRecovered(entries);
+      })
+      .catch((reason) => {
+        if (active) onError(message(reason));
+      });
+    return () => {
+      active = false;
+    };
+  }, [open, onError]);
+  async function deleteRecovered(target: string) {
+    setBusy(true);
+    try {
+      await desktop.projectRecoveredDelete(target);
+      setRecovered((entries) => entries.filter((entry) => entry.path !== target));
+      setDeleting(null);
+    } catch (reason) {
+      onError(message(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function saveRecovered(target: string) {
+    try {
+      const destination = await chooseProjectDestination("Recovered session");
+      if (destination) await run(() => desktop.projectRecoveredSaveAs(target, destination));
+    } catch (reason) {
+      onError(message(reason));
+    }
+  }
   const root = useRef<HTMLDivElement>(null);
   const passphraseInput = useRef<HTMLInputElement>(null);
   const temporary = project?.temporary ?? false;
@@ -207,6 +253,97 @@ export function ProjectControl({
             )}
             {t(`project.${mode}.button`)}
           </button>
+          <fieldset disabled={busy}>
+            <legend>Authorized target scope</legend>
+            <label>
+              One host, wildcard or CIDR per line, with optional port
+              <textarea
+                aria-label="Target scope"
+                value={scope}
+                onChange={(event) => setScope(event.target.value)}
+                placeholder="*.example.com:25565"
+              />
+            </label>
+            <p className="project-hint">
+              Empty scope permits all targets. Out-of-scope targets connect directly.
+            </p>
+            <button
+              type="button"
+              className="button"
+              onClick={() => {
+                setBusy(true);
+                void desktop
+                  .projectScopeSet(
+                    scope
+                      .split("\n")
+                      .map((line) => line.trim())
+                      .filter(Boolean),
+                  )
+                  .catch((reason) => onError(message(reason)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Save scope
+            </button>
+          </fieldset>
+          {recovered.length > 0 && (
+            <div className="recent-projects">
+              <span className="recent-heading">Recovered sessions</span>
+              <ul>
+                {recovered.map((entry) => (
+                  <li key={entry.path}>
+                    <div>
+                      <strong>{entry.path.split(/[\\/]/).pop()}</strong>
+                      <small>
+                        {entry.packets === null ? "Unreadable" : `${entry.packets.toLocaleString()} packets`}{" "}
+                        · {new Date(entry.modified_millis).toLocaleString()}
+                      </small>
+                      <button
+                        type="button"
+                        className="button"
+                        disabled={busy}
+                        onClick={() => void run(() => desktop.projectOpen(entry.path))}
+                      >
+                        Open
+                      </button>
+                      <button
+                        type="button"
+                        className="button"
+                        disabled={busy}
+                        onClick={() => void saveRecovered(entry.path)}
+                      >
+                        Save as…
+                      </button>
+                      {deleting === entry.path ? (
+                        <fieldset aria-label="Confirm session deletion">
+                          <span>Permanently delete this recovered session?</span>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void deleteRecovered(entry.path)}
+                          >
+                            Delete permanently
+                          </button>
+                          <button type="button" disabled={busy} onClick={() => setDeleting(null)}>
+                            Cancel
+                          </button>
+                        </fieldset>
+                      ) : (
+                        <button
+                          type="button"
+                          className="button"
+                          disabled={busy}
+                          onClick={() => setDeleting(entry.path)}
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {mode === "open" && otherRecent.length > 0 && (
             <div className="recent-projects">
               <span className="recent-heading">

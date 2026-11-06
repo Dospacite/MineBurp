@@ -132,3 +132,13 @@ per-name counts, including packet summaries, `kind`, `size_delta` (B minus A),
 and `first_difference` (byte offset or null). This action sends no traffic.
 The limits are 20,000 packets per side, 1,024 edits per direction and a 30-second
 comparison budget. Limit errors suggest narrowing the filter.
+
+The `project` tool accepts `action="scope"` to show the project's target allowlist.
+Pass `patterns=["*.example.com:25565", "10.0.0.0/8", "[2001:db8::/32]:25565"]`
+to replace it. An empty array restores unrestricted operation. Exact hostnames
+are case insensitive; wildcard patterns match subdomains only. CIDRs match
+literal IP targets without DNS resolution. Scope applies to routes, Repeater,
+Intercept, and replacement rules in the running app. Out-of-scope route requests
+fail so the Java agent can connect directly. With a scope set, `status` lists
+the patterns and the number of refused routes. `route` refuses out-of-scope
+targets.

@@ -345,6 +345,24 @@
           "markdownDescription": "Enables the intruder_plan command without any pre-configured scope."
         },
         {
+          "description": "Enables the lab_listener_active command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-lab-listener-active",
+          "markdownDescription": "Enables the lab_listener_active command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the lab_listener_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-lab-listener-start",
+          "markdownDescription": "Enables the lab_listener_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the lab_listener_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-lab-listener-stop",
+          "markdownDescription": "Enables the lab_listener_stop command without any pre-configured scope."
+        },
+        {
           "description": "Enables the launcher_client_assist_configure command without any pre-configured scope.",
           "type": "string",
           "const": "allow-launcher-client-assist-configure",
@@ -489,10 +507,40 @@
           "markdownDescription": "Enables the project_open command without any pre-configured scope."
         },
         {
+          "description": "Enables the project_recovered_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-recovered-delete",
+          "markdownDescription": "Enables the project_recovered_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_recovered_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-recovered-list",
+          "markdownDescription": "Enables the project_recovered_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_recovered_save_as command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-recovered-save-as",
+          "markdownDescription": "Enables the project_recovered_save_as command without any pre-configured scope."
+        },
+        {
           "description": "Enables the project_save_as command without any pre-configured scope.",
           "type": "string",
           "const": "allow-project-save-as",
           "markdownDescription": "Enables the project_save_as command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_scope_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-scope-get",
+          "markdownDescription": "Enables the project_scope_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_scope_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-scope-set",
+          "markdownDescription": "Enables the project_scope_set command without any pre-configured scope."
         },
         {
           "description": "Enables the protocol_versions command without any pre-configured scope.",
@@ -777,6 +825,24 @@
           "markdownDescription": "Denies the intruder_plan command without any pre-configured scope."
         },
         {
+          "description": "Denies the lab_listener_active command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-lab-listener-active",
+          "markdownDescription": "Denies the lab_listener_active command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the lab_listener_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-lab-listener-start",
+          "markdownDescription": "Denies the lab_listener_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the lab_listener_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-lab-listener-stop",
+          "markdownDescription": "Denies the lab_listener_stop command without any pre-configured scope."
+        },
+        {
           "description": "Denies the launcher_client_assist_configure command without any pre-configured scope.",
           "type": "string",
           "const": "deny-launcher-client-assist-configure",
@@ -921,10 +987,40 @@
           "markdownDescription": "Denies the project_open command without any pre-configured scope."
         },
         {
+          "description": "Denies the project_recovered_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-recovered-delete",
+          "markdownDescription": "Denies the project_recovered_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_recovered_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-recovered-list",
+          "markdownDescription": "Denies the project_recovered_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_recovered_save_as command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-recovered-save-as",
+          "markdownDescription": "Denies the project_recovered_save_as command without any pre-configured scope."
+        },
+        {
           "description": "Denies the project_save_as command without any pre-configured scope.",
           "type": "string",
           "const": "deny-project-save-as",
           "markdownDescription": "Denies the project_save_as command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_scope_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-scope-get",
+          "markdownDescription": "Denies the project_scope_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_scope_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-scope-set",
+          "markdownDescription": "Denies the project_scope_set command without any pre-configured scope."
         },
         {
           "description": "Denies the protocol_versions command without any pre-configured scope.",

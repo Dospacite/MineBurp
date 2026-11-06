@@ -147,7 +147,7 @@ mod tests {
             .unwrap();
         drop(store);
         let store = ProjectStore::open(&path, ProjectOptions::default()).unwrap();
-        assert_eq!(store.info().schema_version, 7);
+        assert_eq!(store.info().schema_version, 8);
         let f = store.create_finding(fixture()).unwrap();
         let evidence = Evidence::Packet(99999);
         store.add_finding_evidence(f.id, evidence.clone()).unwrap();

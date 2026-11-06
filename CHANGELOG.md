@@ -6,6 +6,11 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 
 ### Added
 
+- Recovered sessions in the project menu with packet counts and dates, and Open, Save as…, and confirmed Delete actions confined to the private recovered-sessions directory.
+- Per-project target scope: an allowlist of exact hosts, `*.example.com` wildcards, and IPv4/IPv6 CIDRs with optional ports (project migration 8; migration 7 is reserved for findings). Out-of-scope agent routes are refused so the client connects directly, and Repeater, Intercept, and replacement rules skip out-of-scope connections. Traffic shows an out-of-scope badge and refused-route count; MCP `project action=scope` shows and sets the scope.
+- Lab listener panel in Traffic: a loopback-only address toward a target for headless offline lab clients, with optional stay-armed mode (at most eight concurrent clients, stops after 60 idle seconds), subject to target scope.
+- Exit cleanup stops capture and live sessions and closes every shared project database handle before deleting the temporary project, so Windows can remove the file.
+
 - Setup diagnostics with bounded dumpcap probing, capture permission hints, stale assistance reconfiguration, and a Decrypt warning when no agent is connected.
 
 - Project findings with bounded evidence, severity/status tracking, desktop and MCP CRUD, and Markdown/HTML reporting.

@@ -212,3 +212,13 @@ for full-capture SQL aggregation. Custom history columns decode only mounted row
 through bounded batch commands; decoding never moves into capture-time work.
 
 Live Save As uses `ProjectStore::save_as_and_handoff`: the source writer remains locked through export to a private `.partial` file, metadata initialization, sync, publication, and replacement of the shared writer connection. Existing store clones therefore persist subsequent batches to the saved database. Passive flow identity survives the handoff. Ordinary `save_as` remains a snapshot copy. Desktop history pages use `query_history_page`; `interrupt_reads` affects that reader class only, leaving exports and analysis alone. Export ops default to refusing existing targets; `export_json_with_overwrite` and `export_pcapng_with_overwrite` accept an explicit overwrite boolean and still reject symlinks.
+
+Project migration 8 adds the ordered target scope allowlist. Migration 7 is a
+placeholder on this branch and must be replaced by the findings migration at
+integration. Scope parsing lives in core; project storage validates writes;
+proxy policy gates route creation, Repeater, rules, and Intercept. The desktop
+adds scope status to connection views without changing persisted snapshots.
+Recovery metadata is read on the blocking pool and deletion requires a direct,
+non-symlink child of the private recovered directory. Exit cleanup replaces
+shared SQLite readers and writer with memory handles before deleting scratch
+files, so surviving capture and proxy clones cannot keep a Windows file open.

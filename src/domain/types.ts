@@ -48,6 +48,7 @@ export type ConnectionStatus =
 export type LoaderKind = "vanilla" | "fabric" | "quilt" | "forge" | "neo_forge" | "unknown";
 
 export interface ConnectionSnapshot {
+  in_scope?: boolean;
   id: string;
   target: Target;
   listener_address: string;
@@ -281,10 +282,21 @@ export interface AppCapabilities {
   protocol_max: number;
 }
 
+/** An abandoned temporary session kept in the private recovered directory. */
+export interface RecoveredSession {
+  path: string;
+  /** Null when the file could not be opened; it can still be deleted. */
+  packets: number | null;
+  modified_millis: number;
+}
+
 export interface DecryptModeStatus {
   enabled: boolean;
   route_adapter: string;
   active_sessions: number;
+  /** Agent routes refused because their target was outside the project scope. */
+  out_of_scope_refusals?: number;
+  scope_restricted?: boolean;
 }
 
 /**

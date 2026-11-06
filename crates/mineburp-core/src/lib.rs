@@ -21,3 +21,4 @@ pub mod research;
 
 mod findings;
 pub use findings::{Evidence, Finding, FindingStatus, Severity};
+pub mod scope;

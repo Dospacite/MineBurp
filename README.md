@@ -157,6 +157,25 @@ Decrypt mode uses an authenticated client-side route adapter instead of silently
 
 See [docs/CLIENT_ASSISTANCE.md](docs/CLIENT_ASSISTANCE.md) for launcher-specific setup, the local protocol, and its security boundary.
 
+### Recovery, target scope, and lab listeners
+
+The project menu lists recovered sessions after an interrupted run, with packet
+counts and modification dates. Open one, save a copy with Save as, or delete it
+with confirmation. Recovery files stay in the private application data directory.
+
+Use Authorized target scope in the project menu to allow exact hosts,
+`*.example.com` subdomains, or IPv4/IPv6 CIDRs, optionally restricted to a port.
+Use brackets around IPv6 patterns when specifying a port. Empty scope preserves
+unrestricted behavior. Outside-scope agent connections continue directly;
+Repeater, Intercept and replacement rules skip those connections. Traffic
+marks connections outside scope and counts refused agent routes under the
+Decrypt switch.
+
+Traffic's Lab listener panel creates a loopback address for a headless offline
+lab client without a Java agent. Stay armed accepts repeated connections until
+stopped or idle for 60 seconds, with at most eight concurrent clients. Scope
+applies to the configured target.
+
 ## Optional direct Microsoft login
 
 MineBurp does **not** bundle a third party's Microsoft client ID. Microsoft login is not required for automatic traffic capture.

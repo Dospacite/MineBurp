@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use mineburp_mcp::ops::{self, PacketFilterInput, PathPurpose, PcapExportSummary, validate_path};
 
-use crate::state::{AuthenticatedAccount, DesktopState, PendingAuth};
+use crate::state::{AuthenticatedAccount, DesktopState, PendingAuth, RecoveredSession};
 
 type CommandResult<T> = Result<T, String>;
 const AUTH_CALLBACK_URL: &str = "http://localhost:53682/callback";
@@ -48,6 +48,9 @@ pub struct DecryptModeStatus {
     enabled: bool,
     route_adapter: &'static str,
     active_sessions: usize,
+    /// Agent routes refused because the target was outside the project scope.
+    out_of_scope_refusals: u64,
+    scope_restricted: bool,
 }
 
 /// Probing capture runs `dumpcap -D`, which can take seconds; a synchronous
@@ -81,6 +84,8 @@ pub fn decrypt_mode_status(state: State<'_, DesktopState>) -> DecryptModeStatus 
         enabled: state.decrypt_mode_enabled(),
         route_adapter: "private client-assisted loopback routes",
         active_sessions: state.proxy.sessions().len(),
+        out_of_scope_refusals: state.proxy.out_of_scope_refusals(),
+        scope_restricted: !state.proxy.target_scope().is_empty(),
     }
 }
 
@@ -244,15 +249,25 @@ pub fn project_current(state: State<'_, DesktopState>) -> Option<ProjectView> {
 pub async fn connections_query(
     state: State<'_, DesktopState>,
     recent: Option<bool>,
-) -> CommandResult<Vec<ConnectionSnapshot>> {
+) -> CommandResult<Vec<ScopedConnection>> {
     const CONNECTION_LIMIT: usize = 200;
     let store = current_project(&state)?;
+    let patterns = state.proxy.target_scope();
     tauri::async_runtime::spawn_blocking(move || {
-        if recent.unwrap_or(false) {
+        let connections = if recent.unwrap_or(false) {
             store.recent_connections(CONNECTION_LIMIT)
         } else {
             store.list_connections(CONNECTION_LIMIT)
-        }
+        };
+        connections.map(|connections| {
+            connections
+                .into_iter()
+                .map(|connection| ScopedConnection {
+                    in_scope: mineburp_core::scope::contains(&patterns, &connection.target),
+                    connection,
+                })
+                .collect()
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -586,8 +601,16 @@ pub async fn inspect_bytes(
 }
 
 #[tauri::command]
-pub fn proxy_sessions(state: State<'_, DesktopState>) -> Vec<ConnectionSnapshot> {
-    state.proxy.sessions()
+pub fn proxy_sessions(state: State<'_, DesktopState>) -> Vec<ScopedConnection> {
+    state
+        .proxy
+        .sessions()
+        .into_iter()
+        .map(|connection| ScopedConnection {
+            in_scope: state.proxy.target_in_scope(&connection.target),
+            connection,
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -1496,4 +1519,90 @@ pub async fn connections_compare(
     tauri::async_runtime::spawn_blocking(move || ops::compare_connections(&store, a, b, &query))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Abandoned temporary sessions, each validated against the private
+/// recovered-sessions directory before it is opened read-only.
+#[tauri::command]
+pub async fn project_recovered_list(
+    state: State<'_, DesktopState>,
+) -> CommandResult<Vec<RecoveredSession>> {
+    let paths = state.valid_recovered_paths();
+    tauri::async_runtime::spawn_blocking(move || crate::state::describe_recovered(paths))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn project_recovered_delete(
+    state: State<'_, DesktopState>,
+    path: PathBuf,
+) -> CommandResult<()> {
+    state.delete_recovered(&path)
+}
+
+#[tauri::command]
+pub async fn project_recovered_save_as(
+    state: State<'_, DesktopState>,
+    path: PathBuf,
+    destination: PathBuf,
+) -> CommandResult<ProjectView> {
+    let path = state.validate_recovered(&path)?;
+    let destination = validate_path(&destination, PathPurpose::NewProject, &[])?;
+    let store = tauri::async_runtime::spawn_blocking(move || {
+        crate::state::copy_recovered(&path, &destination)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    install_project(&state, store).await
+}
+
+#[tauri::command]
+pub fn project_scope_get(state: State<'_, DesktopState>) -> CommandResult<Vec<String>> {
+    current_project(&state)?
+        .target_scope()
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub fn project_scope_set(
+    state: State<'_, DesktopState>,
+    patterns: Vec<String>,
+) -> CommandResult<()> {
+    current_project(&state)?
+        .set_target_scope(&patterns)
+        .map_err(|e| e.to_string())?;
+    state.proxy.set_target_scope(patterns)
+}
+
+#[tauri::command]
+pub async fn lab_listener_start(
+    state: State<'_, DesktopState>,
+    host: String,
+    port: u16,
+    stay_armed: bool,
+) -> CommandResult<(uuid::Uuid, String)> {
+    if host.trim().is_empty() || port == 0 {
+        return Err("host and nonzero port required".into());
+    }
+    state
+        .proxy
+        .start_lab_listener(mineburp_core::Target { host, port }, stay_armed)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub fn lab_listener_stop(state: State<'_, DesktopState>, id: uuid::Uuid) {
+    state.proxy.stop_lab_listener(id);
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScopedConnection {
+    #[serde(flatten)]
+    connection: ConnectionSnapshot,
+    in_scope: bool,
+}
+
+#[tauri::command]
+pub fn lab_listener_active(state: State<'_, DesktopState>, id: uuid::Uuid) -> bool {
+    state.proxy.lab_listener_active(id)
 }

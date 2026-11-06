@@ -22,14 +22,19 @@ pub fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "project",
-            description: "Project file operations. actions: info (default), open, create, save_as, checkpoint, compact, export (path .json or .pcapng, filter), import (pcap/pcapng into the project), delete_packets (filter; empty filter needs confirm=true). Paths must be absolute.",
+            description: "Project file operations. scope shows the allowlist or sets patterns when provided. actions: info (default), open, create, save_as, checkpoint, compact, export (path .json or .pcapng, filter), import (pcap/pcapng into the project), delete_packets (filter; empty filter needs confirm=true). Paths must be absolute.",
             schema: object(
                 &[
+                    (
+                        "patterns",
+                        super::strings("Scope patterns; empty array permits all targets"),
+                    ),
                     (
                         "action",
                         choice(
                             &[
                                 "info",
+                                "scope",
                                 "open",
                                 "create",
                                 "save_as",
@@ -187,6 +192,24 @@ pub async fn project(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
         }
     }
     match args.action("info").as_str() {
+        "scope" => {
+            let store = ctx.project()?;
+            if let Some(value) = args.get("patterns") {
+                let patterns: Vec<String> =
+                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                store
+                    .set_target_scope(&patterns)
+                    .map_err(|e| e.to_string())?;
+                if let Some(proxy) = ctx.host.proxy() {
+                    proxy.set_target_scope(patterns)?;
+                    ctx.host.notify("project");
+                }
+            }
+            Ok(
+                serde_json::to_string(&store.target_scope().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?,
+            )
+        }
         "info" => Ok(info_text(ctx, &ctx.project()?)),
         "open" => {
             let path = validate_path(

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lab-listener-start"
+description = "Enables the lab_listener_start command without any pre-configured scope."
+commands.allow = ["lab_listener_start"]
+
+[[permission]]
+identifier = "deny-lab-listener-start"
+description = "Denies the lab_listener_start command without any pre-configured scope."
+commands.deny = ["lab_listener_start"]
