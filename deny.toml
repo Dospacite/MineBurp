@@ -9,7 +9,6 @@ wildcards = "allow"
 highlight = "all"
 
 [licenses]
-unlicensed = "deny"
 allow = [
   "MIT",
   "Apache-2.0",
@@ -17,6 +16,10 @@ allow = [
   "Unicode-DFS-2016",
   "BSD-3-Clause",
   "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
 ]
 confidence-threshold = 0.8
 exceptions = []
@@ -26,7 +29,3 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
-
-[features]
-allow-features = []
-deny-features = []

@@ -1,0 +1,13 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+const root = fileURLToPath(new URL('../', import.meta.url));
+const version = process.argv[2];
+if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version ?? '')) throw new Error('Usage: npm run bump:version -- X.Y.Z');
+const cargo = readFileSync(`${root}Cargo.toml`, 'utf8');
+const updated = cargo.replace(/(\[workspace\.package\][\s\S]*?^version = ")[^"]+("$)/m, (_, prefix, suffix) => `${prefix}${version}${suffix}`);
+if (updated === cargo && !cargo.includes(`version = "${version}"`)) throw new Error("Workspace version not found");
+const pkg = JSON.parse(readFileSync(`${root}package.json`, 'utf8'));
+const lock = JSON.parse(readFileSync(`${root}package-lock.json`, 'utf8'));
+pkg.version = lock.version = lock.packages[''].version = version;
+writeFileSync(`${root}Cargo.toml`, updated);
+for (const [name, value] of [['package.json', pkg], ['package-lock.json', lock]]) writeFileSync(`${root}${name}`, `${JSON.stringify(value, null, 2)}\n`);

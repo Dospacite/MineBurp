@@ -1,0 +1,41 @@
+name: Fuzz
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Build every discovered target
+        working-directory: fuzz
+        run: |
+          cargo +nightly fuzz list > targets.txt
+          test -s targets.txt
+          while read -r target; do cargo +nightly fuzz build "$target"; done < targets.txt
+      - name: Run every target for 60 seconds
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: fuzz
+        run: |
+          failed=0
+          while read -r target; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=512 -timeout=1 || failed=1
+          done < targets.txt
+          exit "$failed"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

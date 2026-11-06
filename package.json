@@ -14,7 +14,9 @@
     "lint": "biome check src",
     "lint:fix": "biome check --write src",
     "format": "biome format --write src",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "bump:version": "node scripts/bump-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
