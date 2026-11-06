@@ -130,6 +130,9 @@ with what it reads as instead, rather than renamed.
 
 ## First run
 
+Open **Setup** from Instances or the command palette to check capture permissions, procfs, the agent JAR, broker, launcher configuration, and connected agents. A banner appears while required checks fail. Checks enumerate interfaces without starting capture and time out after two seconds.
+
+
 ### Passive observation
 
 1. Start MineBurp. The **Traffic** view starts system capture automatically and records into a temporary project, so nothing is lost before you decide where to keep it.

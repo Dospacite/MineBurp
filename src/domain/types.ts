@@ -610,3 +610,11 @@ export type PayloadGenerator =
   | { kind: "boundaries"; bits: number; signed: boolean }
   | { kind: "lengths"; start: number; end: number; step: number; unit: string }
   | { kind: "values"; values: string[] };
+
+export interface SetupCheck {
+  id: string;
+  status: "pass" | "warn" | "fail";
+  required: boolean;
+  detail: string;
+  hint: string;
+}

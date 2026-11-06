@@ -24,6 +24,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ErrorLog } from "./components/ErrorLog";
 import type { PacketActions } from "./components/PacketHistory";
 import { ProjectControl } from "./components/ProjectControl";
+import { openSetup, SetupPanel } from "./components/SetupPanel";
 import { Toast } from "./components/Toast";
 import type { PacketView, SavedFilter, View } from "./domain/types";
 import { message, useMineBurp } from "./hooks/useMineBurp";
@@ -254,6 +255,7 @@ export function App() {
     };
   }, [paletteOpen, setError]);
   const paletteCommands: PaletteCommand[] = [
+    { id: "setup", label: "Open Setup", keywords: "capture dumpcap agent assistance", run: openSetup },
     ...navigation.map((item) => ({
       id: `view-${item.id}`,
       label: t(item.labelKey),
@@ -618,6 +620,7 @@ export function App() {
             onError={setError}
           />
         </div>
+        <SetupPanel banner />
         {paletteOpen && <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} />}
         {logOpen && (
           <ErrorLog

@@ -20,6 +20,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "allow-app-capabilities",
+    "allow-setup-check",
     "allow-decrypt-mode-status",
     "allow-decrypt-mode-set",
     "allow-capture-start",

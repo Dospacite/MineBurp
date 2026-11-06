@@ -88,6 +88,7 @@ export function filterArgs(query: PacketHistoryQuery) {
 
 export const desktop = {
   isAvailable: inTauri,
+  setupCheck: () => call<import("../domain/types").SetupCheck[]>("setup_check"),
   intruderPlan: (mode: AttackMode, lengths: number[]) =>
     call<Array<Array<number | null>>>("intruder_plan", { mode, lengths }),
   sequencerAnalyze: (samples: string[]) => call<SequenceAnalysis>("sequencer_analyze", { samples }),

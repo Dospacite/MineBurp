@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { ContextMenu, type MenuItem } from "../components/ContextMenu";
+import { DecryptWarning } from "../components/DecryptWarning";
 import { DeleteHistoryDialog } from "../components/DeleteHistoryDialog";
 import { EmptyState } from "../components/EmptyState";
 import { ImportCaptureDialog } from "../components/ImportCaptureDialog";
@@ -231,6 +232,7 @@ export function TrafficView({
       className="capture-layout"
     >
       <aside className="flow-pane" aria-label={t("traffic.capture.sidebar")}>
+        <DecryptWarning enabled={decryptEnabled} />
         <div className={`decrypt-control ${decryptEnabled ? "enabled" : ""}`}>
           <span className="decrypt-icon" aria-hidden="true">
             {decryptEnabled ? <ShieldCheck size={16} /> : <ShieldOff size={16} />}

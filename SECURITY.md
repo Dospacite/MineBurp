@@ -18,6 +18,8 @@ MineBurp is intended for authorized testing of Minecraft clients and servers. Do
 - The MCP socket is created in a `0700` directory with mode `0600`, and every connection's peer credentials must match the socket's owner. A live socket owned by another MineBurp is never replaced. `MINEBURP_MCP=0` turns it off. MCP paths pass the same validation as the UI's, so an export cannot overwrite the open project.
 - Minecraft is launched as the desktop user; the whole MineBurp application should not be run with elevated privileges.
 
+Setup diagnostics only enumerate capture interfaces and inspect local prerequisites. They do not grant capture permissions. A Decrypt warning means no agent is currently connected; fail-open clients can still connect directly without inspection.
+
 ## Current boundaries
 
 - Launcher assistance is the default online-mode authentication path and does not require an Entra application. The optional direct Microsoft flow requires a public-client application ID configured by the distributor; no third-party ID is bundled.

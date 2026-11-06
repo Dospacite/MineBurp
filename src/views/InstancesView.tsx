@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
+import { openSetup } from "../components/SetupPanel";
 import type { ClientAssistStatus, InstanceDescriptor } from "../domain/types";
 import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
@@ -167,6 +168,9 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
     <div className="page-view">
       <div className="page-heading page-heading-row">
         <h1>{t("instances.title")}</h1>
+        <button type="button" className="button" onClick={openSetup}>
+          Setup
+        </button>
         <button type="button" className="button" onClick={refresh}>
           <RefreshCw size={14} /> {t("instances.refresh")}
         </button>
@@ -279,6 +283,19 @@ export function InstancesView({ onError }: { onError: (error: string) => void })
                   )}
                 </div>
                 <div className="instance-actions">
+                  {instance.client_assist_stale && (
+                    <>
+                      <span>Assistance is stale</span>
+                      <button
+                        type="button"
+                        className="button"
+                        disabled={configuring}
+                        onClick={() => void configureClientAssist(instance, true)}
+                      >
+                        Reconfigure
+                      </button>
+                    </>
+                  )}
                   {instance.supports_agent_configuration ? (
                     <button
                       type="button"

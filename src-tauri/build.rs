@@ -17,6 +17,7 @@ const COMMANDS: &[&str] = &[
     "intruder_plan",
     "sequencer_analyze",
     "app_capabilities",
+    "setup_check",
     "decrypt_mode_status",
     "decrypt_mode_set",
     "capture_start",

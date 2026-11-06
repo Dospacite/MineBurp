@@ -2,6 +2,7 @@ mod capture_project;
 mod commands;
 #[cfg(all(feature = "desktop-runtime", unix))]
 mod mcp;
+mod setup;
 mod state;
 
 #[cfg(feature = "desktop-runtime")]
@@ -34,6 +35,7 @@ pub fn run() {
             commands::intruder_plan,
             commands::sequencer_analyze,
             commands::app_capabilities,
+            commands::setup_check,
             commands::decrypt_mode_status,
             commands::decrypt_mode_set,
             commands::capture_start,

@@ -53,6 +53,13 @@ pub struct DecryptModeStatus {
 /// Probing capture runs `dumpcap -D`, which can take seconds; a synchronous
 /// command would run it on the main thread and freeze the window.
 #[tauri::command]
+pub async fn setup_check(
+    state: State<'_, DesktopState>,
+) -> CommandResult<Vec<crate::setup::SetupCheck>> {
+    crate::setup::setup_check(state).await
+}
+
+#[tauri::command]
 pub async fn app_capabilities(state: State<'_, DesktopState>) -> CommandResult<AppCapabilities> {
     let capture = state.capture.clone();
     let side_capture = tauri::async_runtime::spawn_blocking(move || capture.capabilities())

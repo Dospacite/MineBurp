@@ -573,6 +573,12 @@
           "markdownDescription": "Enables the sequencer_analyze command without any pre-configured scope."
         },
         {
+          "description": "Enables the setup_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-setup-check",
+          "markdownDescription": "Enables the setup_check command without any pre-configured scope."
+        },
+        {
           "description": "Enables the traffic_stats command without any pre-configured scope.",
           "type": "string",
           "const": "allow-traffic-stats",
@@ -985,6 +991,12 @@
           "type": "string",
           "const": "deny-sequencer-analyze",
           "markdownDescription": "Denies the sequencer_analyze command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the setup_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-setup-check",
+          "markdownDescription": "Denies the setup_check command without any pre-configured scope."
         },
         {
           "description": "Denies the traffic_stats command without any pre-configured scope.",

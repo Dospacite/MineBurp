@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-setup-check"
+description = "Enables the setup_check command without any pre-configured scope."
+commands.allow = ["setup_check"]
+
+[[permission]]
+identifier = "deny-setup-check"
+description = "Denies the setup_check command without any pre-configured scope."
+commands.deny = ["setup_check"]

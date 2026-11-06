@@ -1,5 +1,8 @@
 # Client assistance
 
+
+Use **Setup** in Instances or the command palette to diagnose prerequisites. Stale instance arguments show **Reconfigure**; restart the client after updating them. Traffic warns while Decrypt is enabled with no connected agent, since the client can connect directly without inspection.
+
 Automatic traffic capture does not require Microsoft login, an Entra application, or a Java agent. Client assistance becomes necessary when the opt-in **Decrypt connections** mode terminates an online-mode Minecraft connection. Minecraft continues to authenticate through its normal launcher. A small Java agent observes Authlib's existing session join and can ask that same in-process Authlib service to join a different upstream server hash.
 
 This works for vanilla and for Fabric, Quilt, Forge, and NeoForge because authentication reaches the same Authlib boundary before loader-specific login and plugin-channel traffic begins.
