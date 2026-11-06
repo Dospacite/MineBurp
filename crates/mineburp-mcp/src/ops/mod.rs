@@ -46,6 +46,15 @@ pub fn export_json(
     query: &PacketQuery,
     path: &Path,
 ) -> Result<usize, String> {
+    export_json_with_overwrite(store, query, path, false)
+}
+
+pub fn export_json_with_overwrite(
+    store: &ProjectStore,
+    query: &PacketQuery,
+    path: &Path,
+    overwrite: bool,
+) -> Result<usize, String> {
     const EXPORT_PAGE: usize = 500;
     let mut query = query.clone();
     query.limit = EXPORT_PAGE;
@@ -53,7 +62,11 @@ pub fn export_json(
     query.after_id = None;
     // Pages back with `before_id`, which needs newest-first pages.
     query.oldest_first = false;
-    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    check_export_target(path, overwrite)?;
+    let temporary =
+        tempfile::NamedTempFile::new_in(path.parent().ok_or("missing parent directory")?)
+            .map_err(|error| error.to_string())?;
+    let file = temporary.reopen().map_err(|error| error.to_string())?;
     let mut out = std::io::BufWriter::new(file);
     let mut written = 0usize;
     out.write_all(b"[").map_err(|error| error.to_string())?;
@@ -76,6 +89,8 @@ pub fn export_json(
     }
     out.write_all(b"\n]\n").map_err(|error| error.to_string())?;
     out.flush().map_err(|error| error.to_string())?;
+    drop(out);
+    publish_export(temporary, path, overwrite)?;
     Ok(written)
 }
 
@@ -86,10 +101,25 @@ pub fn export_pcapng(
     query: &PacketQuery,
     path: &Path,
 ) -> Result<PcapExportSummary, String> {
+    export_pcapng_with_overwrite(store, query, path, false)
+}
+
+pub fn export_pcapng_with_overwrite(
+    store: &ProjectStore,
+    query: &PacketQuery,
+    path: &Path,
+    overwrite: bool,
+) -> Result<PcapExportSummary, String> {
     let mut query = query.clone();
     query.offset = 0;
-    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
-    write_pcapng(store, &query, std::io::BufWriter::new(file))
+    check_export_target(path, overwrite)?;
+    let temporary =
+        tempfile::NamedTempFile::new_in(path.parent().ok_or("missing parent directory")?)
+            .map_err(|error| error.to_string())?;
+    let file = temporary.reopen().map_err(|error| error.to_string())?;
+    let summary = write_pcapng(store, &query, std::io::BufWriter::new(file))?;
+    publish_export(temporary, path, overwrite)?;
+    Ok(summary)
 }
 
 /// Reads a pcap or pcapng file into `store`.
@@ -186,3 +216,99 @@ pub fn decode_with_schema_packs(
 pub mod fields;
 
 pub mod rules;
+
+fn check_export_target(path: &Path, overwrite: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("export target must not be a symbolic link".into())
+        }
+        Ok(_) if !overwrite => {
+            Err("export target already exists; explicit overwrite required".into())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn publish_export(
+    temporary: tempfile::NamedTempFile,
+    path: &Path,
+    overwrite: bool,
+) -> Result<(), String> {
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    check_export_target(path, overwrite)?;
+    if overwrite {
+        temporary.persist(path)
+    } else {
+        temporary.persist_noclobber(path)
+    }
+    .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().ok_or("missing parent directory")?)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn refuses_existing_targets_and_publishes_only_complete_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("p.mineburp"),
+            "P",
+            mineburp_project::ProjectOptions::default(),
+        )
+        .unwrap();
+        let path = directory.path().join("launcher_profiles.json");
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(export_json(&store, &PacketQuery::default(), &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        export_json_with_overwrite(&store, &PacketQuery::default(), &path, true).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap(),
+            serde_json::json!([])
+        );
+    }
+    #[test]
+    fn failed_export_leaves_no_output_or_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProjectStore::create(
+            directory.path().join("p.mineburp"),
+            "P",
+            mineburp_project::ProjectOptions::default(),
+        )
+        .unwrap();
+        let path = directory.path().join("failed.json");
+        let before = std::fs::read_dir(directory.path()).unwrap().count();
+        let query = PacketQuery {
+            search: Some(mineburp_project::SearchTerm {
+                text: "[".into(),
+                regex: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(export_json(&store, &query, &path).is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinks_even_with_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("export.json");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(check_export_target(&link, true).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
+    }
+}

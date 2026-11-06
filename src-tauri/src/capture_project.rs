@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use mineburp_capture::SideChannelFrame;
 use mineburp_core::{
@@ -43,7 +43,7 @@ pub fn spawn_capture_project_writer(
 ) -> mpsc::Sender<SideChannelFrame> {
     let (sender, mut receiver) = mpsc::channel(16_384);
     tauri::async_runtime::spawn_blocking(move || {
-        let mut flows: HashMap<(PathBuf, String), ObservedFlow> = HashMap::new();
+        let mut flows: HashMap<(Uuid, String), ObservedFlow> = HashMap::new();
         let mut sequence = 0_u64;
         let mut pending = Vec::with_capacity(BATCH_LIMIT);
         while let Some(frame) = receiver.blocking_recv() {
@@ -114,13 +114,13 @@ fn build_detail(
     store: &ProjectStore,
     frame: &SideChannelFrame,
     sequence: u64,
-    flows: &mut HashMap<(PathBuf, String), ObservedFlow>,
+    flows: &mut HashMap<(Uuid, String), ObservedFlow>,
 ) -> (PacketDetail, ConnectionSnapshot) {
     let flow_key = format!(
         "{}|{}|{}",
         frame.protocol, frame.flow.local_address, frame.flow.remote_address
     );
-    let key = (store.info().path.clone(), flow_key);
+    let key = (store.identity(), flow_key);
     let observed = flows.entry(key).or_insert_with(|| ObservedFlow {
         id: Uuid::new_v4(),
         packet_count: 0,

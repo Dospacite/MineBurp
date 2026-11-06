@@ -44,6 +44,7 @@ pub struct DesktopState {
     /// project is that one. Capture always has somewhere to write, so packets
     /// are never held in a buffer that can age out from under the operator.
     pub temporary_project: RwLock<Option<PathBuf>>,
+    pub recovered_projects: RwLock<Vec<PathBuf>>,
     pub launchers: LauncherService,
     pub capture: Arc<dyn SideCapture>,
     pub pending_auth: RwLock<Option<PendingAuth>>,
@@ -73,6 +74,7 @@ impl DesktopState {
             proxy,
             project: Arc::new(RwLock::new(None)),
             temporary_project: RwLock::new(None),
+            recovered_projects: RwLock::new(Vec::new()),
             launchers: LauncherService::new(default_launcher_config()),
             capture: capture_backend(),
             pending_auth: RwLock::new(None),
@@ -103,6 +105,16 @@ impl DesktopState {
                 sessions_dir.display()
             ))
         })?;
+        *self.recovered_projects.write() = fs::read_dir(sessions_dir.join("recovered"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "mineburp")
+            })
+            .collect();
         let path = sessions_dir.join(format!(
             "{SESSION_PREFIX}{}-{}.mineburp",
             std::process::id(),
@@ -211,7 +223,7 @@ fn prepare_private_directory(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Deletes scratch projects a crashed or killed session left behind.
+/// Moves abandoned scratch projects and sidecars into the private recovered directory.
 ///
 /// Each scratch file carries the id of the process that created it, so a file
 /// is removed only when that process is gone: a second `MineBurp` window's
@@ -238,8 +250,18 @@ pub fn remove_abandoned_sessions(sessions_dir: &Path) -> usize {
                 None => older_than_a_day(&entry.path()),
             };
             if abandoned {
-                remove_project_files(&entry.path());
-                removed += 1;
+                let recovered = sessions_dir.join("recovered");
+                if prepare_private_directory(&recovered).is_ok() {
+                    let destination = recovered.join(entry.file_name());
+                    if fs::rename(entry.path(), &destination).is_ok() {
+                        for suffix in ["-wal", "-shm"] {
+                            let from = PathBuf::from(format!("{}{suffix}", entry.path().display()));
+                            let to = PathBuf::from(format!("{}{suffix}", destination.display()));
+                            let _ = fs::rename(from, to);
+                        }
+                        removed += 1;
+                    }
+                }
             }
         }
     }
@@ -250,8 +272,18 @@ pub fn remove_abandoned_sessions(sessions_dir: &Path) -> usize {
                 && name.ends_with(".mineburp")
                 && older_than_a_day(&entry.path())
             {
-                remove_project_files(&entry.path());
-                removed += 1;
+                let recovered = sessions_dir.join("recovered");
+                if prepare_private_directory(&recovered).is_ok() {
+                    let destination = recovered.join(entry.file_name());
+                    if fs::rename(entry.path(), &destination).is_ok() {
+                        for suffix in ["-wal", "-shm"] {
+                            let from = PathBuf::from(format!("{}{suffix}", entry.path().display()));
+                            let to = PathBuf::from(format!("{}{suffix}", destination.display()));
+                            let _ = fs::rename(from, to);
+                        }
+                        removed += 1;
+                    }
+                }
             }
         }
     }

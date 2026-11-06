@@ -26,6 +26,12 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Messages in the corner dismiss themselves (errors after 10 s, confirmations after 4 s) unless hovered.
 
 ### Fixed
+- Save As publishes a synced private snapshot and moves the live writer under its lock; passive flow identity survives the change. Abandoned sessions remain recoverable under `sessions/recovered`, listed by `project_current`.
+- Compaction uses a sibling SQLCipher export and reopens database handles; bulk history deletion releases the writer between bounded id ranges.
+- History cancellation is isolated from export and analysis readers. Exact payload searches filter sizes before decompression; statistics evaluate payload filters once.
+- JSON and pcapng exports publish complete files atomically, reject symlinks, and require explicit overwrite for existing targets.
+- TCP reassembly bounds metadata and segment counts, avoids shifting all flows, and drains ordered ranges without repeated full-map scans.
+- ASCII-insensitive searches preserve non-ASCII exact matches; newer compatible project schemas can open read-only.
 - Save as can create a destination after reopening a project; the destination is reserved atomically with private permissions.
 - Late full-packet loads cannot overwrite newer Repeater edits.
 - Repeater: text components (chat, tab list header and footer, item lore, entity names) and block entity NBT were shown as raw hex. A list of compounds typed every item by its first, so `{"": "text"}` wrappers turned the byte flags of later parts into ints and the round trip failed. Each item is now typed by the item it replaces.
