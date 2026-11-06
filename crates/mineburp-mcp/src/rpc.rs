@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     sync::mpsc,
 };
 
@@ -42,7 +42,10 @@ where
     let mut buffer = String::new();
     loop {
         buffer.clear();
-        let read = lines.read_line(&mut buffer).await?;
+        let read = (&mut lines)
+            .take((MAX_LINE + 1) as u64)
+            .read_line(&mut buffer)
+            .await?;
         if read == 0 {
             break;
         }
@@ -50,7 +53,7 @@ where
             let _ = sender
                 .send(error_response(&Value::Null, -32600, "message too large"))
                 .await;
-            continue;
+            break;
         }
         let text = buffer.trim();
         if text.is_empty() {

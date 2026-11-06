@@ -18,7 +18,7 @@ use crate::{
     process::spawn_launcher,
 };
 
-const AGENT_MARKER: &str = "mineburp-agent.jar";
+const AGENT_MARKER: &str = "mineburp-agent";
 
 #[derive(Debug, Clone, Default)]
 pub struct LauncherConfig {
@@ -90,6 +90,32 @@ impl LauncherService {
                 Ok(found) => instances.extend(found.into_iter().map(Ok)),
                 Err(error) => instances.push(Err(error)),
             }
+        }
+        instances
+    }
+
+    pub async fn discover_with_argument(
+        &self,
+        argument: &str,
+    ) -> Vec<Result<InstanceDescriptor, LaunchError>> {
+        let mut instances = self.discover_all().await;
+        for instance in instances.iter_mut().filter_map(|item| item.as_mut().ok()) {
+            let stored = match instance.launcher {
+                LauncherKind::Official => read_json::<Value>(&instance.path).and_then(|value| {
+                    value["profiles"][&instance.id]["javaArgs"]
+                        .as_str()
+                        .map(str::to_owned)
+                }),
+                LauncherKind::Prism | LauncherKind::MultiMc => {
+                    std::fs::read_to_string(instance.path.join("instance.cfg"))
+                        .ok()
+                        .and_then(|text| IniDocument::parse(&text).get("JvmArgs"))
+                }
+                _ => None,
+            };
+            instance.client_assist_stale = stored
+                .as_ref()
+                .is_some_and(|value| value.contains(AGENT_MARKER) && !value.contains(argument));
         }
         instances
     }
@@ -389,6 +415,7 @@ fn discover_official_instances(root: &Path) -> Result<Vec<InstanceDescriptor>, L
                 icon_path: None,
                 supports_agent_configuration: true,
                 client_assist_configured: configured,
+                client_assist_stale: false,
             }
         })
         .collect::<Vec<_>>();
@@ -435,8 +462,9 @@ fn discover_multimc_instances(
             loader,
             icon_path,
             supports_agent_configuration: true,
-            client_assist_configured: property("JvmArgs")
-                .is_some_and(|arguments| arguments.contains(AGENT_MARKER)),
+            client_assist_stale: false,
+            client_assist_configured: property("OverrideJavaArgs").as_deref() == Some("true")
+                && property("JvmArgs").is_some_and(|arguments| arguments.contains(AGENT_MARKER)),
         });
     }
     instances.sort_by_key(|instance| instance.name.to_lowercase());
@@ -474,6 +502,7 @@ fn discover_modrinth_instances(root: &Path) -> Result<Vec<InstanceDescriptor>, L
             icon_path: None,
             supports_agent_configuration: false,
             client_assist_configured: false,
+            client_assist_stale: false,
         });
     }
     instances.sort_by_key(|instance| instance.name.to_lowercase());
@@ -577,6 +606,7 @@ fn discover_curse_forge_instances(root: &Path) -> Result<Vec<InstanceDescriptor>
             icon_path,
             supports_agent_configuration: false,
             client_assist_configured: false,
+            client_assist_stale: false,
         });
     }
     instances.sort_by_key(|instance| instance.name.to_lowercase());
@@ -592,6 +622,8 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 struct ManagedAgentState {
     #[serde(default)]
     arguments: HashMap<String, String>,
+    #[serde(default)]
+    originals: HashMap<String, (Option<String>, Option<String>)>,
     /// Arguments `MineBurp` wrote earlier that a later edit was replacing when
     /// it was interrupted. They are still removed on the next edit, so a crash
     /// between writing this state and writing the launcher's file never leaves
@@ -602,7 +634,7 @@ struct ManagedAgentState {
 
 impl ManagedAgentState {
     fn is_empty(&self) -> bool {
-        self.arguments.is_empty() && self.superseded.is_empty()
+        self.arguments.is_empty() && self.superseded.is_empty() && self.originals.is_empty()
     }
 
     /// Every argument this state says `MineBurp` may have written for `id`.
@@ -635,6 +667,7 @@ impl ManagedAgentState {
         self.superseded.remove(id);
         if !enabled {
             self.arguments.remove(id);
+            self.originals.remove(id);
         }
     }
 }
@@ -648,11 +681,38 @@ fn configure_multimc_profile(
     let state_path = instance.path.join(".mineburp-client-assistance.json");
     let snapshot = read_snapshot(&config_path)?;
     let mut document = IniDocument::parse(&snapshot.text);
-    let current = document.get("JvmArgs").unwrap_or_default();
+    let original_args = document.get("JvmArgs");
+    let original_override = document.get("OverrideJavaArgs");
+    let mut current = original_args.clone().unwrap_or_default();
     let mut state = read_json::<ManagedAgentState>(&state_path).unwrap_or_default();
+    if enabled && !state.originals.contains_key(&instance.id) {
+        state.originals.insert(
+            instance.id.clone(),
+            (original_override.clone(), original_args),
+        );
+        if original_override.as_deref() != Some("true") {
+            let root = instance
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(&instance.path);
+            for name in ["prismlauncher.cfg", "multimc.cfg"] {
+                if let Ok(text) = std::fs::read_to_string(root.join(name)) {
+                    current = IniDocument::parse(&text).get("JvmArgs").unwrap_or_default();
+                    break;
+                }
+            }
+        }
+    }
     let updated =
         update_managed_argument(&current, &state.known(&instance.id), jvm_argument, enabled)?;
     document.set("JvmArgs", &updated);
+    if enabled {
+        document.set("OverrideJavaArgs", "true");
+    } else if let Some((flag, args)) = state.originals.get(&instance.id) {
+        document.restore("OverrideJavaArgs", flag.as_deref());
+        document.restore("JvmArgs", args.as_deref());
+    }
     apply_managed_edit(
         &mut state,
         &state_path,
@@ -716,7 +776,36 @@ fn configure_official_profile(
     let mut state = read_json::<ManagedAgentState>(&state_path).unwrap_or_default();
     let updated =
         update_managed_argument(&current, &state.known(&instance.id), jvm_argument, enabled)?;
-    profile.insert("javaArgs".into(), Value::String(updated));
+    if enabled {
+        state
+            .originals
+            .entry(instance.id.clone())
+            .or_insert_with(|| {
+                (
+                    None,
+                    profile
+                        .get("javaArgs")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+            });
+        let updated = if profile.contains_key("javaArgs") {
+            updated
+        } else {
+            format!(
+                "-Xmx2G -XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M {jvm_argument}"
+            )
+        };
+        profile.insert("javaArgs".into(), Value::String(updated));
+    } else if let Some((_, original)) = state.originals.get(&instance.id) {
+        if let Some(value) = original {
+            profile.insert("javaArgs".into(), Value::String(value.clone()));
+        } else {
+            profile.remove("javaArgs");
+        }
+    } else {
+        profile.insert("javaArgs".into(), Value::String(updated));
+    }
     let text = serde_json::to_string_pretty(&document)
         .map_err(|error| LaunchError::InvalidMetadata(error.to_string()))?;
     apply_managed_edit(
@@ -925,6 +1014,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prism_inherits_global_flags_and_restores_absent_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("prismlauncher.cfg"),
+            "[General]\nJvmArgs=-Xmx8G\n",
+        )
+        .unwrap();
+        let instance = prism_instance(
+            temp.path(),
+            "[General]\nname=Prism\nOverrideJavaArgs=false\n",
+        );
+        let argument = "-javaagent:/stable/mineburp-agent.jar=config=x";
+        configure_multimc_profile(&instance, argument, true).unwrap();
+        let config =
+            IniDocument::parse(&fs::read_to_string(instance.path.join("instance.cfg")).unwrap());
+        assert_eq!(config.get("OverrideJavaArgs").as_deref(), Some("true"));
+        assert_eq!(config.get("JvmArgs").unwrap(), format!("-Xmx8G {argument}"));
+        configure_multimc_profile(&instance, argument, false).unwrap();
+        let config =
+            IniDocument::parse(&fs::read_to_string(instance.path.join("instance.cfg")).unwrap());
+        assert_eq!(config.get("OverrideJavaArgs").as_deref(), Some("false"));
+        assert_eq!(config.get("JvmArgs"), None);
+    }
+
+    #[test]
+    fn official_missing_arguments_use_defaults_then_remove_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("launcher_profiles.json");
+        fs::write(
+            &path,
+            r#"{"profiles":{"test":{"name":"Test","type":"custom"}}}"#,
+        )
+        .unwrap();
+        let instance = InstanceDescriptor {
+            path: path.clone(),
+            id: "test".into(),
+            launcher: LauncherKind::Official,
+            ..prism_instance(temp.path(), "name=Test\n")
+        };
+        let argument = "-javaagent:/stable/mineburp-agent.jar=config=x";
+        configure_official_profile(&instance, argument, true).unwrap();
+        let value: Value = read_json(&path).unwrap();
+        assert!(
+            value["profiles"]["test"]["javaArgs"]
+                .as_str()
+                .unwrap()
+                .starts_with("-Xmx2G -XX:+UnlockExperimentalVMOptions")
+        );
+        configure_official_profile(&instance, argument, false).unwrap();
+        let value: Value = read_json(&path).unwrap();
+        assert!(value["profiles"]["test"].get("javaArgs").is_none());
+    }
+
+    #[test]
     fn discovers_curse_forge_metadata_and_loader() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let instance = temp.path().join("Instances/All the Mods 10");
@@ -1050,6 +1193,7 @@ mod tests {
             icon_path: None,
             supports_agent_configuration: true,
             client_assist_configured: false,
+            client_assist_stale: false,
         };
         let argument = "-javaagent:/opt/mineburp-agent.jar=config=/tmp/client.properties";
         configure_multimc_profile(&instance, argument, true).expect("agent configuration");
@@ -1121,6 +1265,7 @@ mod tests {
             icon_path: None,
             supports_agent_configuration: true,
             client_assist_configured: false,
+            client_assist_stale: false,
         }
     }
 

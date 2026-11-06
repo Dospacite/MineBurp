@@ -46,6 +46,11 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Isolate traffic append and connection updates, memoize persistent tools and hex parsing, and stabilize history-table callbacks.
 - Scope Repeater shortcuts to its editor, preserve native text undo, coalesce hex typing into undo steps, and support arrow-key tab navigation with tabpanel semantics.
 - Preserve connection lists after failed status queries, prevent overlapping status refreshes, and reset packet history on project changes.
+- Keep the launcher agent in a stable per-user path across AppImage launches; report stale configured arguments.
+- Enable Prism/MultiMC JVM overrides with inherited global flags and restore original launcher settings on removal; preserve official launcher defaults.
+- Validate and persist replacement rules before applying them, serialize MCP rule edits, and protect temporary captures and unrestricted history deletion.
+- Reconnect MCP desktop calls, bound input and hex output, and provide JSON history output.
+
 - Save as can create a destination after reopening a project; the destination is reserved atomically with private permissions.
 - Late full-packet loads cannot overwrite newer Repeater edits.
 - Repeater: text components (chat, tab list header and footer, item lore, entity names) and block entity NBT were shown as raw hex. A list of compounds typed every item by its first, so `{"": "text"}` wrappers turned the byte flags of later parts into ints and the round trip failed. Each item is now typed by the item it replaces.

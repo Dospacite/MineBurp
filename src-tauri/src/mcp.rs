@@ -71,7 +71,7 @@ impl Host for DesktopHost {
         Ok(self
             .state()
             .launchers
-            .discover_all()
+            .discover_with_argument(&self.state().client_assist_jvm_argument())
             .await
             .into_iter()
             .filter_map(Result::ok)

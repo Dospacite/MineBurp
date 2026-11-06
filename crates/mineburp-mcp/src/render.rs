@@ -420,6 +420,41 @@ pub fn hex(data: &[u8], base_offset: usize, dump: bool) -> String {
     out
 }
 
+/// Bounded frame output for tool responses.
+pub fn capped_hex(data: &[u8], limit: usize) -> String {
+    let shown = data.len().min(limit);
+    let mut text = hex(&data[..shown], 0, false);
+    if shown < data.len() {
+        let _ = write!(
+            text,
+            " … [{} of {} bytes; increase hex_limit]",
+            shown,
+            data.len()
+        );
+    }
+    text
+}
+
+/// Changed byte offsets, capped independently of frame size.
+pub fn changed_ranges(before: &[u8], after: &[u8]) -> String {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for index in 0..before.len().max(after.len()) {
+        if before.get(index) != after.get(index) {
+            start.get_or_insert(index);
+        } else if let Some(begin) = start.take() {
+            ranges.push((begin, index));
+        }
+        if ranges.len() == 32 {
+            break;
+        }
+    }
+    if let Some(begin) = start {
+        ranges.push((begin, before.len().max(after.len())));
+    }
+    format!("changed ranges [start,end): {ranges:?} (up to 32)\n")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

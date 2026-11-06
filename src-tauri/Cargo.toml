@@ -36,6 +36,7 @@ mineburp-protocol = { path = "../crates/mineburp-protocol" }
 mineburp-proxy = { path = "../crates/mineburp-proxy" }
 mineburp-session = { path = "../crates/mineburp-session" }
 parking_lot.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", default-features = false, features = [] }

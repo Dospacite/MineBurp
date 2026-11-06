@@ -673,15 +673,29 @@ pub fn network_conditions_set(
 pub async fn replacement_rules_set(
     state: State<'_, DesktopState>,
     rules: Vec<ReplacementRule>,
+    expected_path: Option<String>,
 ) -> CommandResult<()> {
-    state
-        .proxy
-        .set_replacement_rules(rules.clone())
-        .map_err(|error| error.to_string())?;
     let store = current_project(&state)?;
-    tauri::async_runtime::spawn_blocking(move || store.save_replacement_rules(&rules))
+    if expected_path
+        .as_ref()
+        .is_some_and(|path| std::path::Path::new(path) != store.info().path)
+    {
+        return Err("the open project changed; reload its rules".into());
+    }
+    for rule in &rules {
+        if !rule.expression.trim().is_empty() {
+            mineburp_core::FilterExpression::parse(&rule.expression)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let saved = rules.clone();
+    tauri::async_runtime::spawn_blocking(move || store.save_replacement_rules(&saved))
         .await
         .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    state
+        .proxy
+        .set_replacement_rules(rules)
         .map_err(|error| error.to_string())
 }
 
@@ -804,7 +818,7 @@ pub async fn launcher_instances(
 ) -> CommandResult<Vec<InstanceDescriptor>> {
     Ok(state
         .launchers
-        .discover_all()
+        .discover_with_argument(&state.client_assist_jvm_argument())
         .await
         .into_iter()
         .filter_map(Result::ok)
