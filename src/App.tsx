@@ -87,6 +87,8 @@ export function App() {
   useEffect(() => {
     void projectPath;
     setCompare({ a: null, b: null });
+    setRepeaterRequest(null);
+    setRuleRequest(null);
     setIntruderRequest(null);
     setSequencerRequest(null);
     annotationStore.reset();
@@ -334,6 +336,10 @@ export function App() {
             .catch((error) => {
               closing = false;
               setError(message(error));
+              if (
+                globalThis.confirm(`Could not save project edits: ${message(error)}. Close and discard them?`)
+              )
+                void window.destroy();
             });
         });
         if (disposed) unsubscribe();
@@ -475,8 +481,8 @@ export function App() {
             <div className="view-host" hidden={view !== "intruder"}>
               <ErrorBoundary>
                 <IntruderView
+                  key={projectPath}
                   request={intruderRequest}
-                  sessions={workbench.connections}
                   projectKey={projectPath}
                   onError={workbench.setError}
                 />
@@ -485,6 +491,7 @@ export function App() {
             <div className="view-host" hidden={view !== "sequencer"}>
               <ErrorBoundary>
                 <SequencerView
+                  key={projectPath}
                   request={sequencerRequest}
                   projectKey={projectPath}
                   onError={workbench.setError}
@@ -495,7 +502,7 @@ export function App() {
             <div className="view-host" hidden={view !== "repeater"}>
               <ErrorBoundary>
                 <RepeaterView
-                  sessions={workbench.connections}
+                  key={projectPath}
                   projectKey={projectPath}
                   request={repeaterRequest}
                   onRequestHandled={onRepeaterHandled}
@@ -507,9 +514,9 @@ export function App() {
             {view === "traffic" && (
               <ErrorBoundary>
                 <TrafficView
+                  key={projectPath}
                   capabilities={workbench.capabilities}
                   project={workbench.project}
-                  connections={workbench.connections}
                   selectedPacket={workbench.selectedPacket}
                   selectedPacketId={workbench.selectedPacketId}
                   filter={workbench.packetFilter}
@@ -518,7 +525,6 @@ export function App() {
                   onConnectionChange={workbench.setConnectionId}
                   decryptMode={workbench.decryptMode}
                   captureStatus={workbench.captureStatus}
-                  appendSignal={workbench.appendSignal}
                   onSelectPacket={workbench.selectPacket}
                   onDecryptModeChange={workbench.setDecryptMode}
                   onOpenRepeater={openInRepeater}
@@ -532,6 +538,7 @@ export function App() {
             {view === "channels" && (
               <ErrorBoundary>
                 <ChannelExplorerView
+                  key={projectPath}
                   filter={workbench.packetFilter}
                   connectionId={workbench.connectionId}
                   projectKey={projectPath}
@@ -547,11 +554,10 @@ export function App() {
             {view === "stats" && (
               <ErrorBoundary>
                 <StatsView
+                  key={projectPath}
                   project={workbench.project}
                   filter={workbench.packetFilter}
                   connectionId={workbench.connectionId}
-                  connections={workbench.connections}
-                  appendSignal={workbench.appendSignal}
                   onApplyName={applyName}
                   onApplyConnection={applyConnection}
                   onError={workbench.setError}
@@ -561,6 +567,8 @@ export function App() {
             {view === "intercept" && (
               <ErrorBoundary>
                 <InterceptView
+                  key={projectPath}
+                  onRepeater={openInRepeater}
                   settings={workbench.interceptSettings}
                   onSettingsPatch={workbench.patchInterceptSettings}
                   pendingSignal={workbench.interceptSignal}
@@ -572,6 +580,8 @@ export function App() {
             {view === "replace" && (
               <ErrorBoundary>
                 <ReplaceView
+                  key={projectPath}
+                  projectKey={projectPath}
                   seed={workbench.selectedPacket}
                   request={ruleRequest}
                   onRequestHandled={onRuleHandled}
@@ -581,7 +591,7 @@ export function App() {
             )}
             {view === "schemas" && (
               <ErrorBoundary>
-                <SchemasView onError={workbench.setError} />
+                <SchemasView key={projectPath} onError={workbench.setError} />
               </ErrorBoundary>
             )}
             {view === "instances" && (

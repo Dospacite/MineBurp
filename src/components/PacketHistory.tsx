@@ -551,8 +551,9 @@ export function PacketHistory({
   // Annotations are fetched for loaded rows only, in batches, and cached.
   useEffect(() => {
     if (packets.length === 0 || !desktop.isAvailable()) return;
+    void annotations;
     annotationStore.ensure(packets.map((packet) => packet.id)).catch(fail);
-  }, [fail, packets]);
+  }, [fail, packets, annotations]);
 
   // A different project's timestamps are a different clock.
   useEffect(() => {
@@ -777,31 +778,45 @@ export function PacketHistory({
     return items;
   }
 
-  if (!project) {
-    return <EmptyState title={t("traffic.no-project.title")} detail={t("history.no-project.detail")} />;
-  }
-
-  const footer = (
-    <div className="history-footer">
-      <button type="button" className="button" disabled={!hasMore || loading} onClick={() => void loadMore()}>
-        {oldestFirst
-          ? hasMore
-            ? t("history.load-newer")
-            : t("history.end-of-history")
-          : hasMore
-            ? t("history.load-older")
-            : t("history.start-of-history")}
-      </button>
-    </div>
+  const footer = useMemo(
+    () => (
+      <div className="history-footer">
+        <button
+          type="button"
+          className="button"
+          disabled={!hasMore || loading}
+          onClick={() => void loadMore()}
+        >
+          {oldestFirst
+            ? hasMore
+              ? t("history.load-newer")
+              : t("history.end-of-history")
+            : hasMore
+              ? t("history.load-older")
+              : t("history.start-of-history")}
+        </button>
+      </div>
+    ),
+    [hasMore, loading, loadMore, oldestFirst],
   );
   // Scrolling away from the newest row pauses following, so reading older
   // traffic is never interrupted by arriving packets.
   // Oldest first, new rows land below the operator and never move what they
   // are reading, so there is nothing to pause.
-  const onScrollStateChange = (atTop: boolean) => {
-    if (!oldestFirst && !atTop && followingRef.current) setFollowing(false);
-  };
-  const toggleOrder = () => updateSettings({ ...settings, oldestFirst: !oldestFirst });
+  const onScrollStateChange = useCallback(
+    (atTop: boolean) => {
+      if (!oldestFirst && !atTop && followingRef.current) setFollowing(false);
+    },
+    [oldestFirst],
+  );
+  const toggleOrder = useCallback(
+    () => updateSettings({ ...settings, oldestFirst: !oldestFirst }),
+    [updateSettings, settings, oldestFirst],
+  );
+
+  if (!project) {
+    return <EmptyState title={t("traffic.no-project.title")} detail={t("history.no-project.detail")} />;
+  }
 
   return (
     <section className="packet-history" aria-label={t("history.title")} ref={section}>

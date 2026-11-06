@@ -147,3 +147,28 @@ describe("parseSeconds", () => {
     expect(parseSeconds("soon")).toBeUndefined();
   });
 });
+
+it("retains an expired frame draft and never forwards the next unseen frame", async () => {
+  vi.spyOn(desktop, "isAvailable").mockReturnValue(true);
+  const pending = vi.spyOn(desktop, "interceptPending").mockResolvedValue([held]);
+  vi.spyOn(desktop, "packetLayout").mockRejectedValue(new Error("raw"));
+  vi.spyOn(desktop, "networkConditions").mockRejectedValue(new Error("offline"));
+  const resolve = vi.spyOn(desktop, "interceptResolve").mockResolvedValue();
+  const props = {
+    settings,
+    onSettingsPatch: vi.fn(),
+    pendingSignal: 1,
+    decryptEnabled: true,
+    onError: vi.fn(),
+  };
+  const ui = render(<InterceptView {...props} />);
+  const input = await screen.findByRole("textbox", { name: "Bytes" });
+  const { fireEvent } = await import("@testing-library/react");
+  fireEvent.change(input, { target: { value: "01 02" } });
+  pending.mockResolvedValue([{ ...held, id: 8 }]);
+  ui.rerender(<InterceptView {...props} pendingSignal={2} />);
+  await screen.findByText(/forwarded without these edits/);
+  expect(input).toHaveValue("01 02");
+  fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+  expect(resolve).not.toHaveBeenCalled();
+});

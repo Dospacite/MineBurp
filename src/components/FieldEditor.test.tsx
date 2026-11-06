@@ -44,3 +44,31 @@ describe("FieldEditor", () => {
     expect(onCommit).toHaveBeenCalledWith(field, "a\nc");
   });
 });
+
+it.each(["short", "line\nbreak", "x".repeat(100)])(
+  "Ctrl+Enter commits %s without bubbling a send",
+  (value) => {
+    const commit = vi.fn();
+    const bubble = vi.fn();
+    render(
+      // biome-ignore lint/a11y/noStaticElementInteractions: observes bubbling in this regression test.
+      <div role="presentation" onKeyDown={bubble}>
+        <FieldEditor
+          busy={false}
+          layout={{
+            name: "test",
+            complete: true,
+            fields: [{ name: "text", kind: "string", offset: 0, length: 1, value }],
+          }}
+          onCommit={commit}
+        />
+      </div>,
+    );
+    const input = screen.getByRole("textbox");
+    input.focus();
+    fireEvent.change(input, { target: { value: `${value}!` } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(commit).toHaveBeenCalled();
+    expect(bubble).not.toHaveBeenCalled();
+  },
+);

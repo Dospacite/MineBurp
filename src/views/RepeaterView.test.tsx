@@ -177,3 +177,30 @@ describe("Repeater edit history", () => {
     });
   });
 });
+
+it("flushes unsaved packet tabs and ignores shortcuts in the Decoder", async () => {
+  vi.spyOn(desktop, "isAvailable").mockReturnValue(false);
+  const save = vi.spyOn(desktop, "repeaterTabSave").mockResolvedValue();
+  const send = vi.spyOn(desktop, "repeaterSend").mockResolvedValue();
+  render(
+    <>
+      <RepeaterView
+        sessions={[session]}
+        request={{ packet: view([1]), nonce: 1 }}
+        onRequestHandled={vi.fn()}
+        onError={vi.fn()}
+      />
+      <input aria-label="Decoder draft" />
+    </>,
+  );
+  const editor = await screen.findByRole("textbox", { name: "Bytes" });
+  fireEvent.change(editor, { target: { value: "02" } });
+  const { flushProjectEditors } = await import("../lib/projectWrites");
+  await flushProjectEditors();
+  expect(save.mock.calls.at(-1)?.[0].logical_bytes).toEqual([2]);
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "Decoder draft" }), { key: "Enter", ctrlKey: true });
+  expect(send).not.toHaveBeenCalled();
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "Repeater tab name" }), { key: "z", ctrlKey: true });
+  expect(editor).toHaveValue("02");
+  vi.restoreAllMocks();
+});

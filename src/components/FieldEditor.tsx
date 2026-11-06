@@ -50,6 +50,12 @@ function FieldRow({ field, onCommit }: { field: FieldSpan; onCommit: (value: str
         <span className="field-name">{field.name}</span>
         <input
           type="checkbox"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+          }}
           checked={field.value === true}
           onChange={(event) => onCommit(event.target.checked)}
         />
@@ -102,6 +108,13 @@ function FieldRow({ field, onCommit }: { field: FieldSpan; onCommit: (value: str
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onBlur={() => draft !== text(field.value) && onCommit(draft)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.currentTarget.blur();
+            }
+          }}
         />
       ) : (
         <input
@@ -113,6 +126,7 @@ function FieldRow({ field, onCommit }: { field: FieldSpan; onCommit: (value: str
           onKeyDown={(event) => {
             if (event.key === "Enter") {
               event.preventDefault();
+              event.stopPropagation();
               event.currentTarget.blur();
             }
             if (event.key === "Escape") setDraft(text(field.value));

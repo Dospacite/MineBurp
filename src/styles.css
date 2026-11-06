@@ -244,8 +244,7 @@ button:disabled {
   position: relative;
 }
 .project-button,
-.button,
-.icon-button {
+.button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -288,6 +287,20 @@ button:disabled {
   color: var(--accent-on);
 }
 .icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 32px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font-size: 12px;
+  transition:
+    color var(--motion-fast),
+    background var(--motion-fast),
+    border-color var(--motion-fast);
+
   width: 32px;
   padding: 0;
   background: transparent;
@@ -549,8 +562,7 @@ body.dragging-split {
 }
 .flow-pane,
 .traffic-pane,
-.capture-inspector,
-.attempt-pane {
+.capture-inspector {
   min-width: 0;
   min-height: 0;
 }
@@ -592,12 +604,6 @@ body.dragging-split {
   background: var(--surface);
   color: var(--muted);
   font: 10px / 1.4 var(--font-mono);
-}
-
-.field-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
 }
 
 .capture-status {
@@ -1413,6 +1419,8 @@ button.packet-row.selected:focus-visible {
   box-shadow: none;
 }
 .attempt-pane {
+  min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px;
   background: var(--bg);
@@ -3431,7 +3439,7 @@ button.stats-bar:focus-visible {
 }
 .research-position {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(200px, 2fr) auto;
+  grid-template-columns: minmax(160px, 1fr) minmax(200px, 2fr);
   gap: 12px;
   align-items: start;
 }
@@ -3678,9 +3686,6 @@ button.stats-bar:focus-visible {
   flex-wrap: wrap;
   gap: 8px;
   margin: 12px 0;
-}
-.research-position {
-  grid-template-columns: minmax(160px, 1fr) minmax(200px, 2fr);
 }
 .checkbox-label {
   display: flex;
