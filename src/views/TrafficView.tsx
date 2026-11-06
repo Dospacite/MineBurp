@@ -19,10 +19,12 @@ import { DecryptWarning } from "../components/DecryptWarning";
 import { DeleteHistoryDialog } from "../components/DeleteHistoryDialog";
 import { EmptyState } from "../components/EmptyState";
 import { ImportCaptureDialog } from "../components/ImportCaptureDialog";
+import { LabListener } from "../components/LabListener";
 import { describe } from "../components/PacketFilterBar";
 import { type PacketActions, PacketHistory } from "../components/PacketHistory";
 import { PacketInspector } from "../components/PacketInspector";
 import { Split } from "../components/Split";
+import { OutOfScopeBadge, ScopeStatus } from "../components/TargetScope";
 import type {
   AppCapabilities,
   CaptureStats,
@@ -249,6 +251,7 @@ export function TrafficView({
             {decryptEnabled ? t("traffic.decrypt.on") : t("traffic.decrypt.off")}
           </button>
         </div>
+        <ScopeStatus status={decryptMode} />
         <div className={`capture-status ${captureStatus}`} role="status" aria-live="polite">
           {captureStatus === "running" ? (
             <Radio size={15} />
@@ -267,6 +270,7 @@ export function TrafficView({
         {(captureStatus === "running" || captureStatus === "failed") && capture?.available && (
           <CaptureCounters />
         )}
+        <LabListener onError={onError} />
         <div className="flow-toolbar">
           <label className="flow-search">
             <Search size={12} aria-hidden="true" />
@@ -321,6 +325,7 @@ export function TrafficView({
               <span>
                 <strong>
                   {connection.target.host}:{connection.target.port}
+                  <OutOfScopeBadge connection={connection} />
                 </strong>
                 <small>
                   {connection.packet_count.toLocaleString()} · {formatBytes(connection.byte_count)}

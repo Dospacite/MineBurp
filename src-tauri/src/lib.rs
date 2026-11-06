@@ -45,6 +45,14 @@ pub fn run() {
             commands::project_open,
             commands::project_save_as,
             commands::project_current,
+            commands::lab_listener_active,
+            commands::lab_listener_stop,
+            commands::lab_listener_start,
+            commands::project_scope_set,
+            commands::project_scope_get,
+            commands::project_recovered_save_as,
+            commands::project_recovered_delete,
+            commands::project_recovered_list,
             commands::project_checkpoint,
             commands::connections_query,
             commands::packets_query,
@@ -105,9 +113,17 @@ pub fn run() {
             // directory with abandoned captures.
             #[cfg(unix)]
             mcp::stop();
-            handle
-                .state::<state::DesktopState>()
-                .discard_temporary_project();
+            let state = handle.state::<state::DesktopState>();
+            // Windows refuses to delete a file any handle still holds, so the
+            // capture writer and live sessions stop before the project closes.
+            let capture = state.capture.clone();
+            let _ = tauri::async_runtime::block_on(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), capture.stop()).await
+            });
+            for session in state.proxy.sessions() {
+                let _ = state.proxy.stop_session(session.id);
+            }
+            state.discard_temporary_project();
         }
     });
 }

@@ -45,6 +45,7 @@ pub struct DesktopState {
     /// are never held in a buffer that can age out from under the operator.
     pub temporary_project: RwLock<Option<PathBuf>>,
     pub recovered_projects: RwLock<Vec<PathBuf>>,
+    pub recovered_directory: RwLock<Option<PathBuf>>,
     pub launchers: LauncherService,
     pub capture: Arc<dyn SideCapture>,
     pub pending_auth: RwLock<Option<PendingAuth>>,
@@ -75,6 +76,7 @@ impl DesktopState {
             project: Arc::new(RwLock::new(None)),
             temporary_project: RwLock::new(None),
             recovered_projects: RwLock::new(Vec::new()),
+            recovered_directory: RwLock::new(None),
             launchers: LauncherService::new(default_launcher_config()),
             capture: capture_backend(),
             pending_auth: RwLock::new(None),
@@ -105,6 +107,7 @@ impl DesktopState {
                 sessions_dir.display()
             ))
         })?;
+        *self.recovered_directory.write() = Some(sessions_dir.join("recovered"));
         *self.recovered_projects.write() = fs::read_dir(sessions_dir.join("recovered"))
             .into_iter()
             .flatten()
@@ -163,6 +166,8 @@ impl DesktopState {
         self.proxy
             .set_replacement_rules(replacements)
             .map_err(|error| error.to_string())?;
+        self.proxy
+            .set_target_scope(store.target_scope().map_err(|e| e.to_string())?)?;
         self.adopt_project(store);
         Ok(info)
     }
@@ -173,8 +178,71 @@ impl DesktopState {
             return;
         };
         self.proxy.set_project(None);
-        *self.project.write() = None;
+        if let Some(store) = self.project.write().take()
+            && let Err(error) = store.close_for_exit()
+        {
+            eprintln!("Could not close temporary project: {error}");
+            return;
+        }
         remove_project_files(&path);
+    }
+
+    /// Recovered sessions that still pass [`Self::validate_recovered`].
+    pub fn valid_recovered_paths(&self) -> Vec<PathBuf> {
+        let paths = self.recovered_projects.read().clone();
+        paths
+            .into_iter()
+            .filter(|path| self.validate_recovered(path).is_ok())
+            .collect()
+    }
+
+    /// Canonicalizes `path` and accepts it only as a known, inactive,
+    /// non-symlink `.mineburp` file directly inside the recovered directory.
+    pub fn validate_recovered(&self, path: &Path) -> Result<PathBuf, String> {
+        let directory = self
+            .recovered_directory
+            .read()
+            .clone()
+            .ok_or("recovery unavailable")?;
+        let directory = directory.canonicalize().map_err(|e| e.to_string())?;
+        if fs::symlink_metadata(path)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("recovered session must not be a symlink".into());
+        }
+        let path = path.canonicalize().map_err(|e| e.to_string())?;
+        if path.parent() != Some(directory.as_path())
+            || path.extension().is_none_or(|ext| ext != "mineburp")
+            || !self
+                .recovered_projects
+                .read()
+                .iter()
+                .any(|entry| same_file(entry, &path))
+            || self
+                .project
+                .read()
+                .as_ref()
+                .is_some_and(|store| same_file(&store.info().path, &path))
+        {
+            return Err("not an inactive recovered session".into());
+        }
+        Ok(path)
+    }
+
+    pub fn delete_recovered(&self, path: &Path) -> Result<(), String> {
+        let path = self.validate_recovered(path)?;
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = OsString::from(&path);
+            sidecar.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(sidecar));
+        }
+        self.recovered_projects
+            .write()
+            .retain(|entry| entry.exists());
+        Ok(())
     }
 
     #[must_use]
@@ -469,9 +537,129 @@ fn preferred_executable(candidates: &[PathBuf], fallback: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(fallback))
 }
 
+/// Whether `entry` resolves to the already canonical `canonical`. Comparing
+/// resolved paths keeps Windows verbatim prefixes and symlinked temp
+/// directories from hiding a match.
+fn same_file(entry: &Path, canonical: &Path) -> bool {
+    entry
+        .canonicalize()
+        .is_ok_and(|resolved| resolved == canonical)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RecoveredSession {
+    pub path: PathBuf,
+    /// `None` when the file could not be opened; it can still be deleted.
+    pub packets: Option<u64>,
+    pub modified_millis: u128,
+}
+
+/// Packet counts and modification times for already validated paths. An
+/// unreadable file is still listed so it can be deleted.
+pub fn describe_recovered(paths: Vec<PathBuf>) -> Vec<RecoveredSession> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let packets = ProjectStore::open(
+                &path,
+                ProjectOptions {
+                    read_only: true,
+                    ..ProjectOptions::default()
+                },
+            )
+            .and_then(|store| store.packet_count())
+            .ok();
+            let modified_millis = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |elapsed| elapsed.as_millis());
+            RecoveredSession {
+                path,
+                packets,
+                modified_millis,
+            }
+        })
+        .collect()
+}
+
+/// Copies a validated recovered session to `destination`, leaving the
+/// recovered file in place.
+pub fn copy_recovered(source: &Path, destination: &Path) -> Result<ProjectStore, String> {
+    // Writable: the export attaches its target, which a read-only connection
+    // would open read-only too. Opening also migrates an older recovery file.
+    let store =
+        ProjectStore::open(source, ProjectOptions::default()).map_err(|error| error.to_string())?;
+    store
+        .save_as(destination, "Recovered session", ProjectOptions::default())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovered_deletion_is_confined_and_refuses_active_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let recovered = directory.path().join("sessions/recovered");
+        fs::create_dir_all(&recovered).unwrap();
+        let path = recovered.join("old.mineburp");
+        drop(ProjectStore::create(&path, "old", ProjectOptions::default()).unwrap());
+        let outside = directory.path().join("outside.mineburp");
+        fs::write(&outside, b"keep").unwrap();
+        let state = DesktopState::new(
+            directory.path().join("agent.jar"),
+            directory.path().join("agent.properties"),
+        )
+        .unwrap();
+        state
+            .open_temporary_project(&directory.path().join("sessions"))
+            .unwrap();
+        assert!(state.delete_recovered(&outside).is_err());
+        assert!(outside.exists());
+        assert!(state.validate_recovered(&path).is_ok());
+        #[cfg(unix)]
+        {
+            let link = recovered.join("linked.mineburp");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            state.recovered_projects.write().push(link.clone());
+            assert!(state.delete_recovered(&link).is_err());
+            assert!(outside.exists());
+        }
+        let listed = describe_recovered(state.valid_recovered_paths());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, path);
+        assert_eq!(listed[0].packets, Some(0));
+        assert!(listed[0].modified_millis > 0);
+        assert!(
+            state
+                .validate_recovered(
+                    &directory
+                        .path()
+                        .join("sessions/recovered/../../outside.mineburp")
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_recovered(&directory.path().join("sessions/recovered/missing.mineburp"))
+                .is_err()
+        );
+        let copy = directory.path().join("copy.mineburp");
+        let saved = copy_recovered(&state.validate_recovered(&path).unwrap(), &copy).unwrap();
+        assert_eq!(saved.info().name, "Recovered session");
+        drop(saved);
+        assert!(copy.exists() && path.exists());
+        assert!(state.validate_recovered(&copy).is_err());
+        state.adopt_project(ProjectStore::open(&path, ProjectOptions::default()).unwrap());
+        assert!(state.valid_recovered_paths().is_empty());
+        assert!(state.delete_recovered(&path).is_err());
+        state.proxy.set_project(None);
+        *state.project.write() = None;
+        state.delete_recovered(&path).unwrap();
+        assert!(!path.exists());
+    }
 
     #[tokio::test]
     async fn failed_install_preserves_temporary_project() {

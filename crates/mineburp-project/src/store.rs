@@ -27,7 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize as _;
 
-const PROJECT_SCHEMA_VERSION: i32 = 6;
+const PROJECT_SCHEMA_VERSION: i32 = 8;
 
 /// How long one read query may run before it is interrupted.
 ///
@@ -258,6 +258,8 @@ pub enum ProjectError {
     PacketNotFound(i64),
     #[error("project storage error: {0}")]
     Storage(String),
+    #[error("target scope is not valid: {0}")]
+    InvalidScope(String),
 }
 
 #[derive(Debug, Clone)]
@@ -786,6 +788,80 @@ impl ProjectStore {
             offset,
             limit,
             ..PacketQuery::default()
+        })
+    }
+
+    /// The ordered target scope allowlist; empty permits every target.
+    ///
+    /// A project older than schema 8 opened read-only has no scope table and
+    /// therefore no scope.
+    pub fn target_scope(&self) -> Result<Vec<String>, ProjectError> {
+        self.with_reader(|connection| {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'target_scope')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+            let mut query =
+                connection.prepare("SELECT pattern FROM target_scope ORDER BY position")?;
+            query
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProjectError::from)
+        })
+    }
+
+    /// Replaces the target scope allowlist after validating every pattern.
+    pub fn set_target_scope(&self, patterns: &[String]) -> Result<(), ProjectError> {
+        self.ensure_writable()?;
+        mineburp_core::scope::validate(patterns).map_err(ProjectError::InvalidScope)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM target_scope", [])?;
+        for (position, pattern) in patterns.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO target_scope(pattern,position) VALUES(?1,?2)",
+                params![pattern, i64::try_from(position).unwrap_or(i64::MAX)],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Closes file handles across every clone before Windows file deletion.
+    /// Only use once the application is exiting.
+    pub fn close_for_exit(&self) -> Result<(), ProjectError> {
+        let replacement = Connection::open_in_memory()?;
+        let pool = || -> Result<ReaderPool, ProjectError> {
+            Ok(ReaderPool {
+                connections: vec![Mutex::new(Connection::open_in_memory()?)],
+                interrupts: Vec::new(),
+                next: AtomicUsize::new(0),
+            })
+        };
+        let readers = pool()?;
+        let history = pool()?;
+        let mut current_readers = self.readers.write();
+        let mut current_history = self.history_readers.write();
+        let mut writer = self.connection.lock();
+        *current_readers = readers;
+        *current_history = history;
+        *writer = replacement;
+        Ok(())
+    }
+
+    /// Exact packet count without loading payloads or history pages.
+    pub fn packet_count(&self) -> Result<u64, ProjectError> {
+        self.with_reader(|connection| {
+            connection
+                .query_row("SELECT COUNT(*) FROM packets", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| u64::try_from(count).unwrap_or(0))
+                .map_err(ProjectError::from)
         })
     }
 
@@ -1602,6 +1678,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (6, "CREATE TABLE IF NOT EXISTS workbench_documents(
         key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at_micros INTEGER NOT NULL
     );"),
+    // placeholder: replaced by the findings migration at merge
+    (7, ""),
+    (8, "CREATE TABLE IF NOT EXISTS target_scope(pattern TEXT PRIMARY KEY, position INTEGER NOT NULL);"),
 ];
 
 /// Accumulates `WHERE` fragments alongside their bound values.
@@ -3994,5 +4073,48 @@ mod tests {
         // The reader is fine afterwards.
         store.set_query_budget(DEFAULT_QUERY_BUDGET);
         assert!(!store.query_packets(None, 0, 10).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scope_migration_tests {
+    use super::*;
+    #[test]
+    fn v6_migrates_scope_and_preserves_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scope.mineburp");
+        let store = ProjectStore::create(&path, "scope", ProjectOptions::default()).unwrap();
+        store
+            .save_workbench_document("intruder", &serde_json::json!({"version":1}))
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .execute_batch("DROP TABLE target_scope; PRAGMA user_version=6;")
+            .unwrap();
+        drop(store);
+        let read_only = ProjectStore::open(
+            &path,
+            ProjectOptions {
+                read_only: true,
+                ..ProjectOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(read_only.target_scope().unwrap().is_empty());
+        drop(read_only);
+        let store = ProjectStore::open(&path, ProjectOptions::default()).unwrap();
+        assert_eq!(store.info().schema_version, 8);
+        assert!(store.target_scope().unwrap().is_empty());
+        store.set_target_scope(&["*.example.com".into()]).unwrap();
+        assert_eq!(store.target_scope().unwrap(), vec!["*.example.com"]);
+        assert!(store.workbench_document("intruder").unwrap().is_some());
+        let clone = store.clone();
+        store.close_for_exit().unwrap();
+        assert!(
+            clone.packet_count().is_err(),
+            "clones must lose the file handles"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -345,3 +345,33 @@ async fn semantically_empty_delete_filters_require_confirmation() {
     let rows: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn project_scope_round_trip_and_validation() {
+    let session = Session::new();
+    assert_eq!(session.ok("project", json!({"action":"scope"})).await, "[]");
+    let patterns = json!(["*.example.com:25565", "10.0.0.0/8", "[2001:db8::/32]:25565"]);
+    let result = session
+        .ok("project", json!({"action":"scope", "patterns":patterns}))
+        .await;
+    assert_eq!(serde_json::from_str::<Value>(&result).unwrap(), patterns);
+    assert_eq!(
+        session.ok("project", json!({"action":"scope"})).await,
+        result
+    );
+    assert!(
+        session
+            .err(
+                "project",
+                json!({"action":"scope", "patterns":["10.0.0.0/99"]})
+            )
+            .await
+            .contains("CIDR")
+    );
+    assert_eq!(
+        session
+            .ok("project", json!({"action":"scope", "patterns":[]}))
+            .await,
+        "[]"
+    );
+}

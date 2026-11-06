@@ -509,3 +509,48 @@ async fn rewrites_also_apply_to_liveness_bypassing_a_hold() {
         "the dropped keep-alive must not arrive first"
     );
 }
+
+#[tokio::test]
+async fn scope_change_skips_intercept_and_drop_rules_on_existing_connections() {
+    let proxy = ProxyService::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = session(&proxy, &listener).await;
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut server = Link::new(stream);
+    enter_play(&mut client, &mut server).await;
+    proxy
+        .set_target_scope(vec!["allowed.example".into()])
+        .unwrap();
+    proxy
+        .set_replacement_rules(vec![mineburp_core::ReplacementRule {
+            action: mineburp_core::ReplacementAction::Drop,
+            id: uuid::Uuid::new_v4(),
+            name: "Drop all play".into(),
+            enabled: true,
+            expression: "state == play".into(),
+            edits: vec![],
+        }])
+        .unwrap();
+    proxy
+        .set_intercept_settings(InterceptSettings {
+            enabled: true,
+            server_to_client: true,
+            ..InterceptSettings::default()
+        })
+        .unwrap();
+    let chat = play_id(Direction::ServerToClient, "system_chat");
+    let body = string_bytes("outside scope");
+    server.send(chat, &body).await;
+    let received = tokio::time::timeout(Duration::from_secs(2), client.receive())
+        .await
+        .expect("outside scope frame forwards unchanged");
+    assert_eq!(received.body.as_ref(), body.as_slice());
+    assert!(proxy.intercepted().is_empty());
+    let id = proxy.sessions()[0].id;
+    assert!(matches!(
+        proxy
+            .repeater_send(id, Direction::ServerToClient, Bytes::from_static(&[0]))
+            .await,
+        Err(ProxyError::OutOfScope)
+    ));
+}

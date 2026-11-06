@@ -18,3 +18,5 @@ pub use model::{
 };
 
 pub mod research;
+
+pub mod scope;

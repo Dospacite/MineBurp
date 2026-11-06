@@ -32,6 +32,7 @@ import type {
   ProjectInfo,
   ProtocolState,
   ProxyEvent,
+  RecoveredSession,
   RepeaterTab,
   ReplacementRule,
   SavedFilter,
@@ -113,6 +114,16 @@ export const desktop = {
   captureStats: () => call<CaptureStats>("capture_stats"),
   decryptMode: () => call<DecryptModeStatus>("decrypt_mode_status"),
   setDecryptMode: (enabled: boolean) => call<DecryptModeStatus>("decrypt_mode_set", { enabled }),
+  projectRecoveredList: () => call<RecoveredSession[]>("project_recovered_list"),
+  projectRecoveredDelete: (path: string) => call<void>("project_recovered_delete", { path }),
+  projectRecoveredSaveAs: (path: string, destination: string) =>
+    call<ProjectInfo>("project_recovered_save_as", { path, destination }),
+  projectScopeGet: () => call<string[]>("project_scope_get"),
+  projectScopeSet: (patterns: string[]) => call<void>("project_scope_set", { patterns }),
+  labListenerStart: (host: string, port: number, stayArmed: boolean) =>
+    call<[string, string]>("lab_listener_start", { host, port, stayArmed }),
+  labListenerActive: (id: string) => call<boolean>("lab_listener_active", { id }),
+  labListenerStop: (id: string) => call<void>("lab_listener_stop", { id }),
   projectCurrent: () => call<ProjectInfo | null>("project_current"),
   projectCreate: async (path: string, name: string, passphrase?: string) => {
     await flushProjectEditors();

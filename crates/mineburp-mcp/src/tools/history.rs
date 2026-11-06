@@ -266,6 +266,15 @@ pub async fn status(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
         let _ = write!(out, "\nclient assist: {summary}");
     }
     if let Some(proxy) = host.proxy() {
+        let scope = proxy.target_scope();
+        if !scope.is_empty() {
+            let _ = write!(
+                out,
+                "\ntarget scope: {} ({} out-of-scope routes refused; the agent connected those directly)",
+                scope.join(", "),
+                proxy.out_of_scope_refusals()
+            );
+        }
         let sessions = proxy.sessions();
         let _ = write!(out, "\nlive sessions: {}", sessions.len());
         for session in sessions.iter().take(8) {

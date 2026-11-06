@@ -39,3 +39,18 @@ Setup diagnostics only enumerate capture interfaces and inspect local prerequisi
 Do not include access tokens, refresh tokens, project passphrases, or captured private server data in a report. Include the affected crate, a minimal reproduction, and whether the issue crosses the loopback or project trust boundary.
 
 Report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/Dospacite/MineBurp/security/advisories/new). If reporting is unavailable, ask the maintainers to enable private reporting through a public issue containing no vulnerability details. Use public issues only for non-sensitive coordination.
+
+## Authorized target scope
+
+Projects can restrict active testing to an allowlist of hosts, wildcard
+subdomains, or IPv4/IPv6 CIDRs with optional ports. An empty list permits all
+targets for compatibility. Configure scope before enabling Decrypt connections.
+Routes outside scope are refused, and Repeater, Intercept, and replacement rules
+skip connections outside scope. Scope checks use the requested hostname or
+literal IP address without DNS resolution. They do not protect against DNS
+rebinding or restrict passive capture. Changing scope releases held packets
+unchanged; it does not undo earlier edits or disconnect existing sessions.
+
+The GUI lab listener binds only to IPv4 loopback. Stay armed accepts repeated
+clients, caps concurrent connections at eight, and closes after 60 seconds
+without a new connection. Each client uses the existing protocol proxy plumbing.
