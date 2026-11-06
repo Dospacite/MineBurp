@@ -3,9 +3,9 @@
   "productName": "MineBurp",
   "identifier": "tools.mineburp.desktop",
   "build": {
-    "beforeDevCommand": "npm run prepare:sidecar && npm run build:agent && npm run dev",
+    "beforeDevCommand": "npm run build:agent && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run prepare:sidecar && npm run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -34,9 +34,6 @@
     "resources": {
       "../agent/build/mineburp-agent.jar": "resources/mineburp-agent.jar"
     },
-    "externalBin": [
-      "binaries/mineburp-mcp"
-    ],
     "linux": {
       "deb": {
         "depends": [

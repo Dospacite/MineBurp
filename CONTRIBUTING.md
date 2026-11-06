@@ -6,7 +6,6 @@ Before submitting a change, run:
 
 ```bash
 npm run build:agent
-npm run prepare:sidecar
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -27,8 +26,9 @@ Project schema changes require a forward-only migration and tests that open the 
 
 Install Node.js 22, npm, the Rust toolchain in `rust-toolchain.toml`, JDK 21,
 Git, and the [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
-Run `npm ci`, then `npm run tauri dev`. The build prepares the MCP sidecar and
-Java agent automatically. The Java agent targets Java 8 despite using JDK 21
+Run `npm ci`, then `npm run tauri dev`. The build prepares the Java agent automatically. Release
+builds also bundle `mineburp-mcp`: run `npm run prepare:sidecar`, then
+`npm run tauri -- build --config src-tauri/tauri.release.conf.json`. The Java agent targets Java 8 despite using JDK 21
 to compile. Linux is the supported capture platform.
 
 Install `dumpcap` through your distribution and grant capture permission to your

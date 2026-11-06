@@ -51,7 +51,7 @@ jobs:
       - run: npm run build:agent
       - run: npm run prepare:sidecar
       - name: Build Linux app packages
-        run: npm run tauri -- build
+        run: npm run tauri -- build --config src-tauri/tauri.release.conf.json
       - name: Generate Rust and npm CycloneDX SBOMs
         run: |
           cargo install cargo-cyclonedx --locked

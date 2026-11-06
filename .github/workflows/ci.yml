@@ -31,10 +31,9 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-      - name: Prepare bundled binaries for desktop compilation
+      - name: Build the Java agent bundled with the desktop
         run: |
           node agent/build.mjs
-          node scripts/prepare-sidecar.mjs
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
