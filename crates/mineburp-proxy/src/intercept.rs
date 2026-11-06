@@ -221,7 +221,12 @@ impl Interceptor {
     ) -> (u64, oneshot::Receiver<InterceptDecision>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, receiver) = oneshot::channel();
-        self.held.lock().insert(
+        let mut held = self.held.lock();
+        if !self.settings.read().0.enabled {
+            let _ = reply.send(InterceptDecision::Forward);
+            return (id, receiver);
+        }
+        held.insert(
             id,
             Held {
                 packet: InterceptedPacket {
@@ -405,6 +410,19 @@ mod tests {
             Some(769),
             Some("ping_request")
         ));
+    }
+
+    #[tokio::test]
+    async fn hold_after_disable_forwards_immediately() {
+        let interceptor = enabled("");
+        let packet = summary(ProtocolState::Play, Direction::ClientToServer, "chat");
+        assert!(interceptor.should_hold(&packet));
+        interceptor
+            .set_settings(InterceptSettings::default())
+            .unwrap();
+        let (_, decision) = interceptor.hold(packet, "host:1".into(), Bytes::new(), 0, None);
+        assert_eq!(decision.await.unwrap(), InterceptDecision::Forward);
+        assert_eq!(interceptor.pending_count(), 0);
     }
 
     #[tokio::test]

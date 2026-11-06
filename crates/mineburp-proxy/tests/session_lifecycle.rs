@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Session behaviour that only shows over real sockets: what is delivered when
 //! a peer closes, what may overtake a held frame, how the handshake address is
 //! forwarded, and when the live table forgets a session.
@@ -360,6 +361,131 @@ async fn automatic_blockers_also_apply_to_liveness_bypassing_a_hold() {
         loop {
             if let ProxyEvent::Packet(summary) = events.recv().await.unwrap() {
                 if summary.disposition == Disposition::Dropped {
+                    assert_eq!(summary.packet_id, Some(keep_alive));
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        proxy.intercepted().len(),
+        1,
+        "the original chat is still held"
+    );
+    let held = proxy.intercepted()[0].id;
+    proxy
+        .resolve_intercept(held, InterceptDecision::Forward)
+        .unwrap();
+    assert_eq!(
+        client.receive().await.id,
+        chat,
+        "the dropped keep-alive must not arrive first"
+    );
+}
+
+#[tokio::test]
+async fn stopping_a_listening_route_publishes_closed() {
+    let proxy = ProxyService::new();
+    let mut events = proxy.subscribe();
+    let snapshot = proxy
+        .start_session(SessionOptions::new(Target {
+            host: "127.0.0.1".into(),
+            port: 9,
+        }))
+        .await
+        .unwrap();
+    proxy.stop_session(snapshot.id).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let mineburp_proxy::ProxyEvent::Connection(row) = events.recv().await.unwrap() {
+                if row.id == snapshot.id && row.status == mineburp_core::ConnectionStatus::Closed {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("closed snapshot");
+}
+
+#[tokio::test]
+async fn sqlite_write_lock_does_not_stop_relaying() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("blocked.mineburp");
+    let project = mineburp_project::ProjectStore::create(
+        &path,
+        "Blocked",
+        mineburp_project::ProjectOptions::default(),
+    )
+    .unwrap();
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let proxy = ProxyService::new();
+    proxy.set_project(Some(project));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut client = session(&proxy, &listener).await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut server = Link::new(stream);
+        client.send(0, &handshake(1)).await;
+        assert_eq!(server.receive().await.id, 0);
+        for _ in 0..128 {
+            client.send(1, &[0; 8]).await;
+            assert_eq!(server.receive().await.id, 1);
+        }
+    })
+    .await
+    .expect("relay must not await SQLite");
+    lock.execute_batch("ROLLBACK").unwrap();
+}
+
+#[tokio::test]
+async fn rewrites_also_apply_to_liveness_bypassing_a_hold() {
+    use mineburp_core::{Disposition, ReplacementAction, ReplacementRule};
+    use mineburp_proxy::ProxyEvent;
+    let proxy = ProxyService::new();
+    let mut events = proxy.subscribe();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = session(&proxy, &listener).await;
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut server = Link::new(stream);
+    enter_play(&mut client, &mut server).await;
+    proxy
+        .set_replacement_rules(vec![ReplacementRule {
+            action: ReplacementAction::Rewrite,
+            id: uuid::Uuid::new_v4(),
+            name: "Block keep-alive".into(),
+            enabled: true,
+            expression: "state == play && direction == server_to_client && name == keep_alive"
+                .into(),
+            edits: vec![mineburp_core::PacketEdit::Field {
+                name: "id".into(),
+                value: "43".into(),
+            }],
+        }])
+        .unwrap();
+    proxy
+        .set_intercept_settings(InterceptSettings {
+            enabled: true,
+            client_to_server: false,
+            server_to_client: true,
+            ..InterceptSettings::default()
+        })
+        .unwrap();
+    let chat = play_id(Direction::ServerToClient, "system_chat");
+    let keep_alive = play_id(Direction::ServerToClient, "keep_alive");
+    server.send(chat, &string_bytes("held")).await;
+    wait_until(|| !proxy.intercepted().is_empty(), "the held chat").await;
+    server.send(keep_alive, &42_i64.to_be_bytes()).await;
+    let rewritten = client.receive().await;
+    assert_eq!(rewritten.id, keep_alive);
+    assert_eq!(rewritten.body.as_ref(), 43_i64.to_be_bytes());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let ProxyEvent::Packet(summary) = events.recv().await.unwrap() {
+                if summary.disposition == Disposition::Edited {
                     assert_eq!(summary.packet_id, Some(keep_alive));
                     break;
                 }

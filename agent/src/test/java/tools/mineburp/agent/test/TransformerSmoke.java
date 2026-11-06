@@ -36,7 +36,7 @@ public final class TransformerSmoke {
         service.joinServer(new GameProfile(profileId), "legacy-token", "legacy-hash");
         service.joinServer(profileId, "modern-token", "modern-hash");
         Thread.sleep(1_000L);
-        if (YggdrasilMinecraftSessionService.originalCalls != 2) {
+        if (YggdrasilMinecraftSessionService.originalCalls != (trusted ? 4 : 2)) {
             throw new AssertionError("the original Authlib methods did not both run");
         }
 
@@ -48,6 +48,24 @@ public final class TransformerSmoke {
             expectUnchanged("Minecraft's connect under an unverified broker", endpoint, minecraft);
             expectUnchanged("an obfuscated connect under an unverified broker", endpoint, obfuscated);
             return;
+        }
+        // Exercise the same invocation seam and inspect the credential after
+        // return, so removing it from the broker map alone cannot pass.
+        Class<?> credentialType = Class.forName("tools.mineburp.agent.SessionCredential");
+        java.lang.reflect.Constructor<?> constructor = credentialType.getDeclaredConstructor(
+            Object.class, Object.class, String.class);
+        constructor.setAccessible(true);
+        Object credential = constructor.newInstance(service, profileId, "test-token");
+        Method invokeOriginal = Class.forName("tools.mineburp.agent.AgentHooks")
+            .getDeclaredMethod("invokeOriginal", credentialType, String.class);
+        invokeOriginal.setAccessible(true);
+        invokeOriginal.invoke(null, credential, "internal-join-hash");
+        for (String fieldName : new String[] { "sessionService", "identity", "accessToken" }) {
+            java.lang.reflect.Field field = credentialType.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            if (field.get(credential) != null) {
+                throw new AssertionError("JOIN retained " + fieldName);
+            }
         }
         expectRouted("Minecraft's connect", minecraft, routePort);
         expectRouted("an obfuscated Minecraft connect", obfuscated, routePort);

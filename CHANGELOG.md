@@ -32,6 +32,14 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Look up replacement-rule fields only through the requested span, skipping buffer and NBT presentation for preceding fields.
 - Reject invalid characters in Repeater hex field edits using the same strict parser as replacement rules.
 - Reject schema packs with missing collection lengths, invalid count references, or reversed protocol ranges.
+- Slow project writes no longer stall live proxy traffic or route creation; persistence overflow reports dropped rows.
+- Intercept backlogs account for frame overhead and drain without repeated scans.
+- Queued compression and login/configuration transitions preserve decoding and packet order.
+- Keep-alives overtaking held packets now apply rewrite rules and record edits.
+- Disabling Intercept cannot strand a concurrently arriving held packet.
+- Upstream connects time out and stop on cancellation; stopped listening routes publish Closed and connecting routes count toward admission limits.
+- The client-assistance broker retries accept errors instead of stopping.
+- Replacement rules targeting absent fields no longer log a warning per packet.
 - Save as can create a destination after reopening a project; the destination is reserved atomically with private permissions.
 - Late full-packet loads cannot overwrite newer Repeater edits.
 - Repeater: text components (chat, tab list header and footer, item lore, entity names) and block entity NBT were shown as raw hex. A list of compounds typed every item by its first, so `{"": "text"}` wrappers turned the byte flags of later parts into ints and the round trip failed. Each item is now typed by the item it replaces.
