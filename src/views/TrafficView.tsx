@@ -14,7 +14,6 @@ import {
   WifiOff,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-
 import { ContextMenu, type MenuItem } from "../components/ContextMenu";
 import { DeleteHistoryDialog } from "../components/DeleteHistoryDialog";
 import { EmptyState } from "../components/EmptyState";
@@ -37,6 +36,7 @@ import { annotationStore } from "../lib/annotations";
 import { desktop } from "../lib/desktop";
 import { chooseExportDestination, choosePcapngDestination } from "../lib/files";
 import { formatBytes } from "../lib/format";
+import { useTrafficAppend, useTrafficConnections } from "../lib/trafficStore";
 
 type CaptureStatus = "starting" | "running" | "unavailable" | "failed";
 
@@ -45,7 +45,7 @@ const STATS_POLL_MS = 2_000;
 export function TrafficView({
   capabilities,
   project,
-  connections,
+  connections: providedConnections,
   selectedPacket,
   selectedPacketId,
   filter,
@@ -54,7 +54,7 @@ export function TrafficView({
   onConnectionChange,
   decryptMode,
   captureStatus,
-  appendSignal,
+  appendSignal: providedAppendSignal,
   onSelectPacket,
   onDecryptModeChange,
   onOpenRepeater,
@@ -65,7 +65,7 @@ export function TrafficView({
 }: {
   capabilities: AppCapabilities | null;
   project: ProjectInfo | null;
-  connections: ConnectionSnapshot[];
+  connections?: ConnectionSnapshot[];
   selectedPacket: PacketView | null;
   selectedPacketId: number | null;
   /** Held by the workbench so it survives a trip to another view. */
@@ -75,7 +75,7 @@ export function TrafficView({
   onConnectionChange: (connectionId: string | null) => void;
   decryptMode: DecryptModeStatus | null;
   captureStatus: CaptureStatus;
-  appendSignal: number;
+  appendSignal?: number;
   onSelectPacket: (id: number) => void;
   onDecryptModeChange: (enabled: boolean) => Promise<DecryptModeStatus>;
   /** Sends the inspected packet to a new Repeater tab. */
@@ -86,6 +86,10 @@ export function TrafficView({
   /** Rows were added or removed outside the live capture; connections need a refresh. */
   onDataChanged?: () => void;
 }) {
+  const storedConnections = useTrafficConnections();
+  const connections = providedConnections ?? storedConnections;
+  const storeSignal = useTrafficAppend();
+  const appendSignal = providedAppendSignal ?? storeSignal;
   const [dataMenu, setDataMenu] = useState<{ x: number; y: number } | null>(null);
   const [dialog, setDialog] = useState<"delete" | "import" | null>(null);
   const [reloadSignal, setReloadSignal] = useState(0);
@@ -330,6 +334,7 @@ export function TrafficView({
       <main className="traffic-pane">
         {project ? (
           <PacketHistory
+            key={project?.path}
             project={project}
             connectionId={connectionId}
             filter={filter}

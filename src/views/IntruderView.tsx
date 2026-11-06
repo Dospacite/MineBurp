@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { PayloadGeneratorDialog } from "../components/PayloadGeneratorDialog";
 import type { AttackMode, ConnectionSnapshot, FieldSpan, PacketView } from "../domain/types";
 import { message } from "../hooks/useMineBurp";
@@ -13,6 +13,7 @@ import {
   EMPTY_INTRUDER,
   isIntruderDocument,
 } from "../lib/researchDocuments";
+import { useTrafficConnections } from "../lib/trafficStore";
 
 export interface ResearchRequest {
   packet: PacketView;
@@ -21,12 +22,14 @@ export interface ResearchRequest {
 }
 interface Props {
   request: ResearchRequest | null;
-  sessions: ConnectionSnapshot[];
+  sessions?: ConnectionSnapshot[];
   projectKey: string | null;
   onError: (error: string) => void;
 }
 
-export function IntruderView({ request, sessions, projectKey, onError }: Props) {
+function IntruderViewImpl({ request, sessions: providedConnections, projectKey, onError }: Props) {
+  const storedConnections = useTrafficConnections();
+  const sessions = providedConnections ?? storedConnections;
   const document = useProjectDocument(projectKey, "intruder", EMPTY_INTRUDER, isIntruderDocument, onError);
   const [seed, setSeed] = useDocumentField(document.value, document.setValue, "seed");
   const [positions, setPositions] = useDocumentField(document.value, document.setValue, "positions");
@@ -505,3 +508,5 @@ export function IntruderView({ request, sessions, projectKey, onError }: Props) 
     </section>
   );
 }
+
+export const IntruderView = memo(IntruderViewImpl);

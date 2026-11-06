@@ -13,7 +13,7 @@ import type {
 } from "../domain/types";
 import { message } from "../hooks/useMineBurp";
 import { t } from "../i18n";
-import { base64ToBytes, desktop, formatHexInput, parseHex } from "../lib/desktop";
+import { base64ToBytes, desktop, formatHexInput, parseHex, subscription } from "../lib/desktop";
 import { newId } from "../lib/ids";
 import { registerProjectEditor } from "../lib/projectWrites";
 
@@ -61,12 +61,14 @@ function blankEdit(kind: PacketEditKind): PacketEdit {
  * rule is live the moment it is enabled rather than on the next restart.
  */
 export function ReplaceView({
+  projectKey,
   seed,
   request = null,
   onRequestHandled,
   onError,
 }: {
   /** The packet selected in Traffic, offered as a preview subject. */
+  projectKey?: string | null;
   seed: PacketView | null;
   request?: RuleRequest | null;
   onRequestHandled?: (nonce: number) => void;
@@ -91,32 +93,51 @@ export function ReplaceView({
         window.clearTimeout(saveTimer.current);
         const pending = pendingRules.current;
         if (pending) {
-          await desktop.saveReplacementRules(pending);
+          await desktop.saveReplacementRules(pending, projectKey);
           if (pendingRules.current === pending) pendingRules.current = null;
         }
       }),
-    [],
+    [projectKey],
   );
   useEffect(
     () => () => {
       window.clearTimeout(saveTimer.current);
       const pending = pendingRules.current;
-      if (pending) void desktop.saveReplacementRules(pending).catch((reason) => onError(message(reason)));
+      if (pending)
+        void desktop.saveReplacementRules(pending, projectKey).catch((reason) => onError(message(reason)));
     },
-    [onError],
+    [onError, projectKey],
   );
   const previewRequest = useRef(0);
 
   useEffect(() => {
     if (!desktop.isAvailable()) return;
-    void desktop
-      .replacementRules()
-      .then((stored) => {
-        setRules(stored);
-        setSelectedId((current) => current ?? stored[0]?.id ?? null);
-        setLoaded(true);
-      })
-      .catch((reason) => onError(message(reason)));
+    let live = true;
+    const load = () => {
+      void desktop
+        .replacementRules()
+        .then((stored) => {
+          if (!live) return;
+          setRules(stored);
+          setSelectedId((current) => current ?? stored[0]?.id ?? null);
+          setLoaded(true);
+        })
+        .catch((reason) => onError(message(reason)));
+    };
+    load();
+    const stop = subscription(
+      desktop.onMcpChange((topic) => {
+        if (topic === "rules") {
+          window.clearTimeout(saveTimer.current);
+          pendingRules.current = null;
+          load();
+        }
+      }),
+    );
+    return () => {
+      live = false;
+      stop();
+    };
   }, [onError]);
 
   const selected = rules.find((rule) => rule.id === selectedId) ?? null;
@@ -130,14 +151,14 @@ export function ReplaceView({
       window.clearTimeout(saveTimer.current);
       saveTimer.current = window.setTimeout(() => {
         void desktop
-          .saveReplacementRules(next)
+          .saveReplacementRules(next, projectKey)
           .then(() => {
             if (pendingRules.current === next) pendingRules.current = null;
           })
           .catch((reason) => onError(message(reason)));
       }, 350);
     },
-    [onError],
+    [onError, projectKey],
   );
 
   const update = useCallback(

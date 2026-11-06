@@ -40,6 +40,12 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Upstream connects time out and stop on cancellation; stopped listening routes publish Closed and connecting routes count toward admission limits.
 - The client-assistance broker retries accept errors instead of stopping.
 - Replacement rules targeting absent fields no longer log a warning per packet.
+- Serialize decoded-field edits in Repeater and Intercept, commit multiline fields with Ctrl/Cmd+Enter, and await pending edits before sending.
+- Save dirty Repeater tabs before project changes and closing; retain Intercept drafts when held packets leave the queue and offer sending those drafts to Repeater.
+- Reload project-scoped rules and annotations after external edits, and guard rule writes with the expected project path.
+- Isolate traffic append and connection updates, memoize persistent tools and hex parsing, and stabilize history-table callbacks.
+- Scope Repeater shortcuts to its editor, preserve native text undo, coalesce hex typing into undo steps, and support arrow-key tab navigation with tabpanel semantics.
+- Preserve connection lists after failed status queries, prevent overlapping status refreshes, and reset packet history on project changes.
 - Save as can create a destination after reopening a project; the destination is reserved atomically with private permissions.
 - Late full-packet loads cannot overwrite newer Repeater edits.
 - Repeater: text components (chat, tab list header and footer, item lore, entity names) and block entity NBT were shown as raw hex. A list of compounds typed every item by its first, so `{"": "text"}` wrappers turned the byte flags of later parts into ints and the round trip failed. Each item is now typed by the item it replaces.

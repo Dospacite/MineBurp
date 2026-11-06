@@ -118,7 +118,16 @@ export const desktop = {
     return call<ProjectInfo>("project_create", { path, name, passphrase: passphrase || null });
   },
   projectOpen: async (path: string, passphrase?: string) => {
-    await flushProjectEditors();
+    try {
+      await flushProjectEditors();
+    } catch (error) {
+      if (
+        !window.confirm(
+          `Could not save project edits: ${String(error)}. Open another project and discard them?`,
+        )
+      )
+        throw error;
+    }
     return call<ProjectInfo>("project_open", { path, passphrase: passphrase || null, readOnly: false });
   },
   /** Copies the open project (usually the temporary session) to a new file and switches to it. */
@@ -231,7 +240,8 @@ export const desktop = {
   proxySessions: () => call<ConnectionSnapshot[]>("proxy_sessions"),
   /** The automatic replacement rules, in the order they are applied. */
   replacementRules: () => call<ReplacementRule[]>("replacement_rules_get"),
-  saveReplacementRules: (rules: ReplacementRule[]) => call<void>("replacement_rules_set", { rules }),
+  saveReplacementRules: (rules: ReplacementRule[], expectedPath?: string | null) =>
+    call<void>("replacement_rules_set", { rules, expectedPath }),
   /** Runs a rule's edits against one frame without sending anything. */
   replacementRulePreview: (
     rule: ReplacementRule,
