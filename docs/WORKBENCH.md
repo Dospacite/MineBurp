@@ -66,3 +66,16 @@ Enabled blockers run against the incoming decoded packet before replacement edit
 Blocking is available during handshake, status, login, configuration, and play. Replacement editing still excludes handshake and login. A blocker can prevent login or completion of a phase. Preview evaluates the selector and shows the drop verdict without affecting live traffic. Rule persistence is backward-compatible: rules without an action continue to rewrite.
 
 The MCP `rules` tool accepts `behavior="drop"` on add/update, and previews drop rules against a stored packet. Existing clients default to rewrite.
+
+## Compare
+
+Send two history packets to Compare slots A and B using the packet actions.
+Compare shows their bytes and decoded fields side by side. Byte alignment tracks
+insertions and deletions, so a longer string does not make every following byte
+look changed. Large inputs fall back to positional comparison, indicated in the
+view. Only the leading 1 MiB of each packet is read; a truncation notice means
+the comparison does not cover the complete payload.
+
+Fields show changed values and fields absent from either side. Clear **Only
+changed** to include equal fields. Swap A/B to reverse the comparison, or clear
+the slots to choose another pair. Comparing packets sends no traffic.

@@ -35,3 +35,5 @@ MineBurp is intended for authorized testing of Minecraft clients and servers. Do
 ## Reporting vulnerabilities
 
 Do not include access tokens, refresh tokens, project passphrases, or captured private server data in a report. Include the affected crate, a minimal reproduction, and whether the issue crosses the loopback or project trust boundary.
+
+Report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/Dospacite/MineBurp/security/advisories/new). If reporting is unavailable, ask the maintainers to enable private reporting through a public issue containing no vulnerability details. Use public issues only for non-sensitive coordination.

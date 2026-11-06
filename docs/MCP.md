@@ -16,7 +16,6 @@ Any client that launches stdio servers takes the same command:
 { "mcpServers": { "mineburp": { "command": "/path/to/mineburp-mcp" } } }
 ```
 
-OMP reads this repository's `.omp/mcp.json`, which registers `./target/release/mineburp-mcp` as the `mineburp` server, so a session started in this checkout has the tools without further setup. Elsewhere, add the same entry to `~/.omp/agent/mcp.json` and run `/mcp reload`.
 
 `mineburp-mcp` picks its mode at startup:
 
@@ -94,6 +93,6 @@ accepts one client. Close sessions with `connections close=...`. At most 16
 explicit routes can wait for clients at once. Offline-mode lab servers need no
 Java agent. Online-mode upstream servers still require client assistance.
 
-The small client in `test-projects/runtime-client` creates this route itself and
+The optional, local client in `test-projects/runtime-client` (not shipped in this repository) creates this route itself and
 handles Fabric configuration pings and teleport acknowledgments. See its README
 for the memory limits and interactive request format.

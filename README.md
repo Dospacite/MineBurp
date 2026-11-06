@@ -130,12 +130,23 @@ with what it reads as instead, rather than renamed.
 
 ## First run
 
+### Passive observation
+
 1. Start MineBurp. The **Traffic** view starts system capture automatically and records into a temporary project, so nothing is lost before you decide where to keep it.
 2. Choose **Save as** in the project menu to keep the session: it copies everything captured so far into a `.mineburp` file (with an optional passphrase) and keeps recording there. The temporary project is deleted on exit.
 3. Launch Minecraft from its normal launcher or from **Instances**, then connect to any server normally.
 4. Pick a connection in **Traffic** and select a packet to inspect its endpoints, decoded fields, and payload bytes. No MineBurp listener, target, PID, Java agent, or Microsoft sign-in is required.
 
-Passive observation cannot modify a connection, and encrypted application payloads remain encrypted. To inspect an encrypted Minecraft connection, configure client assistance for the instance in **Instances**, enable **Decrypt connections** in **Traffic**, then launch the instance and connect normally. MineBurp keeps this mode off by default. It routes only connections initiated through Minecraft's own network stack and fails open to the original target if the agent or broker is unavailable.
+Passive observation cannot modify a connection, and encrypted application payloads remain encrypted.
+
+### Active testing with decryption
+
+1. Save a project for your authorized assessment.
+2. Configure client assistance for the instance in **Instances**.
+3. Enable **Decrypt connections** in **Traffic**, launch that instance, and connect to your authorized server normally.
+4. Find a plugin channel, hold a matching packet in **Intercept**, then edit or send it to **Repeater**. Follow the [active testing tutorial](docs/TUTORIAL.md) for a disposable lab example.
+
+MineBurp keeps this mode off by default. It routes only connections initiated through Minecraft's own network stack and fails open to the original target if the agent or broker is unavailable.
 
 Decrypt mode uses an authenticated client-side route adapter instead of silently changing host `nftables`/TUN rules or requiring the desktop app to run as root. Separate TLS traffic from mods and launchers remains outside that route; modern signed chat and integrity-sensitive mod/plugin packets are marked as unsafe to alter in the inspector.
 

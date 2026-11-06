@@ -10,11 +10,11 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Project-backed Intruder and Sequencer configuration, samples, analysis, and results, with autosave and flush before project changes/exit.
 - Repeater edit undo/redo, original comparison, and named revisions stored with saved tabs.
 - Automatic drop rules in Replace, including selector preview, history recording, and MCP `behavior="drop"` support.
-- **MCP server**: `mineburp-mcp` exposes 18 tools (history, decoding, frame rewriting, rules, annotations, saved filters, schema packs, project import/export, Intercept, Repeater, network shaping, capture, launchers) over stdio. It bridges to the running app through a user-only Unix socket (disable with `MINEBURP_MCP=0`) or works offline on a project file. Changes made through it refresh the UI.
+- **MCP server**: `mineburp-mcp` exposes 19 tools (history, decoding, frame rewriting, rules, annotations, saved filters, schema packs, project import/export, Intercept, Repeater, network shaping, capture, launchers) over stdio. It bridges to the running app through a user-only Unix socket (disable with `MINEBURP_MCP=0`) or works offline on a project file. Changes made through it refresh the UI.
 - **Intercept** view: hold matching packets on decrypted connections, then forward, edit-and-forward, or drop them (Ctrl+Enter / Ctrl+Backspace). Dropped and edited packets are recorded with the `dropped` and `edited` results.
 - **Save as** copies the open project — including the temporary session — to a new file (re-keyed with an optional passphrase) and continues recording there.
 - Native open/save dialogs for projects and exports, and a recent-projects list.
-- Ctrl/⌘+1–6 switches workbench views.
+- Ctrl/⌘+1–0 switches workbench views.
 - Click the packet list's `#` header to switch between newest first and oldest first. The database orders the whole matching history, so oldest first starts at the first packet ever captured, not the oldest one loaded. "Load newer packets" pages forward, new traffic is appended once the end is loaded, and the choice is remembered with the column settings.
 - **Go to packet** (row menu or Ctrl/⌘+G) selects a packet by its `#` number and scrolls to it, loading the rows around it when it is not loaded. Choosing a bookmark does the same.
 - Repeater: NBT fields are shown and edited as JSON (`{"text": "hi", "bold": 1}`) instead of raw hex. Values keep the NBT type they had, new ones are inferred, and SNBT suffixes (`5b`, `1.5f`, `[B; 1, 2]`) force a type. NBT over 256 KiB, or NBT that would not survive the round trip, stays hex.
@@ -78,4 +78,4 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - New indexes on `packets(disposition)` and `packets(size)` for filtered history queries.
 - CSP remains `default-src 'self'` with `unsafe-inline` only for dynamic split-pane styles (documented).
 
-[0.1.0]: https://github.com/mineburp/mineburp/releases/tag/v0.1.0
+[0.1.0]: https://github.com/Dospacite/MineBurp/releases/tag/v0.1.0
