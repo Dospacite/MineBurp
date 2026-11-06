@@ -355,12 +355,50 @@ impl SessionJoinProvider for ClientAssistBroker {
     }
 }
 
+// Accept failures such as descriptor exhaustion must not kill the broker.
+async fn retry_accept<T, F, Fut>(mut accept: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, io::Error>>,
+{
+    loop {
+        match accept().await {
+            Ok(accepted) => return accepted,
+            Err(error) => {
+                tracing::warn!(%error, "client-assistance accept failed; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod accept_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn accept_errors_are_retried() {
+        let mut calls = 0;
+        let result = retry_accept(|| {
+            calls += 1;
+            std::future::ready(if calls < 3 {
+                Err(io::Error::from_raw_os_error(24))
+            } else {
+                Ok(42)
+            })
+        })
+        .await;
+        assert_eq!(result, 42);
+        assert_eq!(calls, 3);
+    }
+}
+
 impl ClientAssistServer {
     /// Accepts authenticated Java-agent connections until the runtime stops.
     pub async fn run(self) -> Result<(), BrokerError> {
         let listener = TcpListener::from_std(self.listener)?;
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let (stream, peer) = retry_accept(|| listener.accept()).await;
             if !peer.ip().is_loopback() {
                 continue;
             }

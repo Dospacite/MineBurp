@@ -2208,6 +2208,7 @@ dependencies = [
  "mineburp-session",
  "parking_lot",
  "rsa",
+ "rusqlite",
  "serde",
  "subtle",
  "tempfile",

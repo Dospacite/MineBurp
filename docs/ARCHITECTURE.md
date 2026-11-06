@@ -124,17 +124,17 @@ Four invariants hold the feature together:
 
 - Rewrite edits never run on handshake or login frames. The proxy rewrites those itself — the handshake address, the key exchange, compression — and a rule there would undo that work or desynchronise the framing.
 
-- A rule that fails is reported and skipped, never fatal. An unknown field name or a bad pattern must not disconnect the game an operator is testing.
+- A rule that fails is reported and skipped, never fatal. An absent field makes a rule inapplicable without a warning. A bad pattern must not disconnect the game an operator is testing.
 - The recorded row is what went on the wire. A rewritten packet is re-derived from the frame that was actually sent and recorded as `edited`, so the history stays a record of the connection rather than of intent.
 - Field edits go through `layout`, so a resized value rewrites its own length prefix. Byte-level edits do exactly what they are told; that is what makes them useful where no decoder reaches, and why they can leave a frame the client will reject.
 
 ## Intercept
 
-Intercept holds selected status, configuration and play frames for the operator
+Intercept holds selected handshake, status, login, configuration and play frames for the operator
 to forward, edit, or drop. A held frame blocks only its own direction of its own
 connection, and three rules stop a hold from costing the session:
 
-- Keep-alives and pings, recognised by id from the version's table, are forwarded at once even while an earlier frame in the same direction is held. The reader keeps draining its socket during a hold; everything else waits behind the held frame in order, up to a bounded backlog. A frame that changes the protocol state is never overtaken, because what follows it is read in the state it moves to.
+- Keep-alives and pings, recognised by id from the version's table, are forwarded at once even while an earlier frame in the same direction is held. The reader keeps draining its socket during a hold; everything else waits behind the held frame in order, up to a bounded backlog. Held backlogs charge 64 bytes per frame in addition to payload bytes and maintain a running byte total. A queued frame that changes protocol state or stream encoding stops further decoding until released. A frame that changes the protocol state is never overtaken, because what follows it is read in the state it moves to.
 - An optional deadline forwards a held frame unchanged; the UI shows the countdown.
 - A held entry is released however its wait ends — a verdict, the deadline, the session closing, or the task being aborted.
 
@@ -151,7 +151,7 @@ to frames written from then on, on open connections too.
 Capture rates outrun both the webview and SQLite if either is fed per packet:
 
 - Capture and proxy writers both persist to the project and publish only a coalesced append *count* to the webview. Nothing is mirrored into an in-memory ring: a ring bounded by frame count aged rows out of the operator's reach under real Minecraft load, and payloads travelling over IPC per packet is what made the view unusable in the first place.
-- The project writer commits captured frames in batched transactions.
+- The project writer commits captured frames in batched transactions. Proxy readers enqueue without waiting for SQLite. The persistence queue holds at most 64 frames and 32 MiB, with one bounded batch in flight; overflow drops rows and reports the cumulative drop count. Summary events retain database-assigned row ids after insertion.
 - Packet tables render only the rows on screen; row height is fixed so the window is arithmetic.
 - The history appends from a keyset cursor and never replaces loaded rows on a timer.
 - Statistics, export, and deletion compile the same filter as the history and run in SQLite; export walks matching rows a page at a time, oldest first, and never loads a capture into memory.
@@ -161,7 +161,7 @@ Capture rates outrun both the webview and SQLite if either is fed per packet:
 - Each accepted client creates one session handle and four tasks: two readers and two writers.
 - Socket writers are single-owner tasks behind channels bounded by frame count and by bytes, preserving byte order and applying encryption in one place.
 - When either side closes, the other reader stops and both writers deliver what is already queued — a server's disconnect reason, typically — before a short deadline ends the session. A closed session leaves the live table; its last snapshot is in the project.
-- The connection snapshot is saved on the persistence ticker, not per packet, and lifecycle changes are saved at once. A failed save is reported as an error event and never ends the session.
+- The connection snapshot is saved on the persistence ticker, not per packet, and lifecycle changes are published immediately and saved in the background. A failed save is reported as an error event and never ends the session.
 - The proxy's state machine follows the frames it forwarded, not the ones that arrived, and moves between configuration and play only on the four transition packets named by the version's table.
 - Repeater injects only in configuration or play, after compression and encryption are settled.
 - Client and server links have independent stateful ciphers.

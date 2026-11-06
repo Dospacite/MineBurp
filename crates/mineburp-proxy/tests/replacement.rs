@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Drives a replacement rule through a real session.
 //!
 //! The rewrite engine is unit tested on its own; what this covers is the part
