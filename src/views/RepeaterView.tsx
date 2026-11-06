@@ -2,6 +2,7 @@ import { Loader2, Plus, Redo2, Save, Send, Undo2, X } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { FieldEditor } from "../components/FieldEditor";
+import { addToFinding } from "../components/FindingPicker";
 import { Split } from "../components/Split";
 import type {
   ConnectionSnapshot,
@@ -170,6 +171,14 @@ export const RepeaterView = memo(function RepeaterView({
   const parseInput = active?.hex;
   const parsed = useMemo(() => (parseInput === undefined ? null : tryParseHex(parseInput)), [parseInput]);
 
+  useEffect(() => {
+    const open = (event: Event) => {
+      const id = (event as CustomEvent<string>).detail;
+      if (tabsRef.current.some((tab) => tab.id === id)) setActiveId(id);
+    };
+    window.addEventListener("finding-repeater", open);
+    return () => window.removeEventListener("finding-repeater", open);
+  }, []);
   const patchTab = useCallback(
     (id: string, patch: Partial<RepeaterTabState>, typing = false) => {
       const next = tabsRef.current.map((tab) =>
@@ -497,6 +506,12 @@ export const RepeaterView = memo(function RepeaterView({
             aria-labelledby={`tab-${active.id}`}
           >
             <div className="repeater-toolbar">
+              <button
+                type="button"
+                onClick={() => active && addToFinding([{ kind: "repeater", id: active.id }])}
+              >
+                {t("findings.add")}
+              </button>
               <label>
                 {t("repeater.connection")}
                 <select

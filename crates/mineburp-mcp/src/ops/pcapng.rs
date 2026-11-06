@@ -29,6 +29,15 @@ pub fn write_pcapng(
     query: &PacketQuery,
     output: impl Write,
 ) -> Result<PcapExportSummary, String> {
+    write_pcapng_filtered(store, query, output, None)
+}
+
+pub(super) fn write_pcapng_filtered(
+    store: &ProjectStore,
+    query: &PacketQuery,
+    output: impl Write,
+    ids: Option<&std::collections::HashSet<i64>>,
+) -> Result<PcapExportSummary, String> {
     let mut writer = PcapngWriter::new(output, "MineBurp").map_err(|error| error.to_string())?;
     let interface = writer
         .add_interface(SYNTHETIC_LINKTYPE, EXPORT_INTERFACE)
@@ -39,6 +48,9 @@ pub fn write_pcapng(
     let mut summary = PcapExportSummary::default();
     store
         .for_each_packet(query, 500, |packet, payload| {
+            if ids.is_some_and(|ids| !ids.contains(&packet.id)) {
+                return Ok(());
+            }
             let port = if let Some(port) = server_ports.get(&packet.connection_id) {
                 *port
             } else {

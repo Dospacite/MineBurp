@@ -2,6 +2,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
 import { ExpressionInput } from "../components/ExpressionInput";
+import { addToFinding } from "../components/FindingPicker";
 import { Split } from "../components/Split";
 import type {
   Direction,
@@ -268,6 +269,9 @@ export function ReplaceView({
         </div>
         {rules.map((rule) => (
           <div className={`rule-card ${rule.id === selectedId ? "selected" : ""}`} key={rule.id}>
+            <button type="button" onClick={() => addToFinding([{ kind: "rule", id: rule.id }])}>
+              {t("findings.add")}
+            </button>
             <input
               type="checkbox"
               checked={rule.enabled}

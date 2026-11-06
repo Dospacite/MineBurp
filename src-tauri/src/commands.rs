@@ -1465,3 +1465,14 @@ pub async fn replacement_rule_preview(
     })
     .await
 }
+
+#[tauri::command]
+pub async fn findings(
+    state: State<'_, DesktopState>,
+    expected_path: PathBuf,
+    action: String,
+    args: serde_json::Value,
+) -> CommandResult<serde_json::Value> {
+    let store = project_for_path(&state, &expected_path)?;
+    off_main(move || mineburp_mcp::ops::finding_action(&store, &action, &args)).await
+}

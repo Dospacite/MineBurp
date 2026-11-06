@@ -3722,3 +3722,25 @@ button.stats-bar:focus-visible {
   font-size: 11px;
   line-height: 1.5;
 }
+
+.findings-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(300px, 2fr);
+  gap: 16px;
+  overflow: auto;
+}
+.findings-layout > div,
+.findings-layout form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+.findings-layout label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.findings-layout textarea {
+  min-height: 120px;
+}

@@ -6,6 +6,8 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 
 ## What is implemented
 
+- **Findings**: severity/status tracking, Markdown descriptions and reproduction steps, evidence links, tags, and Markdown/HTML reports.
+
 - **Minecraft Decoder** in a right sidebar, **Channel explorer** across the filtered capture, Ctrl/Cmd+K **command palette**, packet selection actions, bounded payload generators, Repeater undo/redo and named revisions, custom decoded-field history columns, and traffic presets. Intruder and Sequencer work saves in the project. See [workbench tools](docs/WORKBENCH.md).
 - **Automatic blockers** in Replace: enabled drop rules discard matched decoded packets before rewriting and Intercept, record the original as `dropped`, and do not advance protocol state.
 
@@ -33,7 +35,7 @@ The current registry covers stable Java releases from 1.7.2 through 26.2. Unknow
 - **Traffic statistics** for any filter: packets and bytes per direction over time, the busiest packet names by count and by bytes, the busiest connections, and a size histogram.
 - **pcapng export and import**. Export writes decrypted packets as one synthetic TCP stream per connection, with each packet named in a comment, and `tools/wireshark/mineburp.lua` dissects it in Wireshark. Import reads pcap or pcapng files into a project through the same reassembly as live capture, then splits each TCP stream into Minecraft packets — one row per packet with its state, id and name — following the handshake, compression, login and configuration the way the proxy does. Encrypted traffic (after an online-mode login) cannot be decrypted from a capture and is kept as labelled raw rows; a capture that starts mid-connection is synchronised by searching for frame boundaries, optionally with a protocol version you give it. Re-importing a MineBurp pcapng export restores the packets, states and names it was written with.
 - History maintenance: delete the packets a filter matches and compact the project file.
-- **MCP server** (`mineburp-mcp`): 19 context-efficient tools that let an MCP client such as Claude Code query and decode history, rewrite frames, manage rules, and drive Intercept and the Repeater. It bridges to the running app over a private Unix socket, or works directly on a `.mineburp` file when the app is closed. See [docs/MCP.md](docs/MCP.md).
+- **MCP server** (`mineburp-mcp`): 20 context-efficient tools that let an MCP client such as Claude Code query and decode history, rewrite frames, manage rules, and drive Intercept and the Repeater. It bridges to the running app over a private Unix socket, or works directly on a `.mineburp` file when the app is closed. See [docs/MCP.md](docs/MCP.md).
 - Advanced packet filtering: traffic source, direction, protocol phase, and result sets; packet-name show/hide lists; payload size bounds; free-text search with regex, case-sensitive, and negative options; a filter expression language (`state == play && size > 256 && name ~ chat`) shared with replace rules; and payload content search by literal text, hex byte sequence, or regular expression, scoped to packets that contain the term, are exactly it, start with it, or end with it — each of which can be negated. A content search takes one term per line and matches any of them, and a hex term may be an inclusive range (`0c-0f`, `0100-01ff`), so hiding a handful of frames is one filter rather than one per frame. All of it runs in SQLite against the whole capture, not against the rows on screen.
 
 ## Repository layout

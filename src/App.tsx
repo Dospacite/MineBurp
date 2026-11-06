@@ -22,6 +22,7 @@ import { CommandPalette, type PaletteCommand } from "./components/CommandPalette
 import { type DecoderRequest, DecoderSidebar } from "./components/DecoderSidebar";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ErrorLog } from "./components/ErrorLog";
+import { FindingPicker } from "./components/FindingPicker";
 import type { PacketActions } from "./components/PacketHistory";
 import { ProjectControl } from "./components/ProjectControl";
 import { openSetup, SetupPanel } from "./components/SetupPanel";
@@ -39,6 +40,7 @@ import { type SelectionActions, SelectionActionsContext } from "./lib/selectionA
 import { TRAFFIC_PRESETS, trafficPreset } from "./lib/trafficPresets";
 import { ChannelExplorerView } from "./views/ChannelExplorerView";
 import { type CompareSlots, CompareView } from "./views/CompareView";
+import { FindingsView } from "./views/FindingsView";
 import { InstancesView } from "./views/InstancesView";
 import { InterceptView } from "./views/InterceptView";
 import { IntruderView, type ResearchRequest } from "./views/IntruderView";
@@ -61,6 +63,7 @@ const navigation: Array<{ id: View; labelKey: Parameters<typeof t>[0]; icon: typ
   { id: "stats", labelKey: "app.view.stats", icon: BarChart3 },
   { id: "intruder", labelKey: "app.view.intruder", icon: Crosshair },
   { id: "sequencer", labelKey: "app.view.sequencer", icon: Fingerprint },
+  { id: "findings", labelKey: "app.view.findings", icon: ScrollText },
   { id: "channels", labelKey: "app.view.channels", icon: Network },
 ];
 
@@ -95,6 +98,16 @@ export function App() {
     annotationStore.reset();
   }, [projectPath]);
 
+  useEffect(() => {
+    const open = (event: Event) => {
+      setView("repeater");
+      window.dispatchEvent(
+        new CustomEvent("finding-repeater", { detail: (event as CustomEvent<string>).detail }),
+      );
+    };
+    window.addEventListener("finding-open-repeater", open);
+    return () => window.removeEventListener("finding-open-repeater", open);
+  }, []);
   const { packetFilter, setPacketFilter, setConnectionId } = workbench;
   const applyName = useCallback(
     (name: string) => {
@@ -480,6 +493,21 @@ export function App() {
 
         <div className={`workbench-body ${decoderOpen ? "decoder-open" : ""}`}>
           <div className="workspace">
+            <FindingPicker key={projectPath} projectKey={projectPath} onError={setError} />
+            {view === "findings" && (
+              <FindingsView
+                key={projectPath}
+                projectKey={projectPath}
+                onError={setError}
+                onPacket={(id) => {
+                  setView("traffic");
+                  setTimeout(
+                    () => window.dispatchEvent(new CustomEvent("finding-packet", { detail: id })),
+                    0,
+                  );
+                }}
+              />
+            )}
             <div className="view-host" hidden={view !== "intruder"}>
               <ErrorBoundary>
                 <IntruderView

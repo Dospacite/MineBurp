@@ -36,6 +36,7 @@ import { ColumnSettings } from "./ColumnSettings";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { ConversationList } from "./ConversationList";
 import { EmptyState } from "./EmptyState";
+import { addToFinding } from "./FindingPicker";
 import { GoToPacketDialog } from "./GoToPacketDialog";
 import { PacketFilterBar } from "./PacketFilterBar";
 import { COPY_LIMIT, type CopyFormat, renderCopy } from "./PacketInspector";
@@ -526,6 +527,13 @@ export function PacketHistory({
     [applyWindow, fail, onError, onNotice, onSelect, project, queueReveal],
   );
 
+  useEffect(() => {
+    const jump = (event: Event) => {
+      void goToPacket((event as CustomEvent<number>).detail);
+    };
+    window.addEventListener("finding-packet", jump);
+    return () => window.removeEventListener("finding-packet", jump);
+  }, [goToPacket]);
   /** Leaves a jumped-to window for the live end of the history. */
   const backToLive = useCallback(() => {
     setDetached(false);
@@ -667,6 +675,7 @@ export function PacketHistory({
           icon: <Send size={13} />,
           onSelect: () => actions.sendToRepeater(packet.id),
         },
+        { label: t("findings.add"), onSelect: () => addToFinding([{ kind: "packet", id: packet.id }]) },
         ...(actions.sendToIntruder
           ? [{ label: t("menu.intruder"), onSelect: () => actions.sendToIntruder?.(packet.id) }]
           : []),

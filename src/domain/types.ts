@@ -1,4 +1,5 @@
 export type View =
+  | "findings"
   | "traffic"
   | "intercept"
   | "repeater"
@@ -617,4 +618,22 @@ export interface SetupCheck {
   required: boolean;
   detail: string;
   hint: string;
+}
+
+export type FindingSeverity = "info" | "low" | "medium" | "high" | "critical";
+export type FindingStatus = "open" | "confirmed" | "false_positive" | "fixed";
+export type FindingEvidence =
+  | { kind: "packet"; id: number }
+  | { kind: "connection" | "repeater" | "rule"; id: string };
+export interface Finding {
+  id: string;
+  title: string;
+  severity: FindingSeverity;
+  status: FindingStatus;
+  description: string;
+  reproductionSteps: string;
+  createdAtMicros: number;
+  updatedAtMicros: number;
+  evidence: FindingEvidence[];
+  tags: string[];
 }
