@@ -645,13 +645,34 @@ impl ProjectStore {
     /// is the only listing that can offer the operator all of the traffic the
     /// history actually contains.
     pub fn list_connections(&self, limit: usize) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
+        self.list_connections_ordered(limit, false)
+    }
+
+    /// Connections most recently inserted into this project, for Compare defaults.
+    pub fn recent_connections(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
+        self.list_connections_ordered(limit, true)
+    }
+
+    fn list_connections_ordered(
+        &self,
+        limit: usize,
+        recent: bool,
+    ) -> Result<Vec<ConnectionSnapshot>, ProjectError> {
         self.with_reader(|connection| {
-            let mut statement = connection.prepare_cached(
+            let order = if recent {
+                "rowid DESC"
+            } else {
+                "packet_count DESC"
+            };
+            let mut statement = connection.prepare_cached(&format!(
                 "SELECT id, target_host, target_port, listener_address, status, state,
                         protocol_version, minecraft_version, loader, compression_threshold,
                         encrypted_client, encrypted_server, packet_count, byte_count, last_error
-                 FROM connections ORDER BY packet_count DESC LIMIT ?1",
-            )?;
+                 FROM connections ORDER BY {order} LIMIT ?1",
+            ))?;
             let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
                 Ok(ConnectionSnapshot {
                     id: parse_uuid(&row.get::<_, String>(0)?)?,

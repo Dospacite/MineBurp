@@ -30,6 +30,7 @@ const COMMANDS: &[&str] = &[
     "project_current",
     "project_checkpoint",
     "connections_query",
+    "connections_compare",
     "packets_query",
     "packets_export",
     "packets_export_pcapng",

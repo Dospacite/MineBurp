@@ -637,3 +637,14 @@ export interface Finding {
   evidence: FindingEvidence[];
   tags: string[];
 }
+
+export interface ConnectionComparison {
+  rows: {
+    a: PacketSummary | null;
+    b: PacketSummary | null;
+    kind: "identical" | "changed" | "only_a" | "only_b";
+    size_delta: number;
+    first_difference: number | null;
+  }[];
+  names: { name: string; a: number; b: number; differ: number }[];
+}

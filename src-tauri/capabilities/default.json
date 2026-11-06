@@ -33,6 +33,7 @@
     "allow-project-current",
     "allow-project-checkpoint",
     "allow-connections-query",
+    "allow-connections-compare",
     "allow-packets-query",
     "allow-packets-export",
     "allow-packets-export-pcapng",

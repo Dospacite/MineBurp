@@ -108,9 +108,13 @@ pub fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "connections",
-            description: "Connections in the project plus live decrypted sessions (marked LIVE), busiest first. `close` ends a live session.",
+            description: "Connections in the project plus live decrypted sessions (marked LIVE), busiest first. `close` ends a live session. action=compare with a,b aligns recorded sessions; filter scopes both sides, limit bounds text differences, format=json returns rows and per-name counts.",
             schema: object(
                 &[
+                    ("action", string("list or compare")),
+                    ("a", string("connection A id")),
+                    ("b", string("connection B id")),
+                    ("filter", filter_ref()),
                     ("limit", integer("default 50")),
                     ("live", boolean("only live sessions")),
                     (
@@ -609,6 +613,52 @@ pub fn annotation_line(annotation: &PacketAnnotation) -> String {
 }
 
 pub async fn connections(ctx: &Ctx<'_>, args: &Args) -> ToolResult {
+    if args.str("action") == Some("compare") {
+        let a = ctx
+            .resolve_connection(args.str("a").ok_or("a is required")?)
+            .await?;
+        let b = ctx
+            .resolve_connection(args.str("b").ok_or("b is required")?)
+            .await?;
+        let filter = args
+            .0
+            .get("filter")
+            .map(|v| v.as_object().ok_or("filter must be an object"))
+            .transpose()?
+            .cloned()
+            .unwrap_or_default();
+        let query = ctx.query(&filter, 500).await?;
+        let store = ctx.project()?;
+        let result =
+            super::blocking(move || crate::ops::compare_connections(&store, a, b, &query)).await?;
+        if args.str("format") == Some("json") {
+            return serde_json::to_string(&result).map_err(|e| e.to_string());
+        }
+        let mut out = format!(
+            "{} aligned rows, {} differences",
+            result.rows.len(),
+            result.rows.iter().filter(|r| r.kind != "identical").count()
+        );
+        for row in result
+            .rows
+            .iter()
+            .filter(|r| r.kind != "identical")
+            .take(args.usize("limit").unwrap_or(20).min(100))
+        {
+            use std::fmt::Write as _;
+            let _ = write!(
+                out,
+                "\n{} A={:?} B={:?} delta={} offset={:?}",
+                row.kind,
+                row.a.as_ref().map(|p| p.id),
+                row.b.as_ref().map(|p| p.id),
+                row.size_delta,
+                row.first_difference
+            );
+        }
+        return Ok(out);
+    }
+
     if let Some(close) = args.str("close") {
         let id = ctx.resolve_connection(close).await?;
         ctx.proxy()?

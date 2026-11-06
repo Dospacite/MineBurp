@@ -3744,3 +3744,32 @@ button.stats-bar:focus-visible {
 .findings-layout textarea {
   min-height: 120px;
 }
+
+.connection-compare-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 1fr 140px;
+  width: 100%;
+  height: 38px;
+  text-align: left;
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid var(--border);
+}
+.connection-compare-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connection-compare-row[aria-pressed="true"] {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.connection-compare-row.compare-changed {
+  color: var(--warn);
+}
+.connection-compare-row.compare-only_a {
+  color: var(--danger);
+}
+.connection-compare-row.compare-only_b {
+  color: var(--success);
+}

@@ -4,6 +4,8 @@
 //! here means a filter saved in the UI means exactly the same thing when an
 //! agent applies it, and an export written by either is byte-for-byte alike.
 
+mod compare;
+pub use compare::{ConnectionComparison, compare_connections};
 mod filter;
 mod paths;
 mod pcapng;
