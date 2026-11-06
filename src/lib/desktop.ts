@@ -87,6 +87,11 @@ export function filterArgs(query: PacketHistoryQuery) {
 }
 
 export const desktop = {
+  findings: <T = import("../domain/types").Finding[]>(
+    expectedPath: string,
+    action: string,
+    args: Record<string, unknown> = {},
+  ) => call<T>("findings", { expectedPath, action, args }),
   isAvailable: inTauri,
   intruderPlan: (mode: AttackMode, lengths: number[]) =>
     call<Array<Array<number | null>>>("intruder_plan", { mode, lengths }),

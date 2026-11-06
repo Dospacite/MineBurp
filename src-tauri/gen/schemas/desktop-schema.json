@@ -291,6 +291,12 @@
           "markdownDescription": "Enables the filter_vocabulary command without any pre-configured scope."
         },
         {
+          "description": "Enables the findings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-findings",
+          "markdownDescription": "Enables the findings command without any pre-configured scope."
+        },
+        {
           "description": "Enables the inspect_bytes command without any pre-configured scope.",
           "type": "string",
           "const": "allow-inspect-bytes",
@@ -703,6 +709,12 @@
           "type": "string",
           "const": "deny-filter-vocabulary",
           "markdownDescription": "Denies the filter_vocabulary command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the findings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-findings",
+          "markdownDescription": "Denies the findings command without any pre-configured scope."
         },
         {
           "description": "Denies the inspect_bytes command without any pre-configured scope.",

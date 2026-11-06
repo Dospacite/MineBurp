@@ -33,10 +33,11 @@ When an MCP client changes something the UI shows — intercept settings, rules,
 
 ## Tools
 
-19 tools. Related actions share one tool through an `action` argument, so the tool list costs a session about 4k tokens.
+20 tools. Related actions share one tool through an `action` argument, so the tool list costs a session about 4k tokens.
 
 | Tool | Purpose |
 | --- | --- |
+| `findings` | Assessment findings: list/get/create/update/delete/add_evidence/remove_evidence/export; `format: "json"` for structured output |
 | `status` | One-call overview: mode, project, capture, decrypt mode, live sessions, intercept queue, rules, shaping |
 | `packets` | Filtered history, one line per packet, with `before`/`after` cursors; `wait_ms` waits for new traffic; `summaries` adds decoded one-liners |
 | `packet` | One packet: metadata, annotation, decode (schema packs too), editable `layout`, hex window; `path` drills into large decodes |
@@ -117,3 +118,5 @@ The desktop `replacement_rules_set` command accepts optional `expectedPath`.
 When supplied, it must equal the current project path. Rule expressions are
 validated and saved before the live proxy applies them. MCP rule edits hold a
 mutex for the project throughout the read, modification, save, and apply steps.
+
+`findings` uses full finding documents for create/update, UUID `id` for get/delete, and `evidence: {kind, id}` for evidence actions. Kinds are `packet`, `connection`, `repeater`, and `rule`. Export takes absolute `path`, `reportFormat: "markdown" | "html"`, optional `pcapPath`, and `overwrite`. Missing history references remain in reports.

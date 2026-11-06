@@ -27,7 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize as _;
 
-const PROJECT_SCHEMA_VERSION: i32 = 6;
+const PROJECT_SCHEMA_VERSION: i32 = 7;
 
 /// How long one read query may run before it is interrupted.
 ///
@@ -1602,6 +1602,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (6, "CREATE TABLE IF NOT EXISTS workbench_documents(
         key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at_micros INTEGER NOT NULL
     );"),
+    (7, "CREATE TABLE IF NOT EXISTS findings(id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);"),
 ];
 
 /// Accumulates `WHERE` fragments alongside their bound values.

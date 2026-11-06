@@ -79,3 +79,7 @@ the comparison does not cover the complete payload.
 Fields show changed values and fields absent from either side. Clear **Only
 changed** to include equal fields. Swap A/B to reverse the comparison, or clear
 the slots to choose another pair. Comparing packets sends no traffic.
+
+## Findings
+
+Use Findings to group evidence under a title, severity, status, Markdown description and reproduction steps. Add captured packets, Repeater tabs and Replace rules through Add to finding. Filter the list by severity or status, edit tags, and export Markdown or self-contained HTML with bounded packet decodes and hex. Packet references survive history deletion and reports mark missing packets. MCP export can also write a pcapng containing linked packets.

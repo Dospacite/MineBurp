@@ -27,6 +27,7 @@ pub fn run() {
             commands::replacement_rule_preview,
             commands::payload_generate,
             commands::decoder_transform,
+            commands::findings,
             commands::workbench_document_get,
             commands::workbench_document_save,
             commands::channel_stats,

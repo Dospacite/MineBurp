@@ -11,7 +11,6 @@ import {
   StickyNote,
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-
 import type { ByteWindow, FieldSpan, PacketLayout, PacketView } from "../domain/types";
 import { t } from "../i18n";
 import { annotationColorStyle, annotationStore, useAnnotations } from "../lib/annotations";
@@ -32,6 +31,7 @@ import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { DecodedFields } from "./DecodedFields";
 import { EmptyState } from "./EmptyState";
 import { FieldTree, fieldAt } from "./FieldTree";
+import { addToFinding } from "./FindingPicker";
 import { type ByteRange, HEX_PAGE_BYTES, HexView } from "./HexView";
 import { SelectionToolbar } from "./SelectionToolbar";
 import { Split } from "./Split";
@@ -322,6 +322,9 @@ export const PacketInspector = memo(function PacketInspector({
           >
             <Send size={14} aria-hidden="true" />
             <span className="button-label">{t("inspector.repeater")}</span>
+          </button>
+          <button type="button" onClick={() => addToFinding([{ kind: "packet", id: summary.id }])}>
+            {t("findings.add")}
           </button>
         </div>
       </header>

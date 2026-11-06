@@ -36,6 +36,7 @@ pub struct Tool {
 
 pub fn catalog() -> Vec<Tool> {
     let mut tools = Vec::new();
+    tools.push(Tool { name: "findings", description: "Assessment findings: list/get/create/update/delete/add_evidence/remove_evidence/export. create requires finding.title; update takes the full document from get; finding fields: title, severity(info/low/medium/high/critical), status(open/confirmed/false_positive/fixed), description, reproductionSteps, tags, evidence; evidence is {kind,id}. reportFormat is markdown or html. format=json returns structured results.", schema: object(&[("action",string("action")),("id",string("finding UUID")),("finding",json!({"type":"object"})),("evidence",json!({"type":"object"})),("status",string("status filter")),("severity",string("severity filter")),("format",choice(&["text","json"],"output")),("pcapPath",string("optional linked-packet pcapng path")),("path",string("absolute export path")),("reportFormat",choice(&["markdown","html"],"report format")),("overwrite",boolean("replace existing export"))], &["action"]), read_only:false, destructive:true });
     tools.extend(history::tools());
     tools.extend(frames::tools());
     tools.extend(live::tools());
@@ -55,6 +56,57 @@ pub async fn dispatch(host: &dyn Host, name: &str, arguments: Value) -> ToolResu
     let args = Args::new(arguments)?;
     let ctx = Ctx { host };
     match name {
+        "findings" => {
+            let action = args.action("list");
+            let result = crate::ops::finding_action(
+                &ctx.project()?,
+                &action,
+                &Value::Object(args.0.clone()),
+            )?;
+            if !matches!(action.as_str(), "list" | "get" | "export") {
+                host.notify("findings");
+            }
+            if args.str("format") == Some("json") {
+                Ok(result.to_string())
+            } else if let Some(rows) = result.as_array() {
+                Ok(rows
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "{} {:?} {:?} {}",
+                            f["id"].as_str().unwrap_or(""),
+                            f["severity"],
+                            f["status"],
+                            f["title"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            } else if result.get("title").is_some() {
+                let description: String = result["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(2048)
+                    .collect();
+                let steps: String = result["reproductionSteps"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(2048)
+                    .collect();
+                Ok(format!(
+                    "{} {} {} {}\n{description}\nsteps: {steps}\nevidence={} (text capped at 2048 characters per field; format=json for full details)",
+                    result["id"].as_str().unwrap_or(""),
+                    result["severity"].as_str().unwrap_or(""),
+                    result["status"].as_str().unwrap_or(""),
+                    result["title"].as_str().unwrap_or(""),
+                    result["evidence"].as_array().map_or(0, Vec::len)
+                ))
+            } else {
+                Ok(result.to_string())
+            }
+        }
         "status" => history::status(&ctx, &args).await,
         "packets" => history::packets(&ctx, &args).await,
         "packet" => history::packet(&ctx, &args).await,

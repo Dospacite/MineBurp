@@ -5,6 +5,8 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 ## [Unreleased]
 
 ### Added
+
+- Project findings with bounded evidence, severity/status tracking, desktop and MCP CRUD, and Markdown/HTML reporting.
 - Minecraft Decoder in the right sidebar, with chained hex/text/Base64, VarInt/VarLong, Minecraft string, UUID, integer, compression, NBT, and JSON transforms.
 - Channel explorer, Ctrl/Cmd+K command palette, packet selection actions, payload generators, decoded-field history columns, and traffic presets.
 - Project-backed Intruder and Sequencer configuration, samples, analysis, and results, with autosave and flush before project changes/exit.

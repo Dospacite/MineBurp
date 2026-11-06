@@ -6,6 +6,7 @@
     "main"
   ],
   "permissions": [
+    "allow-findings",
     "allow-replacement-rule-preview",
     "allow-payload-generate",
     "allow-decoder-transform",

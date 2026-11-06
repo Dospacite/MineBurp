@@ -312,3 +312,8 @@ mod export_tests {
         assert_eq!(std::fs::read(target).unwrap(), b"keep");
     }
 }
+
+mod findings;
+pub use findings::{export_findings_with_overwrite, render_findings};
+mod finding_actions;
+pub use finding_actions::finding_action;

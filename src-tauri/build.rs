@@ -7,6 +7,7 @@
 //! in `src/lib.rs` keeps the three lists identical.
 
 const COMMANDS: &[&str] = &[
+    "findings",
     "replacement_rule_preview",
     "payload_generate",
     "decoder_transform",
