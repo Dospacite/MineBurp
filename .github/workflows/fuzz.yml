@@ -3,8 +3,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    - cron: '23 2 * * *'
   workflow_dispatch:
 permissions:
   contents: read
@@ -26,7 +24,6 @@ jobs:
           test -s targets.txt
           while read -r target; do cargo +nightly fuzz build "$target"; done < targets.txt
       - name: Run every target for 60 seconds
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: fuzz
         run: |
           failed=0

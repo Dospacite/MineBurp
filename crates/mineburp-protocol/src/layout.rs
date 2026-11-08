@@ -430,10 +430,27 @@ fn unchanged_field(kind: FieldKind, value: &Value, bytes: &[u8]) -> bool {
                 && reader.remaining() == 0
         }
         FieldKind::String => {
-            reader
+            if reader
                 .string(262_144)
                 .is_some_and(|old| value.as_str() == Some(old.as_str()))
                 && reader.remaining() == 0
+            {
+                return true;
+            }
+            // The declarative walker displays malformed UTF-8 with replacement
+            // characters instead of refusing it. An unchanged field must keep
+            // the bytes it had, or re-saving a packet would silently rewrite a
+            // hostile string.
+            let mut reader = Reader::new(bytes);
+            let Some(length) = reader
+                .var_i32()
+                .and_then(|length| usize::try_from(length).ok())
+            else {
+                return false;
+            };
+            reader.take(length).is_some_and(|payload| {
+                value.as_str() == Some(String::from_utf8_lossy(payload).as_ref())
+            }) && reader.remaining() == 0
         }
         FieldKind::PrefixedBytes => {
             reader
@@ -1258,6 +1275,30 @@ mod tests {
             Some(774),
         );
         assert!(!layout.complete);
+        tiles(&layout, &logical);
+    }
+
+    #[test]
+    fn malformed_utf8_strings_keep_their_bytes() {
+        // status_response whose JSON text is one invalid UTF-8 byte. The
+        // decoder shows it with a replacement character, but re-encoding an
+        // unchanged field must not rewrite the wire bytes.
+        let logical = [0x00, 0x01, 0xb6];
+        let layout = layout_logical(
+            ProtocolState::Status,
+            Direction::ServerToClient,
+            &logical,
+            Some(774),
+        );
+        assert_eq!(layout.name.as_deref(), Some("status_response"));
+        assert!(layout.complete);
+        let response = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "response")
+            .unwrap();
+        assert_eq!(response.kind, FieldKind::String);
+        assert_eq!(response.value, json!("\u{FFFD}"));
         tiles(&layout, &logical);
     }
 

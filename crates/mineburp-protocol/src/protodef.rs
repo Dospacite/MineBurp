@@ -860,16 +860,16 @@ impl<'a> Decoder<'a> {
         }
         let text_start = self.position;
         // Invalid UTF-8 is shown rather than refused: a malformed string is
-        // exactly what an operator testing a server wants to see.
-        let text = String::from_utf8_lossy(self.take(length)?).into_owned();
+        // exactly what an operator testing a server wants to see. Keep the
+        // original bytes for the span, though, so re-encoding an unchanged
+        // field does not replace them with the replacement characters.
+        let bytes = self.take(length)?.to_vec();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         if prefixed {
             self.span(FieldKind::String, start, Value::String(text.clone()));
         } else {
-            self.span(
-                FieldKind::Bytes,
-                text_start,
-                Value::String(self.display_hex(text.as_bytes())),
-            );
+            let hex = self.display_hex(&bytes);
+            self.span(FieldKind::Bytes, text_start, Value::String(hex));
         }
         Ok(Value::String(text))
     }
