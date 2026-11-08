@@ -82,7 +82,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        # Build from crates.io instead of the action's Docker image: that image
+        # downloads its binary from a GitHub release, which is unavailable
+        # during GitHub release-asset incidents.
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - run: cargo deny check
 
   desktop:
     if: github.event_name == 'push'
