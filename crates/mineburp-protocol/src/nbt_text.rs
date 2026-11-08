@@ -438,7 +438,10 @@ fn write_float(output: &mut String, value: f64, debug: &str) {
 }
 
 fn scalar(tag: &Tag) -> bool {
-    !matches!(tag, Tag::List(_) | Tag::Compound(_))
+    !matches!(
+        tag,
+        Tag::List(_) | Tag::Compound(_) | Tag::ByteArray(_) | Tag::IntArray(_) | Tag::LongArray(_)
+    )
 }
 
 fn write_numbers<T: std::fmt::Display>(output: &mut String, values: &[T]) {
@@ -1323,5 +1326,19 @@ mod tests {
         // A NUL written as a single byte is not modified UTF-8.
         assert!(to_text(&[8, 0, 1, 0], false).is_none());
         assert!(to_text(&[10, 1, 0], false).is_none(), "truncated input");
+    }
+
+    #[test]
+    fn a_list_of_byte_arrays_reports_the_same_text_after_re_encoding() {
+        let bytes = [
+            0x09, 0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let first = to_text(&bytes, false).expect("renders");
+        let encoded = from_text(&first, false, None).expect("encodes");
+        let second = to_text(&encoded, false).expect("renders again");
+        assert_eq!(first, second);
     }
 }

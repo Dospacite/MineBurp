@@ -414,6 +414,19 @@ pub fn encode_field_over(
     })
 }
 
+/// Whether a decoded float and a JSON number describe the same field value.
+///
+/// JSON cannot carry NaN, so non-finite values arrive as text. Every NaN
+/// compares unequal to itself, but re-encoding one would lose its payload;
+/// signed zero also has to compare equal so `-0.0` keeps its sign bit.
+fn same_float(old: f64, new: f64) -> bool {
+    const SIGN: u64 = 1 << 63;
+    if old.is_nan() {
+        return new.is_nan();
+    }
+    old.to_bits() == new.to_bits() || (old.to_bits() & !SIGN == 0 && new.to_bits() & !SIGN == 0)
+}
+
 fn unchanged_field(kind: FieldKind, value: &Value, bytes: &[u8]) -> bool {
     let mut reader = Reader::new(bytes);
     match kind {
@@ -430,16 +443,51 @@ fn unchanged_field(kind: FieldKind, value: &Value, bytes: &[u8]) -> bool {
                 && reader.remaining() == 0
         }
         FieldKind::String => {
-            reader
+            if reader
                 .string(262_144)
                 .is_some_and(|old| value.as_str() == Some(old.as_str()))
                 && reader.remaining() == 0
+            {
+                return true;
+            }
+            // The declarative walker displays malformed UTF-8 with replacement
+            // characters instead of refusing it. An unchanged field must keep
+            // the bytes it had, or re-saving a packet would silently rewrite a
+            // hostile string.
+            let mut reader = Reader::new(bytes);
+            let Some(length) = reader
+                .var_i32()
+                .and_then(|length| usize::try_from(length).ok())
+            else {
+                return false;
+            };
+            reader.take(length).is_some_and(|payload| {
+                value.as_str() == Some(String::from_utf8_lossy(payload).as_ref())
+            }) && reader.remaining() == 0
         }
         FieldKind::PrefixedBytes => {
             reader
                 .byte_array()
                 .is_some_and(|old| parse_hex(value).is_ok_and(|new| new == old))
                 && reader.remaining() == 0
+        }
+        FieldKind::F32 => {
+            let Ok(bytes) = <[u8; 4]>::try_from(bytes) else {
+                return false;
+            };
+            let Ok(new) = parse_f64(value) else {
+                return false;
+            };
+            same_float(f64::from(f32::from_be_bytes(bytes)), new)
+        }
+        FieldKind::F64 => {
+            let Ok(bytes) = <[u8; 8]>::try_from(bytes) else {
+                return false;
+            };
+            let Ok(new) = parse_f64(value) else {
+                return false;
+            };
+            same_float(f64::from_be_bytes(bytes), new)
         }
         FieldKind::Nbt | FieldKind::NamedNbt => {
             crate::nbt_text::to_text(bytes, kind == FieldKind::NamedNbt)
@@ -1259,6 +1307,46 @@ mod tests {
         );
         assert!(!layout.complete);
         tiles(&layout, &logical);
+    }
+
+    #[test]
+    fn malformed_utf8_strings_keep_their_bytes() {
+        // status_response whose JSON text is one invalid UTF-8 byte. The
+        // decoder shows it with a replacement character, but re-encoding an
+        // unchanged field must not rewrite the wire bytes.
+        let logical = [0x00, 0x01, 0xb6];
+        let layout = layout_logical(
+            ProtocolState::Status,
+            Direction::ServerToClient,
+            &logical,
+            Some(774),
+        );
+        assert_eq!(layout.name.as_deref(), Some("status_response"));
+        assert!(layout.complete);
+        let response = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "response")
+            .unwrap();
+        assert_eq!(response.kind, FieldKind::String);
+        assert_eq!(response.value, json!("\u{FFFD}"));
+        tiles(&layout, &logical);
+    }
+
+    #[test]
+    fn non_finite_floats_keep_their_payload() {
+        // JSON cannot carry NaN, so it arrives as the text "NaN". Re-encoding
+        // would canonicalise the payload and change the wire bytes.
+        let nan32 = [0xff; 4];
+        assert_eq!(
+            encode_field_over(FieldKind::F32, &json!("NaN"), Some(&nan32)).unwrap(),
+            nan32
+        );
+        let nan64 = [0xff; 8];
+        assert_eq!(
+            encode_field_over(FieldKind::F64, &json!("NaN"), Some(&nan64)).unwrap(),
+            nan64
+        );
     }
 
     #[test]
