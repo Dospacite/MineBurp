@@ -19,15 +19,15 @@
     "bump:version": "node scripts/bump-version.mjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0",
-    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
     "lucide-react": "^0.468.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.10",
-    "@tauri-apps/cli": "^2.8.4",
+    "@tauri-apps/cli": "^2.12.4",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.5",
