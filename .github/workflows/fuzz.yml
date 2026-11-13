@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -31,7 +31,7 @@ jobs:
             cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=512 -timeout=1 || failed=1
           done < targets.txt
           exit "$failed"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-artifacts
