@@ -18,10 +18,10 @@ use mineburp_proxy::{
     InterceptDecision, InterceptSettings, ProxyEvent, ProxyService, SessionOptions,
 };
 use mineburp_session::{SessionJoinProvider, SessionJoinRequest};
+use rand::rngs::SysRng;
 use rsa::{
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    Pkcs1v15Encrypt, PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey,
     pkcs8::{DecodePublicKey, EncodePublicKey},
-    rand_core::OsRng,
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -240,7 +240,7 @@ async fn login_through_the_proxy(
     provider: Arc<dyn SessionJoinProvider>,
     hold: LoginHold,
 ) {
-    let private_key = RsaPrivateKey::new(&mut OsRng, 1024).expect("server key");
+    let private_key = RsaPrivateKey::new(&mut SysRng, 1024).expect("server key");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let target_port = listener.local_addr().expect("addr").port();
     let server = tokio::spawn(run_server(listener, private_key, should_authenticate));
@@ -330,12 +330,12 @@ async fn login_through_the_proxy(
     let response = EncryptionResponse {
         encrypted_secret: Bytes::from(
             proxy_key
-                .encrypt(&mut OsRng, Pkcs1v15Encrypt, &SHARED_SECRET)
+                .encrypt(&mut SysRng, Pkcs1v15Encrypt, &SHARED_SECRET)
                 .expect("encrypt secret"),
         ),
         encrypted_verify_token: Bytes::from(
             proxy_key
-                .encrypt(&mut OsRng, Pkcs1v15Encrypt, &request.verify_token)
+                .encrypt(&mut SysRng, Pkcs1v15Encrypt, &request.verify_token)
                 .expect("encrypt token"),
         ),
         signature: None,

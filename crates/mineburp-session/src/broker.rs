@@ -15,8 +15,8 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac as _};
-use rand::RngCore as _;
+use hmac::{Hmac, KeyInit as _, Mac as _};
+use rand::Rng as _;
 use serde::Serialize;
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;

@@ -4,10 +4,10 @@ use mineburp_protocol::{
 };
 use mineburp_session::minecraft_server_hash;
 use parking_lot::Mutex;
+use rand::{Rng as _, rand_core::UnwrapErr, rngs::SysRng};
 use rsa::{
-    Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey,
+    Pkcs1v15Encrypt, PrivateKey as RsaPrivateKey, PublicKey as RsaPublicKey,
     pkcs8::{DecodePublicKey, EncodePublicKey},
-    rand_core::{OsRng, RngCore},
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -57,7 +57,7 @@ impl EncryptionBridge {
     /// the blocking pool rather than on a runtime worker shared with every
     /// other session.
     pub(crate) fn generate_key() -> Result<RsaPrivateKey, EncryptionBridgeError> {
-        RsaPrivateKey::new(&mut OsRng, RSA_BITS)
+        RsaPrivateKey::new(&mut SysRng, RSA_BITS)
             .map_err(|error| EncryptionBridgeError::Rsa(error.to_string()))
     }
 
@@ -73,12 +73,11 @@ impl EncryptionBridge {
         private_key: RsaPrivateKey,
         protocol_version: i32,
     ) -> Result<Bytes, EncryptionBridgeError> {
-        let mut random = OsRng;
         let public_key = RsaPublicKey::from(&private_key)
             .to_public_key_der()
             .map_err(|error| EncryptionBridgeError::Rsa(error.to_string()))?;
         let mut client_verify_token = [0_u8; VERIFY_TOKEN_LENGTH];
-        random.fill_bytes(&mut client_verify_token);
+        UnwrapErr(SysRng).fill_bytes(&mut client_verify_token);
         let client_public_key_der = Bytes::copy_from_slice(public_key.as_ref());
         let client_request = EncryptionRequest {
             server_id: server_request.server_id.clone(),
@@ -145,11 +144,11 @@ impl EncryptionBridge {
             RsaPublicKey::from_public_key_der(&negotiation.server_request.public_key_der)
                 .map_err(|error| EncryptionBridgeError::Rsa(error.to_string()))?;
         let encrypted_secret = server_public_key
-            .encrypt(&mut OsRng, Pkcs1v15Encrypt, &shared_secret)
+            .encrypt(&mut SysRng, Pkcs1v15Encrypt, &shared_secret)
             .map_err(|error| EncryptionBridgeError::Rsa(error.to_string()))?;
         let encrypted_verify_token = server_public_key
             .encrypt(
-                &mut OsRng,
+                &mut SysRng,
                 Pkcs1v15Encrypt,
                 &negotiation.server_request.verify_token,
             )
@@ -243,7 +242,7 @@ mod tests {
 
     #[test]
     fn bridge_reencrypts_secret_and_tokens_for_both_links() {
-        let mut random = OsRng;
+        let mut random = SysRng;
         let server_private = RsaPrivateKey::new(&mut random, RSA_BITS).unwrap();
         let server_public = RsaPublicKey::from(&server_private);
         let server_public_der = server_public.to_public_key_der().unwrap();
@@ -321,7 +320,7 @@ mod tests {
 
     #[test]
     fn a_signed_nonce_response_completes_the_bridge() {
-        let mut random = OsRng;
+        let mut random = SysRng;
         let server_private = RsaPrivateKey::new(&mut random, RSA_BITS).unwrap();
         let server_public_der = RsaPublicKey::from(&server_private)
             .to_public_key_der()
@@ -377,7 +376,7 @@ mod tests {
 
     #[test]
     fn a_server_that_skips_authentication_is_reported() {
-        let mut random = OsRng;
+        let mut random = SysRng;
         let server_private = RsaPrivateKey::new(&mut random, RSA_BITS).unwrap();
         let server_public_der = RsaPublicKey::from(&server_private)
             .to_public_key_der()

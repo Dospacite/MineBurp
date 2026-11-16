@@ -253,7 +253,7 @@ export function HexView({
       );
       const start = focus ?? offset;
       const first = found.findIndex((at) => at >= start);
-      const index = found.length === 0 ? -1 : first < 0 ? 0 : first;
+      const index = found.length === 0 ? -1 : Math.max(first, 0);
       setMatchIndex(index);
       const at = found[index];
       if (at !== undefined) {

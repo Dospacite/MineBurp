@@ -559,7 +559,7 @@ impl ProjectStore {
         work: impl FnOnce(&Connection) -> Result<T, ProjectError>,
     ) -> Result<T, ProjectError> {
         let pool = self.readers.read();
-        let connection = pool.acquire();
+        let mut connection = pool.acquire();
         let budget = Duration::from_millis(self.budget_millis.load(Ordering::Relaxed));
         let deadline = Instant::now() + budget;
         let expired = Arc::new(AtomicBool::new(false));
