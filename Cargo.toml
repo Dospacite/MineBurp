@@ -35,8 +35,8 @@ parking_lot = "0.13.0"
 rand = "0.10.3"
 regex = "1.11.1"
 reqwest = { version = "0.12.22", default-features = false, features = ["json", "rustls-tls"] }
-rsa = "0.10.0"
-rusqlite = { version = "0.41.1", features = [
+rsa = { version = "0.10.0", features = ["pkcs1v15"] }
+rusqlite = { version = "0.43.0", features = [
   "bundled-sqlcipher-vendored-openssl",
   "functions",
   "uuid",

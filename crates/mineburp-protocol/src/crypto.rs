@@ -1,5 +1,5 @@
 use aes::Aes128;
-use cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use cipher::{Array, BlockCipherEncrypt as _, KeyInit};
 use zeroize::Zeroize;
 
 /// Stateful AES-128/CFB8 stream used by the Minecraft Java protocol.
@@ -13,7 +13,7 @@ pub struct MinecraftCipher {
 impl MinecraftCipher {
     #[must_use]
     pub fn new(shared_secret: [u8; 16]) -> Self {
-        let key = GenericArray::from(shared_secret);
+        let key = Array::from(shared_secret);
         Self {
             cipher: Aes128::new(&key),
             encrypt_shift_register: shared_secret,
@@ -26,7 +26,7 @@ impl MinecraftCipher {
     #[cfg(test)]
     fn with_iv(key: [u8; 16], iv: [u8; 16]) -> Self {
         Self {
-            cipher: Aes128::new(&GenericArray::from(key)),
+            cipher: Aes128::new(&Array::from(key)),
             encrypt_shift_register: iv,
             decrypt_shift_register: iv,
         }
@@ -35,7 +35,7 @@ impl MinecraftCipher {
     pub fn encrypt(&mut self, bytes: &mut [u8]) {
         for byte in bytes {
             let input = *byte;
-            let mut block = GenericArray::from(self.encrypt_shift_register);
+            let mut block = Array::from(self.encrypt_shift_register);
             self.cipher.encrypt_block(&mut block);
             let output = input ^ block[0];
             self.encrypt_shift_register.copy_within(1.., 0);
@@ -47,7 +47,7 @@ impl MinecraftCipher {
     pub fn decrypt(&mut self, bytes: &mut [u8]) {
         for byte in bytes {
             let input = *byte;
-            let mut block = GenericArray::from(self.decrypt_shift_register);
+            let mut block = Array::from(self.decrypt_shift_register);
             self.cipher.encrypt_block(&mut block);
             let output = input ^ block[0];
             self.decrypt_shift_register.copy_within(1.., 0);

@@ -13,6 +13,7 @@ mineburp-project = { path = "../mineburp-project" }
 mineburp-protocol = { path = "../mineburp-protocol" }
 mineburp-session = { path = "../mineburp-session" }
 parking_lot.workspace = true
+rand.workspace = true
 rsa.workspace = true
 serde.workspace = true
 subtle.workspace = true

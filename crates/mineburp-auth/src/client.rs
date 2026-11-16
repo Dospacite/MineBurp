@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use mineburp_session::minecraft_server_hash;
-use rand::RngCore;
+use rand::Rng as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

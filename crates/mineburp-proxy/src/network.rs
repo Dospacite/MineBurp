@@ -6,7 +6,7 @@
 //! bandwidth ceiling — which is enough to exercise timeouts, lag compensation,
 //! movement prediction, and keep-alive handling in a client or server.
 
-use rsa::rand_core::{OsRng, RngCore as _};
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::{Duration, Instant};
@@ -91,7 +91,7 @@ impl Default for Shaper {
             last_release: None,
             next_free: None,
             // xorshift must not start at zero.
-            random: OsRng.next_u64() | 1,
+            random: rand::rng().next_u64() | 1,
         }
     }
 }

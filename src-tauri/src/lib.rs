@@ -153,7 +153,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         use sha2::{Digest, Sha256};
         use std::io::Write;
         let bytes = std::fs::read(&agent_path)?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = hex::encode(Sha256::digest(&bytes));
         let directory = app.path().app_data_dir()?.join("agent");
         std::fs::create_dir_all(&directory)?;
         let destination = directory.join(format!("mineburp-agent-{}.jar", &digest[..16]));

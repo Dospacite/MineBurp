@@ -88,6 +88,10 @@ All notable changes to MineBurp are documented here. Follows Keep a Changelog an
 - Modern plugin messages (`custom_payload`) were recorded without their channel, so `channel` filters, channel search, the channel explorer, and schema matching could not see 1.20.2+ custom payloads. Live proxy rows and imported captures now read the channel (and loader) from the packet preamble without decoding the payload.
 - The MCP `packets` tool and every `filter` object now reject an unknown filter key instead of silently ignoring it. A typo such as `channel=` used to widen the query to the whole history; it is now an error that lists the accepted keys (`channel` is an expression field: `expr="channel == mineburp:batch"`).
 
+### Security
+- Project files are opened with SQLCipher 4.20.0 on SQLite 3.54.1, which fixes CVE-2026-119375: a project file paired with a crafted `-wal` file could make queries return stale process memory (RUSTSEC-2026-0459, RUSTSEC-2026-0502).
+- The login proxy uses `rsa` 0.10, which fixes the Marvin timing side channel in PKCS#1 v1.5 decryption (RUSTSEC-2023-0071). The advisory is no longer ignored in `deny.toml`.
+
 ## [0.1.0] - 2026-09-02
 
 ### Added
