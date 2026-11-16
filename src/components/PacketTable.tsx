@@ -101,7 +101,7 @@ export const PacketTable = memo(function PacketTable({
     [packets, selectedId],
   );
   // One tab stop for the whole grid: the selected row, or the first.
-  const activeIndex = selectedIndex >= 0 ? selectedIndex : 0;
+  const activeIndex = Math.max(selectedIndex, 0);
   const navigate = useMemo(
     () => rowNavigationKeyHandler(packets.length, PACKET_ROW_HEIGHT),
     [packets.length],

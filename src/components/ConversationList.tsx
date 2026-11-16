@@ -39,7 +39,7 @@ export const ConversationList = memo(function ConversationList({
     [packets.length],
   );
   const selectedIndex = packets.findIndex((packet) => packet.id === selectedId);
-  const activeIndex = selectedIndex >= 0 ? selectedIndex : 0;
+  const activeIndex = Math.max(selectedIndex, 0);
 
   const menu = (event: MouseEvent<HTMLElement>, packet: PacketSummary) => {
     if (!onRowMenu) return;
